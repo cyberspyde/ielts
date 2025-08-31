@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import { apiService } from '../../services/api';
-import BulkImporter from '../../components/ui/BulkImporter';
+// Simplified: temporarily hide complex bulk importers for clarity
 
 const AdminExamEdit: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
@@ -157,18 +157,7 @@ const AdminExamEdit: React.FC = () => {
             </div>
 
             {/* Import Headings for matching */}
-            {section.sectionType === 'reading' && (
-              <div className="mb-4">
-                <div className="text-sm font-medium text-gray-700 mb-2">Bulk Headings Import</div>
-                <BulkImporter
-                  mode="headings"
-                  onParsed={({ headingOptions }) => {
-                    if (!headingOptions) return;
-                    updateSection.mutate({ sectionId: section.id, data: { headingBank: { options: headingOptions } } });
-                  }}
-                />
-              </div>
-            )}
+            {/* Headings import hidden to reduce complexity; manage in create flow */}
 
             {/* Matching bank (if section has matching) */}
             {section.questions?.some((q: any) => q.questionType === 'matching') && (
@@ -275,26 +264,7 @@ const AdminExamEdit: React.FC = () => {
             )}
 
             {/* Bulk Questions Import */}
-            <div className="mb-4">
-              <div className="text-sm font-medium text-gray-700 mb-2">Bulk Questions Import</div>
-              <BulkImporter
-                mode="questions"
-                onParsed={async ({ groups }) => {
-                  if (!groups || !groups.length) return;
-                  try {
-                    await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
-                      sectionId: section.id,
-                      groups
-                    });
-                    toast.success('Questions created');
-                    // refresh
-                    (async () => { await queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); })();
-                  } catch (e: any) {
-                    toast.error(e?.message || 'Failed to create questions');
-                  }
-                }}
-              />
-            </div>
+            {/* Bulk import hidden for now to keep editing UI simple */}
 
             {/* Questions */}
             <div className="space-y-3">

@@ -4,6 +4,7 @@ import { toast } from 'react-toastify';
 import { useNavigate } from 'react-router-dom';
 
 import { apiService } from '../../services/api';
+import MatchingBatchBuilder, { type MatchingBatch } from '../../components/admin/MatchingBatchBuilder';
 
 type ExamPayload = {
   title: string;
@@ -60,11 +61,11 @@ const AdminExamCreate: React.FC = () => {
 
   // Step 3: bulk groups per section
   const [readingGroups, setReadingGroups] = useState<QuestionGroup[]>([
-    { questionType: 'matching', start: 1, end: 8, points: 1, questionText: '' },
     { questionType: 'multiple_choice', start: 9, end: 13, points: 1, questionText: '' },
     { questionType: 'true_false', start: 14, end: 20, points: 1, questionText: '' },
     { questionType: 'fill_blank', start: 21, end: 22, points: 1, questionText: '' },
   ]);
+  const [readingMatching, setReadingMatching] = useState<MatchingBatch>({ start: 1, end: 8, points: 1, questionText: '', options: [], correctAnswers: Array(8).fill('') });
   const [listeningGroups, setListeningGroups] = useState<QuestionGroup[]>([
     { questionType: 'multiple_choice', start: 1, end: 10, points: 1 },
   ]);
@@ -90,9 +91,15 @@ const AdminExamCreate: React.FC = () => {
       const examId = (examRes.data as any).examId as string;
 
       // 2) Create sections
+      const sectionsPayload = sections.map((s) => {
+        if (s.sectionType === 'reading' && (readingMatching.options?.length || 0) > 0) {
+          return { ...s, headingBank: { options: readingMatching.options } } as any;
+        }
+        return s as any;
+      });
       const sectionsRes = await apiService.post<{ sections: Array<{ id: string }> }>(
         `/admin/exams/${examId}/sections`,
-        { sections }
+        { sections: sectionsPayload }
       );
       if (!sectionsRes.success || !sectionsRes.data) throw new Error(sectionsRes.message || 'Failed to create sections');
 
@@ -103,11 +110,26 @@ const AdminExamCreate: React.FC = () => {
       const speaking = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'speaking');
 
       // 3) Bulk questions per section (optional / if groups provided)
-      if (reading && readingGroups.length) {
-        await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
-          sectionId: reading.id,
-          groups: readingGroups,
-        });
+      if (reading) {
+        const includeMatching = (readingMatching.end - readingMatching.start + 1) > 0;
+        const groups = [
+          ...readingGroups,
+          ...(includeMatching ? [{
+            questionType: 'matching',
+            start: readingMatching.start,
+            end: readingMatching.end,
+            points: readingMatching.points || 1,
+            questionText: readingMatching.questionText || '',
+            options: readingMatching.options,
+            correctAnswers: readingMatching.correctAnswers,
+          }] as any : [])
+        ];
+        if (groups.length) {
+          await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
+            sectionId: reading.id,
+            groups,
+          });
+        }
       }
       if (listening && listeningGroups.length) {
         await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
@@ -241,45 +263,34 @@ const AdminExamCreate: React.FC = () => {
             </div>
           </div>
 
-          {/* Bulk Questions Presets */}
+          {/* Simple Matching Builder + Other Reading Groups */}
           {hasSection.reading && (
-          <div className="bg-white border border-gray-200 rounded-lg p-6">
-            <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Reading)</h2>
-            <p className="text-sm text-gray-600 mb-4">Define ranges like 1-8 matching, 9-13 multiple choice, etc.</p>
-            <div className="space-y-3">
-              {readingGroups.map((g, i) => (
-                <div key={i} className="grid grid-cols-1 md:grid-cols-6 gap-2">
-                  <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => {
-                    const next = [...readingGroups]; next[i] = { ...g, questionType: e.target.value as any }; setReadingGroups(next);
-                  }}>
-                    <option value="matching">Heading/Paragraph Matching</option>
-                    <option value="multiple_choice">Multiple Choice</option>
-                    <option value="true_false">True/False/NG</option>
-                    <option value="fill_blank">Fill in the Blank</option>
-                    <option value="short_answer">Short Answer</option>
-                    <option value="drag_drop">Drag & Drop</option>
-                  </select>
-                  <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setReadingGroups(next); }} />
-                  <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setReadingGroups(next); }} />
-                  <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 1} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, points: Number(e.target.value) }; setReadingGroups(next); }} />
-                  <input className="rounded-md border-gray-300 md:col-span-2" placeholder="Default question text (optional)" value={g.questionText || ''} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, questionText: e.target.value }; setReadingGroups(next); }} />
-                  {/* Advanced: options and correct answers (comma-separated) */}
-                  <input className="rounded-md border-gray-300 md:col-span-3" placeholder="Options (comma-separated, e.g., A,B,C or A:Heading A,B:Heading B)" value={(g.options as any)?.map((o:any)=> typeof o==='string'? o : `${o.letter||''}:${o.text||''}`).join(',') || ''} onChange={(e) => {
-                    const raw = e.target.value.trim();
-                    const parsed = raw ? raw.split(',').map((item) => {
-                      const [letter, text] = item.split(':');
-                      if (text !== undefined) return { letter: letter.trim(), text: text.trim() };
-                      return item.trim();
-                    }) : [];
-                    const next = [...readingGroups]; next[i] = { ...g, options: parsed as any } as any; setReadingGroups(next);
-                  }} />
-                  <input className="rounded-md border-gray-300 md:col-span-3" placeholder="Correct answers per question (comma-separated, aligns with range)" value={(g.correctAnswers || []).join(',')} onChange={(e) => {
-                    const next = [...readingGroups]; next[i] = { ...g, correctAnswers: e.target.value ? e.target.value.split(',').map(s=>s.trim()) : [] }; setReadingGroups(next);
-                  }} />
-                </div>
-              ))}
+          <>
+            <MatchingBatchBuilder value={readingMatching} onChange={setReadingMatching} />
+            <div className="bg-white border border-gray-200 rounded-lg p-6 mt-4">
+              <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Reading - Others)</h2>
+              <p className="text-sm text-gray-600 mb-4">Define ranges like 9-13 multiple choice, 14-20 true/false, etc.</p>
+              <div className="space-y-3">
+                {readingGroups.map((g, i) => (
+                  <div key={i} className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                    <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => {
+                      const next = [...readingGroups]; next[i] = { ...g, questionType: e.target.value as any }; setReadingGroups(next);
+                    }}>
+                      <option value="multiple_choice">Multiple Choice</option>
+                      <option value="true_false">True/False/NG</option>
+                      <option value="fill_blank">Fill in the Blank</option>
+                      <option value="short_answer">Short Answer</option>
+                      <option value="drag_drop">Drag & Drop</option>
+                    </select>
+                    <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setReadingGroups(next); }} />
+                    <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setReadingGroups(next); }} />
+                    <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 1} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, points: Number(e.target.value) }; setReadingGroups(next); }} />
+                    <input className="rounded-md border-gray-300 md:col-span-2" placeholder="Default question text (optional)" value={g.questionText || ''} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, questionText: e.target.value }; setReadingGroups(next); }} />
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
+          </>
           )}
 
           {/* Listening Bulk */}
