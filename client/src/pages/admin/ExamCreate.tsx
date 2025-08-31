@@ -28,7 +28,7 @@ type SectionDraft = {
 };
 
 type QuestionGroup = {
-  questionType: 'multiple_choice' | 'true_false' | 'fill_blank' | 'matching' | 'short_answer' | 'essay' | 'speaking';
+  questionType: 'multiple_choice' | 'true_false' | 'fill_blank' | 'matching' | 'short_answer' | 'essay' | 'speaking' | 'drag_drop' | 'speaking_task';
   start: number;
   end: number;
   points?: number;
@@ -71,11 +71,15 @@ const AdminExamCreate: React.FC = () => {
   const [writingGroups, setWritingGroups] = useState<QuestionGroup[]>([
     { questionType: 'essay', start: 1, end: 2, points: 0 },
   ]);
+  const [speakingGroups, setSpeakingGroups] = useState<QuestionGroup[]>([
+    { questionType: 'speaking_task', start: 1, end: 3, points: 0, questionText: '' },
+  ]);
 
   const hasSection = useMemo(() => ({
     reading: sections.some(s => s.sectionType === 'reading'),
     listening: sections.some(s => s.sectionType === 'listening'),
     writing: sections.some(s => s.sectionType === 'writing'),
+    speaking: sections.some(s => s.sectionType === 'speaking'),
   }), [sections]);
 
   const createExamMutation = useMutation({
@@ -92,10 +96,11 @@ const AdminExamCreate: React.FC = () => {
       );
       if (!sectionsRes.success || !sectionsRes.data) throw new Error(sectionsRes.message || 'Failed to create sections');
 
-      // Pick IDs for listening/reading/writing
+      // Pick IDs for listening/reading/writing/speaking
       const listening = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'listening');
       const reading = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'reading');
       const writing = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'writing');
+      const speaking = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'speaking');
 
       // 3) Bulk questions per section (optional / if groups provided)
       if (reading && readingGroups.length) {
@@ -114,6 +119,13 @@ const AdminExamCreate: React.FC = () => {
         await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
           sectionId: writing.id,
           groups: writingGroups,
+        });
+      }
+
+      if (speaking && speakingGroups.length) {
+        await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
+          sectionId: speaking.id,
+          groups: speakingGroups,
         });
       }
 
@@ -245,6 +257,7 @@ const AdminExamCreate: React.FC = () => {
                     <option value="true_false">True/False/NG</option>
                     <option value="fill_blank">Fill in the Blank</option>
                     <option value="short_answer">Short Answer</option>
+                    <option value="drag_drop">Drag & Drop</option>
                   </select>
                   <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setReadingGroups(next); }} />
                   <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setReadingGroups(next); }} />
@@ -280,12 +293,40 @@ const AdminExamCreate: React.FC = () => {
                     <option value="multiple_choice">Multiple Choice</option>
                     <option value="matching">Matching</option>
                     <option value="fill_blank">Fill in the Blank</option>
+                    <option value="drag_drop">Drag & Drop</option>
                   </select>
                   <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, start: Number(e.target.value) }; setListeningGroups(next); }} />
                   <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, end: Number(e.target.value) }; setListeningGroups(next); }} />
                   <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 1} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, points: Number(e.target.value) }; setListeningGroups(next); }} />
                 </div>
               ))}
+            </div>
+          </div>
+          )}
+
+          {/* Speaking Bulk */}
+          {hasSection.speaking && (
+          <div className="bg-white border border-gray-200 rounded-lg p-6">
+            <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Speaking)</h2>
+            <div className="space-y-3">
+              {speakingGroups.map((g, i) => (
+                <div key={i} className="grid grid-cols-1 md:grid-cols-8 gap-2">
+                  <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => {
+                    const next = [...speakingGroups]; next[i] = { ...g, questionType: e.target.value as any }; setSpeakingGroups(next);
+                  }}>
+                    <option value="speaking_task">Speaking Prompt</option>
+                    <option value="short_answer">Short Answer (typed)</option>
+                  </select>
+                  <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setSpeakingGroups(next); }} />
+                  <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setSpeakingGroups(next); }} />
+                  <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 0} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, points: Number(e.target.value) }; setSpeakingGroups(next); }} />
+                  <input className="rounded-md border-gray-300 md:col-span-3" placeholder="Default prompt (optional)" value={g.questionText || ''} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, questionText: e.target.value }; setSpeakingGroups(next); }} />
+                  <button type="button" onClick={() => setSpeakingGroups(prev => prev.filter((_, idx) => idx !== i))} className="px-2 py-1 text-xs text-red-600 border border-red-200 rounded hover:bg-red-50">Remove</button>
+                </div>
+              ))}
+              <div>
+                <button type="button" onClick={() => setSpeakingGroups(prev => [...prev, { questionType: 'speaking_task', start: (prev[prev.length-1]?.end || 0) + 1, end: (prev[prev.length-1]?.end || 0) + 1, points: 0, questionText: '' }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Speaking Group</button>
+              </div>
             </div>
           </div>
           )}
