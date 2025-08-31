@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import { apiService } from '../../services/api';
+import BulkImporter from '../../components/ui/BulkImporter';
 
 const AdminExamEdit: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
@@ -32,6 +33,8 @@ const AdminExamEdit: React.FC = () => {
   const answerPlaceholderFor = (type: string) => {
     switch (type) {
       case 'multiple_choice':
+        return 'Enter exact option text (or letter) that is correct';
+      case 'drag_drop':
         return 'Enter exact option text (or letter) that is correct';
       case 'true_false':
         return 'Enter True, False, or Not Given';
@@ -153,6 +156,20 @@ const AdminExamEdit: React.FC = () => {
               )}
             </div>
 
+            {/* Import Headings for matching */}
+            {section.sectionType === 'reading' && (
+              <div className="mb-4">
+                <div className="text-sm font-medium text-gray-700 mb-2">Bulk Headings Import</div>
+                <BulkImporter
+                  mode="headings"
+                  onParsed={({ headingOptions }) => {
+                    if (!headingOptions) return;
+                    updateSection.mutate({ sectionId: section.id, data: { headingBank: { options: headingOptions } } });
+                  }}
+                />
+              </div>
+            )}
+
             {/* Matching bank (if section has matching) */}
             {section.questions?.some((q: any) => q.questionType === 'matching') && (
               <div className="mb-4">
@@ -257,6 +274,28 @@ const AdminExamEdit: React.FC = () => {
               </div>
             )}
 
+            {/* Bulk Questions Import */}
+            <div className="mb-4">
+              <div className="text-sm font-medium text-gray-700 mb-2">Bulk Questions Import</div>
+              <BulkImporter
+                mode="questions"
+                onParsed={async ({ groups }) => {
+                  if (!groups || !groups.length) return;
+                  try {
+                    await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
+                      sectionId: section.id,
+                      groups
+                    });
+                    toast.success('Questions created');
+                    // refresh
+                    (async () => { await queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); })();
+                  } catch (e: any) {
+                    toast.error(e?.message || 'Failed to create questions');
+                  }
+                }}
+              />
+            </div>
+
             {/* Questions */}
             <div className="space-y-3">
               {(section.questions || []).map((q: any) => (
@@ -280,6 +319,7 @@ const AdminExamEdit: React.FC = () => {
                       <span className="text-xs text-gray-500 w-6">#{q.questionNumber || q.order || ''}</span>
                       <select defaultValue={q.questionType} onChange={(e) => { setStatus(q.id, 'dirty'); updateQuestion.mutate({ questionId: q.id, data: { questionType: e.target.value } }); setStatus(q.id, 'saving'); }} className="rounded-md border-gray-300">
                       <option value="multiple_choice">Multiple Choice</option>
+                      <option value="drag_drop">Drag & Drop</option>
                       <option value="true_false">True/False/NG</option>
                       <option value="fill_blank">Fill in the Blank</option>
                       <option value="matching">Heading/Paragraph Matching</option>
@@ -293,8 +333,8 @@ const AdminExamEdit: React.FC = () => {
                     <input placeholder="Explanation (optional)" defaultValue={q.explanation || ''} onChange={() => setStatus(q.id, 'dirty')} onBlur={(e) => { setStatus(q.id, 'saving'); updateQuestion.mutate({ questionId: q.id, data: { explanation: e.target.value } }); }} className="md:col-span-6 rounded-md border-gray-300" />
                   </div>
 
-                  {/* Options for multiple choice/matching */}
-                  {(q.questionType === 'multiple_choice' || (q.questionType === 'matching' && !(section.headingBank?.options?.length))) && (
+                  {/* Options for multiple choice/matching/drag_drop */}
+                  {(q.questionType === 'multiple_choice' || q.questionType === 'drag_drop' || (q.questionType === 'matching' && !(section.headingBank?.options?.length))) && (
                     <div className="mt-3 space-y-2">
                       {q.questionType === 'matching' && (
                         <div className="flex items-center gap-2">

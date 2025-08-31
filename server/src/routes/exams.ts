@@ -180,8 +180,8 @@ router.get('/:id',
             questionData.correctAnswer = question.correct_answer;
           }
 
-          // Get question options for multiple choice questions
-          if (['multiple_choice', 'matching'].includes(question.question_type)) {
+          // Get question options for multiple choice-like questions
+          if (['multiple_choice', 'matching', 'drag_drop'].includes(question.question_type)) {
             const optionsResult = await query(`
               SELECT id, option_text, option_letter, option_order
               FROM exam_question_options 
@@ -468,7 +468,7 @@ router.post('/sessions/:sessionId/submit',
           const received = normalize(studentAnswer);
 
           let isCorrect = false;
-          if (question.question_type === 'multiple_choice' || question.question_type === 'matching') {
+          if (question.question_type === 'multiple_choice' || question.question_type === 'matching' || question.question_type === 'drag_drop') {
             isCorrect = expected !== '' && received === expected;
           } else if (question.question_type === 'true_false') {
             // Accept synonyms like T/F and not given variations
