@@ -1,0 +1,49 @@
+{
+  "name": "ielts-online-platform",
+  "version": "1.0.0",
+  "description": "IELTS Online Testing Platform for Best Center",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server:dev\" \"npm run client:dev\"",
+    "server:dev": "cd server && npm run dev",
+    "client:dev": "cd client && npm run dev",
+    "build": "npm run client:build && npm run server:build",
+    "client:build": "cd client && npm run build",
+    "server:build": "cd server && npm run build",
+    "start": "cd server && npm start",
+    "test": "npm run test:server && npm run test:client",
+    "test:server": "cd server && npm test",
+    "test:client": "cd client && npm test",
+    "docker:dev": "docker-compose -f docker-compose.dev.yml up -d",
+    "docker:prod": "docker-compose up -d",
+    "migrate": "cd server && npm run migrate",
+    "seed": "cd server && npm run seed"
+  },
+  "keywords": [
+    "ielts",
+    "online",
+    "testing",
+    "education",
+    "exam"
+  ],
+  "author": "Best Center",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "dependencies": {
+    "@headlessui/react": "^2.2.7",
+    "@heroicons/react": "^2.2.0",
+    "@hookform/resolvers": "^5.2.1",
+    "@tanstack/react-query": "^5.85.5",
+    "axios": "^1.11.0",
+    "lucide-react": "^0.542.0",
+    "react-hook-form": "^7.62.0",
+    "react-router-dom": "^7.8.2",
+    "react-toastify": "^11.0.5",
+    "recharts": "^3.1.2",
+    "socket.io-client": "^4.8.1",
+    "tailwindcss": "^4.1.12",
+    "yup": "^1.7.0"
+  }
+}
