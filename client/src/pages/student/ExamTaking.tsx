@@ -315,7 +315,7 @@ const ExamTaking: React.FC = () => {
                       </div>
                     )}
 
-                    {(q.questionType === 'multiple_choice' || q.type === 'multiple_choice' || q.questionType === 'matching') && (
+                    {(q.questionType === 'multiple_choice' || q.type === 'multiple_choice' || q.questionType === 'matching' || q.questionType === 'drag_drop') && (
                       <div className="space-y-2.5">
                         {(q.options || []).map((option: any, index: number) => {
                           const value = option.letter || option.text || option;
@@ -373,13 +373,13 @@ const ExamTaking: React.FC = () => {
                       </div>
                     )}
 
-                    {(q.questionType === 'essay' || q.type === 'text') && (
+                    {(q.questionType === 'essay' || q.type === 'text' || q.questionType === 'speaking_task') && (
                       <textarea
                         value={(answers[q.id]?.answer as string) || ''}
                         onChange={(e) => handleAnswerChange(q.id, e.target.value)}
-                        placeholder="Enter your answer..."
+                        placeholder={q.questionType === 'speaking_task' ? 'Type key points you would say...' : 'Enter your answer...'}
                         className="w-full p-3 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none"
-                        rows={6}
+                        rows={q.questionType === 'speaking_task' ? 4 : 6}
                       />
                     )}
 
