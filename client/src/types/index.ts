@@ -63,7 +63,9 @@ export type QuestionType =
   | 'matching'
   | 'short_answer'
   | 'essay'
-  | 'speaking';
+  | 'speaking'
+  | 'drag_drop'
+  | 'speaking_task';
 
 export interface QuestionOption {
   id: string;
