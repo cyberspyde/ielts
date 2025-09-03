@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation } from '@tanstack/react-query';
-import { Clock, ChevronLeft, ChevronRight, AlertTriangle, Send } from 'lucide-react';
+import { Clock, AlertTriangle } from 'lucide-react';
 import { toast } from 'react-toastify';
 import { apiService } from '../../services/api';
+import { useAuth } from '../../contexts/AuthContext';
 
 interface TimerProps {
   duration: number;
@@ -45,6 +46,7 @@ const ExamTaking: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
   const [searchParams] = useSearchParams();
   const sectionParam = searchParams.get('section') || undefined;
+  const sidFromUrl = searchParams.get('sid') || undefined;
   const navigate = useNavigate();
 
   const [currentSectionIndex, setCurrentSectionIndex] = useState(0);
@@ -53,13 +55,18 @@ const ExamTaking: React.FC = () => {
   const [isPaused] = useState(false);
   const [showConfirmSubmit, setShowConfirmSubmit] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [pendingHeading, setPendingHeading] = useState<string | null>(null);
+  // Matching drag & drop state
+  const [draggingHeading, setDraggingHeading] = useState<string | null>(null);
 
-  // Fetch exam (with questions)
+  // Fetch exam (with questions) - include sid so server can authorize question access for ticket-based (unauth) sessions
+  const activeSid = sidFromUrl || sessionId || undefined;
   const { data: exam, isLoading: examLoading } = useQuery({
-    queryKey: ['exam', examId],
+    queryKey: ['exam', examId, activeSid, sectionParam],
     queryFn: async () => {
-      const res = await apiService.get<any>(`/exams/${examId}`, { questions: 'true', ...(sectionParam ? { section: sectionParam } : {}) });
+      const params: Record<string, string> = { questions: 'true' };
+      if (sectionParam) params.section = sectionParam;
+      if (activeSid) params.sid = activeSid; // server also accepts 'session'
+      const res = await apiService.get<any>(`/exams/${examId}`, params);
       return (res.data as any)?.exam || res.data;
     },
     enabled: !!examId
@@ -77,11 +84,25 @@ const ExamTaking: React.FC = () => {
     onSuccess: (sid) => setSessionId(sid)
   });
 
+  // If sid present in URL, adopt it once
   useEffect(() => {
-    if (exam && !sessionId) {
+    if (sidFromUrl && !sessionId) {
+      setSessionId(sidFromUrl);
+    }
+  }, [sidFromUrl, sessionId]);
+
+  useEffect(() => {
+    if (exam && !sessionId && !sidFromUrl) {
       startSession.mutate(exam.id);
     }
-  }, [exam, sessionId]);
+  }, [exam, sessionId, sidFromUrl]);
+
+  // Lock outer scroll (hide global scrollbar) while taking exam
+  useEffect(() => {
+    const original = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = original; };
+  }, []);
 
   // Submit
   const submit = useMutation({
@@ -104,55 +125,97 @@ const ExamTaking: React.FC = () => {
   });
 
   const currentSection = exam?.sections?.[currentSectionIndex];
-  const currentQuestion = currentSection?.questions?.[currentQuestionIndex];
+  // currentQuestion removed (unused after refactor)
   const isMatchingSection = (currentSection?.questions || []).some((q: any) => (q.questionType === 'matching'));
   const headingOptions: any[] = isMatchingSection
     ? ((currentSection as any)?.headingBank?.options ||
        ((currentSection?.questions || []).find((q: any) => q.questionType === 'matching')?.options || []))
     : [];
 
-  // Line-drawing refs
-  const bankRefs = useRef<Record<string, HTMLButtonElement | null>>({});
-  const questionAnchorRefs = useRef<Record<string, HTMLDivElement | null>>({});
-  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
-  const [lines, setLines] = useState<Array<{ x1:number; y1:number; x2:number; y2:number; key: string }>>([]);
+  // Precompute matching questions
+  const matchingQuestions = (currentSection?.questions || []).filter((q: any) => q.questionType === 'matching');
+  const matchingQuestionsSorted = [...matchingQuestions].sort((a: any, b: any) => (a.questionNumber || 0) - (b.questionNumber || 0));
 
-  const recalcLines = useCallback(() => {
-    if (!scrollContainerRef.current) return;
-    const containerRect = scrollContainerRef.current.getBoundingClientRect();
-    const newLines: Array<{ x1:number; y1:number; x2:number; y2:number; key: string }> = [];
-    (currentSection?.questions || []).forEach((q: any) => {
-      const letter = (answers[q.id]?.answer as string) || '';
-      if (!letter) return;
-      const bankEl = bankRefs.current[letter];
-      const anchorEl = questionAnchorRefs.current[q.id];
-      if (!bankEl || !anchorEl) return;
-      const a = bankEl.getBoundingClientRect();
-      const b = anchorEl.getBoundingClientRect();
-      newLines.push({
-        x1: a.left + a.width / 2 - containerRect.left,
-        y1: a.top + a.height / 2 - containerRect.top,
-        x2: b.left + 8 - containerRect.left,
-        y2: b.top + b.height / 2 - containerRect.top,
-        key: q.id,
-      });
-    });
-    setLines(newLines);
-  }, [answers, currentSection]);
-
-  useEffect(() => {
-    recalcLines();
-  }, [recalcLines]);
-
-  useEffect(() => {
-    const handler = () => recalcLines();
-    window.addEventListener('resize', handler);
-    window.addEventListener('scroll', handler, true);
-    return () => {
-      window.removeEventListener('resize', handler);
-      window.removeEventListener('scroll', handler, true);
+  // Auto-detect paragraphs with letter markers (either a line containing only 'A' or a line starting 'A ' inline). Ensure unique sequential letters.
+  interface PassageParagraph { letter?: string; text: string; }
+  const passageParagraphs: PassageParagraph[] = React.useMemo(() => {
+    if (!currentSection?.passageText) return [];
+    const raw = currentSection.passageText.replace(/\r\n/g, '\n');
+    const lines = raw.split(/\n/);
+    const paras: PassageParagraph[] = [];
+    let current: { letter?: string; buffer: string[] } | null = null;
+    const pushCurrent = () => {
+      if (!current) return;
+      const text = current.buffer.join('\n').trim();
+      if (text) paras.push({ letter: current.letter, text });
+      current = null;
     };
-  }, [recalcLines]);
+    for (let i = 0; i < lines.length; i++) {
+      const rawLine = lines[i];
+      const line = rawLine.trim();
+      const singleLetter = /^[A-Z]$/.test(line);
+      const inlineLetter = /^([A-Z])\s+/.exec(line); // captures first letter when followed by space
+      if (singleLetter) {
+        pushCurrent();
+        current = { letter: line, buffer: [] };
+        continue;
+      } else if (inlineLetter && (current === null || current.buffer.length === 0)) {
+        // treat as new paragraph start with inline letter; remove letter token
+        pushCurrent();
+        current = { letter: inlineLetter[1], buffer: [rawLine.slice(rawLine.indexOf(inlineLetter[1]) + 1).trimStart()] };
+        continue;
+      }
+      if (!current) current = { buffer: [], letter: undefined };
+      current.buffer.push(rawLine);
+    }
+    pushCurrent();
+    // Validate detection quality; if fewer than 2 paragraphs, fallback
+    if (paras.length < 2) {
+      const parts = raw.split(/\n{2,}/).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+      return parts.map((p: string) => ({ text: p }));
+    }
+    // Normalize letters without shifting first lettered paragraph index.
+    const firstLetterIndex = paras.findIndex(p => !!p.letter);
+    const used = new Set<string>();
+    paras.forEach((p, idx) => {
+      if (p.letter) {
+        if (used.has(p.letter)) {
+          // duplicate letter: assign next free
+            let code = 65; while (used.has(String.fromCharCode(code))) code++; p.letter = String.fromCharCode(code);
+        }
+        used.add(p.letter);
+      } else if (firstLetterIndex !== -1 && idx > firstLetterIndex) {
+        // letterless paragraph after letters started -> assign next free
+        let code = 65; while (used.has(String.fromCharCode(code))) code++; p.letter = String.fromCharCode(code); used.add(p.letter);
+      }
+    });
+    return paras;
+  }, [currentSection?.passageText]);
+
+  // Helper: assign heading to question ensuring uniqueness (one heading used only once)
+  const assignHeadingToQuestion = (letter: string, questionId: string) => {
+    setAnswers(prev => {
+      const next = { ...prev } as typeof prev;
+      // Remove letter from any other question to enforce uniqueness
+      Object.values(next).forEach(v => {
+        if (v.questionId !== questionId && v.answer === letter) {
+          v.answer = '';
+        }
+      });
+      next[questionId] = { questionId, answer: letter };
+      return next;
+    });
+  };
+
+  const clearHeadingFromQuestion = (questionId: string) => {
+    setAnswers(prev => ({ ...prev, [questionId]: { questionId, answer: '' } }));
+  };
+
+  const resolveHeadingText = (letter: string | undefined) => {
+    if (!letter) return '';
+    const found = headingOptions.find((o: any) => (o.letter || o.option_letter) === letter);
+    return found?.text || found?.option_text || letter;
+  };
 
   const goToQuestion = (sectionIndex: number, questionIndex: number) => {
     setCurrentSectionIndex(sectionIndex);
@@ -178,68 +241,187 @@ const ExamTaking: React.FC = () => {
     }
   };
 
+  // Keyboard navigation (Left/Right arrows)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowRight') { e.preventDefault(); goToNextQuestion(); }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); goToPreviousQuestion(); }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [goToNextQuestion, goToPreviousQuestion]);
+
   const handleAnswerChange = (questionId: string, answer: string | string[]) => {
     setAnswers(prev => ({ ...prev, [questionId]: { questionId, answer } }));
   };
 
-  const handleTimeUp = useCallback(() => {
-    if (sessionId) submit.mutate(sessionId);
-  }, [sessionId]);
+  const handleTimeUp = () => { if (sessionId) submit.mutate(sessionId); };
 
-  if (examLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-      </div>
-    );
-  }
+  const { user } = useAuth();
 
-  if (!exam) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-center">
-          <h2 className="text-2xl font-bold text-red-600 mb-4">Exam Not Found</h2>
-          <p className="text-gray-600">The exam you're looking for doesn't exist.</p>
-        </div>
-      </div>
-    );
-  }
+  const [leftWidthPct, setLeftWidthPct] = useState<number>(50); // large screens only
+  useEffect(() => {
+    const onResize = () => {
+      // keep range 20-80
+      setLeftWidthPct(prev => Math.min(80, Math.max(20, prev)));
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
+  const startDrag = (e: React.PointerEvent) => {
+    if (window.innerWidth < 1024) return; // only on lg+
+    e.preventDefault();
+    const startX = e.clientX;
+    const startLeft = leftWidthPct;
+    const total = document.body.clientWidth;
+    let active = false; // activate only after threshold
+    const threshold = 3; // px
+    const move = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      if (!active && Math.abs(dx) >= threshold) {
+        active = true;
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = 'col-resize';
+      }
+      if (!active) return;
+      const percentDelta = (dx / total) * 100;
+      const next = Math.min(80, Math.max(20, startLeft + percentDelta));
+      setLeftWidthPct(next);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up, { once: true });
+  };
+
+  // Scroll handling for right pane question list
+  const rightScrollRef = useRef<HTMLDivElement | null>(null);
+  const questionRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  useEffect(() => {
+    const section = currentSection;
+    if (!section) return;
+    const targetQuestion = section.questions?.[currentQuestionIndex];
+    if (!targetQuestion) return;
+    const container = rightScrollRef.current;
+    if (!container) return;
+    // For matching questions (handled on left), scroll to top of headings list.
+    if (targetQuestion.questionType === 'matching') {
+      container.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+    const el = questionRefs.current[targetQuestion.id];
+    if (el) {
+      const offsetTop = el.offsetTop - 8; // small padding adjustment
+      container.scrollTo({ top: offsetTop, behavior: 'smooth' });
+    }
+  }, [currentQuestionIndex, currentSectionIndex, currentSection]);
+
+  const examSectionsLength = exam?.sections?.length || 0;
+  const notFound = !exam && !examLoading;
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <div className="bg-white border-b sticky top-0 z-10">
-        <div className="container mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-xl font-semibold text-gray-900">{exam.title}</h1>
-              <p className="text-sm text-gray-600">
-                Section {currentSectionIndex + 1} of {exam.sections.length}: {currentSection?.title || currentSection?.sectionType}
-              </p>
-            </div>
-            <div className="flex items-center space-x-4">
-              <Timer duration={currentSection?.durationMinutes || exam.durationMinutes || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
-              <button onClick={() => setShowConfirmSubmit(true)} className="flex items-center px-4 py-2 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700">
-                <Send className="h-4 w-4 mr-1" />
-                Submit
-              </button>
-            </div>
+    <div className="h-screen flex flex-col bg-gray-50 overflow-hidden select-text">
+      {examLoading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-white/70 z-50">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+        </div>
+      )}
+      {notFound && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="text-center">
+            <h2 className="text-2xl font-bold text-red-600 mb-4">Exam Not Found</h2>
+            <p className="text-gray-600">The exam you're looking for doesn't exist.</p>
           </div>
         </div>
+      )}
+      {/* Exam header (navigation hidden globally) */}
+      <div className="bg-white border-b z-30 px-4 py-2 flex items-center justify-between shadow-sm">
+        <div className="flex flex-col">
+          <span className="text-sm text-gray-500">{user?.firstName} {user?.lastName}</span>
+          <h1 className="text-base font-semibold text-gray-900">{exam?.title || (examLoading ? 'Loading…' : 'Unknown Exam')}</h1>
+          {exam && <p className="text-xs text-gray-600">Section {currentSectionIndex + 1} of {examSectionsLength}: {currentSection?.title || currentSection?.sectionType}</p>}
+        </div>
+        <div className="flex items-center gap-4">
+          <Timer duration={currentSection?.durationMinutes || exam?.durationMinutes || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
+          {exam && <button onClick={() => setShowConfirmSubmit(true)} className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700">Submit</button>}
+        </div>
       </div>
 
-      <div className="mx-auto px-0 py-0">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-2">
-          {/* Left column: passage (for reading) */}
-          <div className={(currentSection?.sectionType || '').toLowerCase() === 'reading' ? 'lg:col-span-6' : 'lg:col-span-6'}>
-            <div className="bg-white shadow-sm border rounded-none flex flex-col h-[calc(100vh-180px)]">
-              <div className="p-2 md:p-3 flex-1 overflow-auto">
+      <div className="flex-1 overflow-hidden min-h-0">
+        {/* Responsive: stacked on small screens, resizable flex on lg+ */}
+        <div className="h-full w-full flex flex-col lg:flex-row gap-0">
+          {/* Left Pane */}
+          <div
+            className="min-h-0 flex flex-col border-b lg:border-b-0 lg:border-r bg-white shadow-sm"
+            style={window.innerWidth >= 1024 ? { width: `${leftWidthPct}%` } : undefined}
+          >
+            <div className="flex flex-col h-full overflow-hidden min-h-0">
+              <div className="p-2 md:p-3 flex-1 overflow-auto min-h-0">
                 {(currentSection?.sectionType || '').toLowerCase() === 'reading' ? (
                   <>
                     <h3 className="font-semibold text-gray-900 mb-3">Reading Passage</h3>
-                    <div className="prose max-w-none text-gray-800 whitespace-pre-wrap">
-                      {currentSection?.passageText || 'No passage text set for this section.'}
-                    </div>
+                    {/* Matching drag & drop paragraphs */}
+                    {/* Always show passage text (if any) */}
+                    {isMatchingSection && passageParagraphs.length > 0 && matchingQuestionsSorted.length > 0 ? (
+                      <div className="mb-6">
+                        {(() => {
+                          const lettered = passageParagraphs.filter(p => p.letter);
+                          return passageParagraphs.map((paraObj, idxAll) => {
+                            const para = paraObj.text;
+                            if (!paraObj.letter) {
+                              // Intro or unlabeled paragraph
+                              return (
+                                <div key={`intro-${idxAll}`} className="mb-6 pb-4 border-b last:border-0 last:pb-0">
+                                  <div className="prose max-w-none text-gray-800 whitespace-pre-wrap text-sm leading-relaxed">{para}</div>
+                                </div>
+                              );
+                            }
+                            const idx = lettered.indexOf(paraObj);
+                            const mq = matchingQuestionsSorted[idx];
+                            if (!mq) return null;
+                            const qAnswer = (answers[mq.id]?.answer as string) || '';
+                            const paragraphLetter = paraObj.letter;
+                            return (
+                              <div key={mq.id} className="mb-6 pb-4 border-b last:border-0 last:pb-0">
+                                <div
+                                  className={`mb-2 px-3 py-2 border rounded flex items-center gap-3 min-h-[44px] bg-white transition-colors text-sm ${draggingHeading ? 'border-blue-500 ring-1 ring-blue-300' : 'border-gray-300'}`}
+                                  onDragOver={(e) => { e.preventDefault(); }}
+                                  onDrop={(e) => { e.preventDefault(); const letter = e.dataTransfer.getData('text/plain'); if (letter) assignHeadingToQuestion(letter, mq.id); setDraggingHeading(null); }}
+                                >
+                                  <span className="text-[11px] font-semibold text-gray-500 w-6 text-center select-none">{mq.questionNumber || ''}</span>
+                                  {qAnswer ? (
+                                    <>
+                                      <span className="flex-1 text-gray-900 font-medium leading-snug">{resolveHeadingText(qAnswer)}</span>
+                                      <button onClick={() => clearHeadingFromQuestion(mq.id)} className="ml-auto text-[11px] text-red-600 hover:underline" type="button">✕</button>
+                                    </>
+                                  ) : (
+                                    <span className="flex-1 text-gray-400 italic">Drop heading here</span>
+                                  )}
+                                </div>
+                                <div className="text-xs text-gray-500 mb-1">Paragraph {paragraphLetter}</div>
+                                <div className="prose max-w-none text-gray-800 whitespace-pre-wrap text-sm leading-relaxed">{para}</div>
+                              </div>
+                            );
+                          });
+                        })()}
+                      </div>
+                    ) : (
+                      // Fallback: show entire passage if no auto-detect possible
+                      currentSection?.passageText && (
+                        <div className="prose max-w-none text-gray-800 whitespace-pre-wrap mb-6">{currentSection.passageText}</div>
+                      )
+                    )}
+                    {/* Non-matching passage text (if provided) */}
+                    {!isMatchingSection && (
+                      <div className="prose max-w-none text-gray-800 whitespace-pre-wrap">
+                        {currentSection?.passageText || 'No passage text set for this section.'}
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div className="text-sm text-gray-500">Navigate questions using the chips below.</div>
@@ -247,57 +429,156 @@ const ExamTaking: React.FC = () => {
               </div>
             </div>
           </div>
-
-          
-
-          {/* Right column: question list */}
-          <div className="lg:col-span-6">
-            <div className="bg-white shadow-sm border-l rounded-none flex flex-col h-[calc(100vh-180px)]">
-              <div className="p-2 md:p-3 flex-1 overflow-auto relative" ref={scrollContainerRef}>
-                {isMatchingSection && (
-                  <div className="mb-4">
-                    <div className="text-sm font-medium text-gray-700 mb-2">Headings</div>
-                    <div className="flex flex-wrap gap-2">
+          {/* Divider handle (lg+) */}
+          <div
+            className="hidden lg:block w-1 relative cursor-col-resize group"
+            role="separator"
+            aria-orientation="vertical"
+            aria-valuenow={Math.round(leftWidthPct)}
+            aria-valuemin={20}
+            aria-valuemax={80}
+            tabIndex={0}
+            onPointerDown={startDrag}
+          >
+            <div className="absolute inset-0 bg-gray-200 group-hover:bg-gray-300 transition-colors"></div>
+            <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-0.5 bg-gray-300"></div>
+          </div>
+          {/* Right Pane */}
+          <div
+            className="min-h-0 flex flex-col bg-white shadow-sm"
+            style={window.innerWidth >= 1024 ? { width: `${100 - leftWidthPct}%` } : undefined}
+          >
+            <div className="flex flex-col h-full overflow-hidden min-h-0 border-l">
+              <div ref={rightScrollRef} className="p-2 md:p-3 flex-1 overflow-auto relative min-h-0">
+                {isMatchingSection && headingOptions.length > 0 && (
+                  <div className="mb-4 space-y-2">
+                    {(() => { const gi = matchingQuestions[0]?.metadata?.groupInstruction; return gi ? <div className="text-xs text-gray-600 whitespace-pre-wrap border rounded p-2 bg-gray-50">{gi}</div> : null; })()}
+                    <div className="text-sm font-medium text-gray-700">List of Headings</div>
+                    <div className="flex flex-col gap-2">
                       {headingOptions.map((opt: any, idx: number) => {
                         const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + idx);
-                        const isActive = pendingHeading === letter;
+                        const text = opt.text || opt.option_text || '';
+                        const used = matchingQuestions.some((mq: any) => (answers[mq.id]?.answer as string) === letter);
                         return (
-                          <button
+                          <div
                             key={letter}
-                            ref={(el) => { bankRefs.current[letter] = el; }}
-                            onClick={() => setPendingHeading(isActive ? null : letter)}
-                            className={`px-2.5 py-1 rounded border text-sm ${isActive ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700'}`}
-                            title={opt.text || opt.option_text}
+                            draggable
+                            onDragStart={(e) => { e.dataTransfer.setData('text/plain', letter); setDraggingHeading(letter); }}
+                            onDragEnd={() => setDraggingHeading(null)}
+                            className={`px-3 py-1.5 rounded border text-sm cursor-move select-none leading-snug ${used ? 'bg-gray-200 text-gray-500 line-through' : 'bg-white hover:bg-gray-50'} border-gray-300`}
+                            title={text + (used ? ' (already used)' : '')}
                           >
-                            {letter}
-                          </button>
+                            {text}
+                          </div>
                         );
                       })}
                     </div>
-                    {pendingHeading && (
-                      <div className="mt-1 text-xs text-blue-600">Selected: {pendingHeading} — click a paragraph/question to assign</div>
-                    )}
+                    <div className="text-[10px] text-gray-500">Drag a heading text onto a paragraph drop zone on the left. Each heading can be used once.</div>
                   </div>
                 )}
-                {/* SVG overlay for lines */}
-                {isMatchingSection && lines.length > 0 && (
-                  <svg className="absolute inset-0 pointer-events-none" width="100%" height="100%">
-                    {lines.map((l) => (
-                      <line key={l.key} x1={l.x1} y1={l.y1} x2={l.x2} y2={l.y2} stroke="#2563eb" strokeWidth="2" strokeOpacity="0.8" />
-                    ))}
-                  </svg>
-                )}
-                {(currentSection?.questions || []).map((q: any, idx: number) => (
-                  <div key={q.id} className="mb-3 pb-3 border-b last:border-0 last:pb-0">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center space-x-3">
-                        <span className="text-sm font-medium text-gray-500">Question {idx + 1}</span>
-                        <span className="px-2 py-0.5 bg-blue-100 text-blue-800 text-xs rounded-full">{q.questionType}</span>
+                {(() => {
+                  const lastInstructionPerType: Record<string, string | undefined> = {};
+                  return (currentSection?.questions || []).filter((q: any) => q.questionType !== 'matching').map((q: any, idx: number) => {
+                  const displayNumber = q.questionNumber || (idx + 1);
+                  // Interactive fill_blank: support placeholders {answer1} OR runs of underscores ___ inline.
+                  let renderedQuestionText: React.ReactNode = q.questionText || q.text;
+                  let hasInlinePlaceholders = false;
+                  if (q.questionType === 'fill_blank' && typeof (q.questionText || '') === 'string') {
+                    const text = q.questionText;
+                    const hasCurly = /\{answer\d+\}/i.test(text);
+                    const hasUnderscore = /_{3,}/.test(text);
+                    if (hasCurly || hasUnderscore) {
+                      hasInlinePlaceholders = true;
+                      const nodes: React.ReactNode[] = [];
+                      const answerArray = Array.isArray(answers[q.id]?.answer) ? answers[q.id]?.answer as string[] : [];
+                      const baseNum = Number(q.questionNumber) || (idx + 1);
+                      if (hasCurly) {
+                        const regex = /\{(answer\d+)\}/gi;
+                        let lastIndex = 0; let match; let blankIndex = 0;
+                        while ((match = regex.exec(text)) !== null) {
+                          const before = text.slice(lastIndex, match.index);
+                          if (before) nodes.push(before);
+                          const idxLocal = blankIndex;
+                          const val = answerArray[idxLocal] || '';
+                          const blankNumber = baseNum + idxLocal;
+                          nodes.push(
+                            <span key={`blank-${q.id}-${idxLocal}`} className="mx-1 inline-block align-middle">
+                              <span className="relative inline-flex">
+                                <input
+                                  type="text"
+                                  className="px-2 py-1 border border-gray-400 rounded-sm text-sm min-w-[110px] focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-center font-medium tracking-wide"
+                                  value={val}
+                                  onChange={(e) => {
+                                    const prev = Array.isArray(answers[q.id]?.answer) ? [...(answers[q.id]?.answer as string[])] : [];
+                                    while (prev.length <= idxLocal) prev.push('');
+                                    prev[idxLocal] = e.target.value;
+                                    handleAnswerChange(q.id, prev);
+                                  }}
+                                />
+                                {!val && (
+                                  <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-semibold text-gray-700 select-none">{blankNumber}</span>
+                                )}
+                              </span>
+                            </span>
+                          );
+                          blankIndex++;
+                          lastIndex = regex.lastIndex;
+                        }
+                        const tail = text.slice(lastIndex);
+                        if (tail) nodes.push(tail);
+                      } else if (hasUnderscore) {
+                        const uRegex = /_{3,}/g;
+                        let lastIndexU = 0; let matchU; let blankIndex = 0;
+                        while ((matchU = uRegex.exec(text)) !== null) {
+                          const before = text.slice(lastIndexU, matchU.index);
+                          if (before) nodes.push(before);
+                          const idxLocal = blankIndex;
+                          const val = answerArray[idxLocal] || '';
+                          const blankNumber = baseNum + idxLocal;
+                          nodes.push(
+                            <span key={`ublank-${q.id}-${idxLocal}`} className="mx-1 inline-block align-middle">
+                              <span className="relative inline-flex">
+                                <input
+                                  type="text"
+                                  className="px-2 py-1 border border-gray-400 rounded-sm text-sm min-w-[110px] focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-center font-medium tracking-wide"
+                                  value={val}
+                                  onChange={(e) => {
+                                    const prev = Array.isArray(answers[q.id]?.answer) ? [...(answers[q.id]?.answer as string[])] : [];
+                                    while (prev.length <= idxLocal) prev.push('');
+                                    prev[idxLocal] = e.target.value;
+                                    handleAnswerChange(q.id, prev);
+                                  }}
+                                />
+                                {!val && (
+                                  <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-semibold text-gray-700 select-none">{blankNumber}</span>
+                                )}
+                              </span>
+                            </span>
+                          );
+                          blankIndex++;
+                          lastIndexU = uRegex.lastIndex;
+                        }
+                        const tail = text.slice(lastIndexU);
+                        if (tail) nodes.push(tail);
+                      }
+                      renderedQuestionText = <span className="leading-relaxed flex flex-wrap items-center">{nodes}</span>;
+                    }
+                  }
+                    const groupInstruction: string | undefined = q.metadata?.groupInstruction;
+                    const showGroupInstruction = !!groupInstruction && groupInstruction !== lastInstructionPerType[q.questionType];
+                    if (showGroupInstruction) lastInstructionPerType[q.questionType] = groupInstruction;
+                  return (
+                  <div ref={el => { if (el) questionRefs.current[q.id] = el; }} key={q.id} className="mb-3 pb-3 border-b last:border-0 last:pb-0">
+                    {showGroupInstruction && (
+                      <div className="mb-2 text-xs text-gray-600 bg-gray-50 border rounded p-2 whitespace-pre-wrap">
+                        {groupInstruction}
                       </div>
-                    </div>
-                    <div className="flex items-start gap-3">
-                      <div ref={(el) => { questionAnchorRefs.current[q.id] = el; }} className="w-2 h-2 mt-2 rounded-full bg-blue-500 opacity-60"></div>
-                      <h3 className="text-lg font-medium text-gray-900 mb-3 flex-1">{q.questionText || q.text}</h3>
+                    )}
+                    <div className="mb-2">
+                      <h3 className="text-base font-medium text-gray-900 flex flex-wrap items-start gap-1">
+                        <span className="text-gray-600">Question {displayNumber} -</span>
+                        <span className="font-medium text-gray-900">{renderedQuestionText}</span>
+                      </h3>
                     </div>
 
                     {(currentSection?.sectionType || '').toLowerCase() === 'listening' && currentSection?.audioUrl && idx === 0 && (
@@ -315,61 +596,78 @@ const ExamTaking: React.FC = () => {
                       </div>
                     )}
 
-                    {(q.questionType === 'multiple_choice' || q.type === 'multiple_choice' || q.questionType === 'matching' || q.questionType === 'drag_drop') && (
-                      <div className="space-y-2.5">
-                        {(q.options || []).map((option: any, index: number) => {
-                          const value = option.letter || option.text || option;
-                          const isSelected = answers[q.id]?.answer === value;
-                          return (
-                            <label key={index} className="flex items-center p-3 border border-gray-200 rounded hover:bg-gray-50 cursor-pointer">
-                              <input
-                                type="radio"
-                                name={`question-${q.id}`}
-                                value={value}
-                                checked={isSelected}
-                                onChange={(e) => handleAnswerChange(q.id, e.target.value)}
-                                className="mr-3"
-                              />
-                              {option.letter && (
-                                <span className="inline-flex items-center justify-center w-6 h-6 text-xs font-semibold rounded-full bg-blue-100 text-blue-800 mr-2">
-                                  {option.letter}
-                                </span>
-                              )}
-                              <span className="text-gray-900">{option.text || option}</span>
-                            </label>
-                          );
-                        })}
+                    {(q.questionType === 'multiple_choice' || q.type === 'multiple_choice' || q.questionType === 'drag_drop') && (
+                      <div className="mb-2">
+                        <select
+                          className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                          value={(answers[q.id]?.answer as string) || ''}
+                          onChange={(e) => handleAnswerChange(q.id, e.target.value)}>
+                          <option value="">Select an answer</option>
+                          {(q.options || []).map((option: any, index: number) => {
+                            const value = option.letter || option.text || option;
+                            const label = option.letter ? `${option.letter}. ${option.text}` : option.text || option;
+                            return <option key={index} value={value}>{label}</option>;
+                          })}
+                        </select>
                       </div>
                     )}
 
-                    {isMatchingSection && q.questionType === 'matching' && (
-                      <button
-                        onClick={() => {
-                          if (!pendingHeading) return;
-                          handleAnswerChange(q.id, pendingHeading);
-                          setPendingHeading(null);
-                        }}
-                        className="mt-2 px-3 py-1.5 text-sm rounded border border-blue-200 text-blue-700 hover:bg-blue-50"
-                      >
-                        {answers[q.id]?.answer ? `Assigned: ${answers[q.id]?.answer}` : 'Assign selected heading'}
-                      </button>
+                    {q.questionType === 'multi_select' && (
+                      <div className="mb-2 space-y-1">
+                        {(q.options || []).map((opt: any, idx: number) => {
+                          const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + idx);
+                          const label = opt.option_text || opt.text || '';
+                          const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as string[]) : [];
+                          const checked = current.includes(letter);
+                          return (
+                            <label
+                              key={letter}
+                              className={`flex items-start gap-2 text-sm px-3 py-2 border rounded cursor-pointer select-none ${checked ? 'bg-blue-100 border-blue-300' : 'bg-white border-gray-300 hover:bg-gray-50'}`}
+                              onClick={() => {
+                                let next = [...current];
+                                if (checked) next = next.filter(l => l !== letter); else if (next.length < 2) next.push(letter); else {
+                                  // Replace the second selection keeping the first
+                                  next = [next[0], letter];
+                                }
+                                handleAnswerChange(q.id, next);
+                              }}
+                            >
+                              <input type="checkbox" className="mt-1" checked={checked} readOnly />
+                              <span className="flex-1">{label}</span>
+                            </label>
+                          );
+                        })}
+                        <div className="text-[10px] text-gray-500">Choose TWO answers.</div>
+                      </div>
                     )}
 
+                    {/* Matching dropdown removed in favor of drag & drop UI on left */}
+
+                    {/* Assign selected heading button removed */}
+
                     {(q.questionType === 'true_false') && (
-                      <div className="space-y-2.5">
-                        {['True','False','Not Given'].map((label, idx) => (
-                          <label key={idx} className="flex items-center p-3 border border-gray-200 rounded hover:bg-gray-50 cursor-pointer">
-                            <input
-                              type="radio"
-                              name={`question-${q.id}`}
-                              value={label}
-                              checked={answers[q.id]?.answer === label}
-                              onChange={(e) => handleAnswerChange(q.id, e.target.value)}
-                              className="mr-3"
-                            />
-                            <span className="text-gray-900">{label}</span>
-                          </label>
-                        ))}
+                      <div className="space-y-1">
+                        {['TRUE','FALSE','NOT GIVEN'].map((raw, idx) => {
+                          const label = raw.replace('NOT GIVEN','Not Given').replace('TRUE','True').replace('FALSE','False');
+                          const selected = (typeof answers[q.id]?.answer === 'string' ? (answers[q.id]?.answer as string) : '').toLowerCase() === label.toLowerCase();
+                          return (
+                            <label
+                              key={idx}
+                              className={`flex items-start gap-2 cursor-pointer rounded px-3 py-2 border border-transparent hover:bg-gray-100 transition-colors ${selected ? 'bg-gray-200' : ''}`}
+                              onClick={() => handleAnswerChange(q.id, label)}
+                            >
+                              <input
+                                type="radio"
+                                className="mt-1"
+                                name={`question-${q.id}`}
+                                value={label}
+                                checked={selected}
+                                onChange={() => handleAnswerChange(q.id, label)}
+                              />
+                              <span className="text-sm text-gray-900 select-none">{label}</span>
+                            </label>
+                          );
+                        })}
                       </div>
                     )}
 
@@ -383,17 +681,25 @@ const ExamTaking: React.FC = () => {
                       />
                     )}
 
-                    {(q.questionType === 'fill_blank' || q.type === 'number') && (
-                      <input
-                        type="text"
-                        value={(answers[q.id]?.answer as string) || ''}
-                        onChange={(e) => handleAnswerChange(q.id, e.target.value)}
-                        placeholder="Enter your answer..."
-                        className="w-full p-3 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                      />
+                    {(q.questionType === 'fill_blank' || q.type === 'number') && !hasInlinePlaceholders && (
+                      <div className="mt-2">
+                        <span className="relative inline-flex">
+                          <input
+                            type="text"
+                            value={(answers[q.id]?.answer as string) || ''}
+                            onChange={(e) => handleAnswerChange(q.id, e.target.value)}
+                            className="px-3 py-2 border border-gray-400 rounded-sm text-sm min-w-[140px] focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-center font-medium tracking-wide"
+                          />
+                          {!(answers[q.id]?.answer) && (
+                            <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-semibold text-gray-700 select-none">
+                              {q.questionNumber || ''}
+                            </span>
+                          )}
+                        </span>
+                      </div>
                     )}
                   </div>
-                ))}
+                );});})()}
               </div>
               <div className="p-4 border-t flex items-center gap-2">
                 <button
@@ -415,21 +721,30 @@ const ExamTaking: React.FC = () => {
           </div>
         </div>
       </div>
-
-      {/* Full-width bottom navigation */}
-      <div className="sticky bottom-0 left-0 right-0 bg-white border-t">
-        <div className="container mx-auto px-2 md:px-4 py-3">
-          <div className="flex flex-wrap gap-1">
-            {(currentSection?.questions || []).map((q: any, idx: number) => {
+      {/* Bottom navigation integrated inside flex (no outer page scroll) */}
+  <div className="border-t bg-white p-3">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={goToPreviousQuestion}
+            className="px-3 py-2 text-sm rounded border border-gray-300 bg-white hover:bg-gray-50"
+            disabled={currentSectionIndex === 0 && currentQuestionIndex === 0}
+          >Prev</button>
+          <div className="flex-1 flex flex-wrap gap-1 overflow-y-auto max-h-20">
+    {(currentSection?.questions || []).map((q: any, idx: number) => {
               const isAnswered = answers[q.id];
               const isCurrent = idx === currentQuestionIndex;
               return (
                 <button key={q.id} onClick={() => goToQuestion(currentSectionIndex, idx)} className={`w-8 h-8 text-xs rounded border flex items-center justify-center ${isCurrent ? 'bg-blue-600 text-white border-blue-600' : isAnswered ? 'bg-green-100 text-green-800 border-green-300' : 'bg-gray-50 text-gray-600 border-gray-300 hover:bg-gray-100'}`}>
-                  {idx + 1}
+                  {q.questionNumber || idx + 1}
                 </button>
               );
             })}
           </div>
+          <button
+            onClick={goToNextQuestion}
+            className="px-3 py-2 text-sm rounded border border-blue-300 bg-blue-600 text-white hover:bg-blue-700"
+    disabled={(currentSectionIndex === (examSectionsLength || 1) - 1) && (currentQuestionIndex === ((currentSection?.questions?.length || 1) - 1))}
+          >Next</button>
         </div>
       </div>
 

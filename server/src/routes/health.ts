@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { healthCheck } from '../config/database';
+import { healthCheck } from '../config/database-no-redis';
 import { asyncHandler } from '../middleware/errorHandler';
 
 const router = Router();
@@ -9,14 +9,13 @@ router.get('/', asyncHandler(async (req: Request, res: Response) => {
   const health = await healthCheck();
   
   const healthStatus = {
-    status: health.database && health.redis ? 'healthy' : 'unhealthy',
+    status: health.database ? 'healthy' : 'unhealthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV,
     version: process.env.npm_package_version || '1.0.0',
     services: {
-      database: health.database ? 'connected' : 'disconnected',
-      redis: health.redis ? 'connected' : 'disconnected',
+      database: health.database ? 'connected' : 'disconnected'
     },
     system: {
       memory: process.memoryUsage(),
@@ -34,7 +33,7 @@ router.get('/detailed', asyncHandler(async (req: Request, res: Response) => {
   const health = await healthCheck();
   
   const detailedHealth = {
-    status: health.database && health.redis ? 'healthy' : 'unhealthy',
+    status: health.database ? 'healthy' : 'unhealthy',
     timestamp: new Date().toISOString(),
     uptime: {
       seconds: process.uptime(),
@@ -47,10 +46,6 @@ router.get('/detailed', asyncHandler(async (req: Request, res: Response) => {
       database: {
         status: health.database ? 'connected' : 'disconnected',
         type: 'PostgreSQL'
-      },
-      redis: {
-        status: health.redis ? 'connected' : 'disconnected',
-        type: 'Redis'
       }
     },
     system: {
@@ -89,7 +84,7 @@ router.get('/live', (req: Request, res: Response) => {
 router.get('/ready', asyncHandler(async (req: Request, res: Response) => {
   const health = await healthCheck();
   
-  if (health.database && health.redis) {
+  if (health.database) {
     res.status(200).json({
       status: 'ready',
       timestamp: new Date().toISOString()

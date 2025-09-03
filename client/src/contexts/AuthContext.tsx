@@ -147,10 +147,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       );
       
       if (response.success && response.data) {
-        const { user, accessToken } = response.data as any;
+        const { user, accessToken, refreshToken } = response.data as any;
         
         // Store token and user data
         localStorage.setItem('token', accessToken);
+        if (refreshToken) localStorage.setItem('refreshToken', refreshToken);
         localStorage.setItem('user', JSON.stringify(user));
         
         dispatch({
@@ -187,10 +188,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       );
       
       if (response.success && response.data) {
-        const { user, accessToken } = response.data as any;
+        const { user, accessToken, refreshToken } = response.data as any;
         
         // Store token and user data
         localStorage.setItem('token', accessToken);
+        if (refreshToken) localStorage.setItem('refreshToken', refreshToken);
         localStorage.setItem('user', JSON.stringify(user));
         
         dispatch({

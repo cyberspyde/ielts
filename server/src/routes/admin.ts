@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
-import { query, logger } from '../config/database';
+import { query, logger } from '../config/database-no-redis';
 import { asyncHandler, createValidationError, createNotFoundError, AppError } from '../middleware/errorHandler';
 import { authMiddleware, requireRole, requireAdmin, requireSuperAdmin, rateLimitByUser } from '../middleware/auth';
 
@@ -233,6 +233,7 @@ router.put('/questions/:questionId',
   body('explanation').optional().isString(),
   body('audioUrl').optional().isString(),
   body('imageUrl').optional().isString(),
+  body('metadata').optional(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
     const { questionId } = req.params;
@@ -242,11 +243,11 @@ router.put('/questions/:questionId',
     const map: Record<string, string> = {
       questionType: 'question_type', questionText: 'question_text', points: 'points',
       timeLimitSeconds: 'time_limit_seconds', explanation: 'explanation', correctAnswer: 'correct_answer',
-      audioUrl: 'audio_url', imageUrl: 'image_url'
+      audioUrl: 'audio_url', imageUrl: 'image_url', metadata: 'metadata'
     };
     for (const key of Object.keys(map)) {
       const val = (req.body as any)[key];
-      if (val !== undefined) { fields.push(`${map[key]} = $${p++}`); values.push(val); }
+      if (val !== undefined) { fields.push(`${map[key]} = $${p++}`); values.push(key === 'metadata' ? JSON.stringify(val) : val); }
     }
     if (fields.length === 0) { res.json({ success: true, message: 'No changes' }); return; }
     values.push(questionId);
@@ -353,6 +354,7 @@ router.post('/exams/:examId/questions/bulk',
   body('groups.*.points').optional().isFloat({ min: 0 }).withMessage('Points must be >= 0'),
   body('groups.*.options').optional().isArray().withMessage('Options must be an array when provided'),
   body('groups.*.correctAnswers').optional().isArray().withMessage('correctAnswers must be an array when provided'),
+  body('groups.*.questionTexts').optional().isArray().withMessage('questionTexts must be an array when provided'),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
 
@@ -383,7 +385,13 @@ router.post('/exams/:examId/questions/bulk',
           INSERT INTO exam_questions (
             section_id, question_type, question_text, question_number, points
           ) VALUES ($1, $2, $3, $4, $5) RETURNING id
-        `, [sectionId, dbQuestionType, g.questionText || '', num, g.points || 1.0]);
+        `, [
+          sectionId,
+          dbQuestionType,
+          (Array.isArray(g.questionTexts) ? g.questionTexts[num - startNum] : g.questionText) || '',
+          num,
+          g.points || 1.0
+        ]);
         const questionId = rQ.rows[0].id;
 
         // If provided, set correct answer per question by index within group
@@ -524,7 +532,7 @@ router.get('/users',
 
 // POST /api/admin/tickets - Create exam tickets
 router.post('/tickets',
-  rateLimitByUser(20, 60), // 20 tickets per hour
+  rateLimitByUser(20, 3600), // 20 tickets per hour (3600s)
   body('examId')
     .isUUID()
     .withMessage('Valid exam ID is required'),
@@ -595,7 +603,11 @@ router.post('/tickets',
     const ticketPrefix = process.env.TICKET_PREFIX || 'IELTS';
 
     for (let i = 0; i < quantity; i++) {
-      const ticketCode = `${ticketPrefix}-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+      // Keep ticket code <= 20 chars to satisfy DB constraint (VARCHAR(20))
+      const tsPart = Date.now().toString(36).toUpperCase().slice(-6); // 6 chars
+      const randPart = Math.random().toString(36).toUpperCase().slice(2, 6); // 4 chars
+      const prefixPart = ticketPrefix.slice(0, 5); // up to 5 chars
+      const ticketCode = `${prefixPart}-${tsPart}-${randPart}`; // ~5+1+6+1+4 = 17
       
       const ticketResult = await query(`
         INSERT INTO tickets (
@@ -929,6 +941,95 @@ router.get('/sessions',
           hasNext: Number(page) < totalPages,
           hasPrev: Number(page) > 1
         }
+      }
+    });
+  })
+);
+
+// GET /api/admin/sessions/:sessionId/results - Get results for any session (including ticket-based anonymous)
+router.get('/sessions/:sessionId/results',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { sessionId } = req.params;
+
+    // Fetch session with exam and optional user/ticket info
+    const sessionResult = await query(`
+      SELECT es.id, es.status, es.started_at, es.submitted_at, es.total_score,
+             es.percentage_score, es.is_passed, es.time_spent_seconds,
+             es.exam_id, es.ticket_id,
+             e.title as exam_title, e.exam_type, e.passing_score, e.duration_minutes,
+             u.email as user_email, u.first_name, u.last_name,
+             t.ticket_code
+      FROM exam_sessions es
+      JOIN exams e ON es.exam_id = e.id
+      LEFT JOIN users u ON es.user_id = u.id
+      LEFT JOIN tickets t ON es.ticket_id = t.id
+      WHERE es.id = $1
+    `, [sessionId]);
+
+    if (sessionResult.rows.length === 0) {
+      throw createNotFoundError('Exam session');
+    }
+
+    const session = sessionResult.rows[0];
+
+    if (session.status !== 'submitted') {
+      throw new AppError('Session not yet submitted', 400);
+    }
+
+    // Get answers
+    const answersResult = await query(`
+      SELECT esa.question_id, esa.student_answer, esa.is_correct, esa.points_earned,
+             eq.question_text, eq.correct_answer, eq.explanation, eq.points,
+             esec.section_type, esec.title as section_title, eq.question_number, eq.question_type
+      FROM exam_session_answers esa
+      JOIN exam_questions eq ON esa.question_id = eq.id
+      JOIN exam_sections esec ON eq.section_id = esec.id
+      WHERE esa.session_id = $1
+      ORDER BY esec.section_order, eq.question_number
+    `, [sessionId]);
+
+    const answers = answersResult.rows.map((row: any) => {
+      let parsedStudent: any = null;
+      try { parsedStudent = JSON.parse(row.student_answer || 'null'); } catch { parsedStudent = row.student_answer; }
+      return {
+        questionId: row.question_id,
+        questionNumber: row.question_number,
+        questionType: row.question_type,
+        questionText: row.question_text,
+        studentAnswer: parsedStudent,
+        isCorrect: row.is_correct,
+        pointsEarned: row.points_earned,
+        maxPoints: row.points,
+        correctAnswer: row.correct_answer,
+        explanation: row.explanation,
+        sectionType: row.section_type,
+        sectionTitle: row.section_title
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        session: {
+          id: session.id,
+            status: session.status,
+            startedAt: session.started_at,
+            submittedAt: session.submitted_at,
+            totalScore: session.total_score,
+            percentageScore: session.percentage_score,
+            isPassed: session.is_passed,
+            timeSpentSeconds: session.time_spent_seconds,
+            ticketCode: session.ticket_code,
+            user: session.user_email ? { email: session.user_email, name: `${session.first_name} ${session.last_name}` } : null
+        },
+        exam: {
+          id: session.exam_id,
+          title: session.exam_title,
+          type: session.exam_type,
+          passingScore: session.passing_score,
+          durationMinutes: session.duration_minutes
+        },
+        answers
       }
     });
   })

@@ -1,0 +1,41 @@
+IELTS Platform – Prioritized Development Plan and Technical TODOs
+
+Scope: This file captures what’s missing, what’s broken, and what to build next, ordered by priority. Items are grouped by Critical, High, Medium, Low. Each bullet is an actionable task with an intended outcome.
+
+MEDIUM
+- Consolidate `database.ts` vs `database-no-redis.ts`
+  - Feature-flag Redis usage with an env (`USE_REDIS=true|false`) and export one interface. Avoid dual implementations across imports.
+- Vite dev proxy or CORS
+  - Add Vite proxy to `http://localhost:7000` to avoid CORS and simplify local dev; or keep CORS but document it clearly.
+- Scoring model
+  - Replace simplified scoring with IELTS band conversion per section; persist band per section and overall.
+- Admin analytics polishing
+  - Parameterize ranges; add grouped stats by exam type; export CSV endpoints.
+- File uploads
+  - Define storage strategy and validation for audio/images; wire Multer usage to specific endpoints (currently imported but not used).
+- Emails
+  - Implement `nodemailer` transport and templates for ticket delivery and password resets (env-gated in dev).
+
+LOW / NICE-TO-HAVE
+- Frontend polish
+  - Unify design tokens; add dark mode; ensure loading states via `LoadingSpinner` everywhere.
+- Accessibility
+  - ARIA labels, focus management on modals/forms.
+- Performance
+  - Code-splitting for admin routes; memoization on large lists; React Query cache policies.
+
+DOCS & DEVELOPER EXPERIENCE
+- Update READMEs to actual commands
+  - Root `README.md` quick start should match scripts: `npm run dev`, `npm run migrate`. Note that `seed` is pending implementation.
+  - Replace `client/README.md` template with project-specific usage, envs, and scripts.
+- Environment variables
+  - Document all server envs from `env.example`. Add `client/.env.example` with `VITE_API_URL=http://localhost:7000/api`.
+- Missing folders referenced in docs
+  - Create or remove references to `shared/` and `docs` to match repo reality. Remove Docker sections from docs.
+
+CLEANUP
+- Remove unused/duplicated deps
+  - `server`: drop `bcryptjs`, keep `bcrypt`. Review `lodash`, `moment` usage; replace if trivial.
+- Logging outputs
+  - Align `LOG_FILE` and Winston transports. Ensure logs directory exists (both root and `server/` currently present); standardize to one place.
+

@@ -1,8 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { query, logger } from '../config/database';
+import { query, logger } from '../config/database-no-redis';
 import { asyncHandler, createValidationError, createNotFoundError, AppError } from '../middleware/errorHandler';
-import { requireOwnershipOrAdmin, requireUserManagementPermission, rateLimitByUser } from '../middleware/auth';
+import { requireOwnershipOrAdmin, requireUserManagementPermission, rateLimitByUser, authMiddleware } from '../middleware/auth';
 
 const router = Router();
 
@@ -51,6 +51,7 @@ const validateUserUpdate = [
 
 // GET /api/users/profile - Get current user profile
 router.get('/profile',
+  authMiddleware,
   asyncHandler(async (req: Request, res: Response) => {
     const userId = req.user!.id;
 
@@ -94,7 +95,8 @@ router.get('/profile',
 
 // PUT /api/users/profile - Update current user profile
 router.put('/profile',
-  rateLimitByUser(10, 60), // 10 updates per hour
+  authMiddleware,
+  ...(process.env.DISABLE_ROUTE_RATE_LIMIT === '1' ? [] : [rateLimitByUser(10, 3600)]), // optional rate limit
   validateUserUpdate,
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);

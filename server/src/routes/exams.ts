@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { query, logger } from '../config/database';
+import { query, logger } from '../config/database-no-redis';
 import { asyncHandler, createValidationError, createNotFoundError, AppError } from '../middleware/errorHandler';
 import { authMiddleware, optionalAuth, requireRole, rateLimitByUser } from '../middleware/auth';
 
@@ -35,7 +35,6 @@ router.get('/',
     if (search) {
       whereClause += ` AND (e.title ILIKE $${paramCount++} OR e.description ILIKE $${paramCount++})`;
       queryParams.push(`%${search}%`, `%${search}%`);
-      paramCount++;
     }
 
     // Get exams with section count
@@ -104,6 +103,7 @@ router.get('/:id',
     const { id } = req.params;
     const includeQuestions = req.query.questions === 'true';
     const sectionFilter = req.query.section as string | undefined; // reading | listening | writing | speaking
+    const sessionIdParam = (req.query.session || req.query.sid) as string | undefined;
 
     // Get exam details
     const examResult = await query(`
@@ -134,6 +134,28 @@ router.get('/:id',
     const sectionsResult = await query(sectionsSql, params);
 
     const sections = [];
+    // If not authenticated but a sessionId was provided, verify it belongs to this exam to permit question access.
+    let sessionValidatedForQuestions = false;
+    if (!req.user && includeQuestions && sessionIdParam) {
+      const sessCheck = await query(`SELECT id, status, started_at FROM exam_sessions WHERE id = $1 AND exam_id = $2 AND status IN ('pending','in_progress') LIMIT 1`, [sessionIdParam, id]);
+      sessionValidatedForQuestions = sessCheck.rows.length > 0;
+      // Auto-start pending ticket-based session when questions are requested
+      if (sessionValidatedForQuestions) {
+        const s = sessCheck.rows[0];
+        if (s.status === 'pending' || !s.started_at) {
+          await query(`
+            UPDATE exam_sessions
+            SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END
+            WHERE id = $1
+          `, [sessionIdParam]);
+          logger.info('Auto-started ticket session on question fetch', { sessionId: sessionIdParam, examId: id });
+        }
+      }
+    }
+
+    const allowQuestions = !!req.user || sessionValidatedForQuestions;
+
     for (const section of sectionsResult.rows) {
       const sectionData = {
         id: section.id,
@@ -151,7 +173,7 @@ router.get('/:id',
       };
 
       // Include questions if requested and user is authenticated
-      if (includeQuestions && req.user) {
+  if (includeQuestions && allowQuestions) {
         const questionsResult = await query(`
           SELECT id, question_type, question_text, question_number, points,
                  time_limit_seconds, explanation, audio_url, image_url, metadata, correct_answer
@@ -181,7 +203,7 @@ router.get('/:id',
           }
 
           // Get question options for multiple choice-like questions
-          if (['multiple_choice', 'matching', 'drag_drop'].includes(question.question_type)) {
+          if (['multiple_choice', 'multi_select', 'matching', 'drag_drop'].includes(question.question_type)) {
             const optionsResult = await query(`
               SELECT id, option_text, option_letter, option_order
               FROM exam_question_options 
@@ -252,8 +274,7 @@ router.get('/:id',
 
 // POST /api/exams/:id/start - Start an exam session
 router.post('/:id/start',
-  authMiddleware,
-  rateLimitByUser(5, 60), // 5 attempts per hour
+  optionalAuth,
   body('ticketCode')
     .optional()
     .trim()
@@ -268,7 +289,7 @@ router.post('/:id/start',
 
     const { id: examId } = req.params;
     const { ticketCode, section } = req.body;
-    const userId = req.user!.id;
+    const userId = req.user?.id || null;
 
     // Verify exam exists and is active
     const examResult = await query(`
@@ -290,20 +311,35 @@ router.post('/:id/start',
     // Removed max attempts restriction: students can start unlimited sessions
 
     // Check for existing active session
-    const activeSessionResult = await query(`
-      SELECT id FROM exam_sessions 
-      WHERE user_id = $1 AND exam_id = $2 AND status IN ('pending', 'in_progress')
-      AND expires_at > CURRENT_TIMESTAMP
-    `, [userId, examId]);
+    if (userId) {
+      const activeSessionResult = await query(`
+        SELECT id, status, started_at FROM exam_sessions 
+        WHERE user_id = $1 AND exam_id = $2 AND status IN ('pending', 'in_progress')
+          AND expires_at > CURRENT_TIMESTAMP
+        ORDER BY created_at DESC
+        LIMIT 1
+      `, [userId, examId]);
 
-    if (activeSessionResult.rows.length > 0) {
-      const existingId = activeSessionResult.rows[0].id;
-      logger.info('Existing active session reused', { userId, examId, sessionId: existingId });
-      return res.status(200).json({
-        success: true,
-        message: 'Existing active session found',
-        data: { sessionId: existingId, examId, resumed: true }
-      });
+      if (activeSessionResult.rows.length > 0) {
+        const existing = activeSessionResult.rows[0];
+        // If still pending / not started, transition to in_progress & set started_at
+        if (existing.status === 'pending' || !existing.started_at) {
+          await query(`
+            UPDATE exam_sessions
+            SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END
+            WHERE id = $1
+          `, [existing.id]);
+          logger.info('Started previously pending session', { userId, examId, sessionId: existing.id });
+        } else {
+          logger.info('Existing in_progress session reused', { userId, examId, sessionId: existing.id });
+        }
+        return res.status(200).json({
+            success: true,
+            message: 'Existing active session found',
+            data: { sessionId: existing.id, examId, resumed: true }
+        });
+      }
     }
 
     // Validate ticket if provided
@@ -363,14 +399,13 @@ router.post('/:id/start',
 
     const sessionResult = await query(`
       INSERT INTO exam_sessions (
-        user_id, exam_id, ticket_id, status, expires_at, browser_info
-      ) VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, expires_at, created_at
+        user_id, exam_id, ticket_id, status, started_at, expires_at, browser_info
+      ) VALUES ($1, $2, $3, 'in_progress', CURRENT_TIMESTAMP, $4, $5)
+      RETURNING id, started_at, expires_at, created_at
     `, [
       userId,
       examId,
       ticketId,
-      'pending',
       sessionExpiresAt,
       JSON.stringify({
         userAgent: req.get('User-Agent'),
@@ -395,6 +430,7 @@ router.post('/:id/start',
       data: {
         sessionId: session.id,
         examId,
+        startedAt: session.started_at,
         expiresAt: session.expires_at,
         createdAt: session.created_at
       }
@@ -404,22 +440,38 @@ router.post('/:id/start',
 
 // POST /api/exams/sessions/:sessionId/submit - Submit exam answers
 router.post('/sessions/:sessionId/submit',
-  authMiddleware,
+  optionalAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const { sessionId } = req.params;
     const { answers } = req.body;
-    const userId = req.user!.id;
+    const userId = req.user?.id || null;
 
-    // Verify session ownership and status
-    const sessionResult = await query(`
-      SELECT es.id, es.exam_id, es.status, es.expires_at, es.started_at,
-             e.title as exam_title, e.passing_score
-      FROM exam_sessions es
-      JOIN exams e ON es.exam_id = e.id
-      WHERE es.id = $1 AND es.user_id = $2
-    `, [sessionId, userId]);
+    // Fetch session (different rules if authenticated vs ticket-based anonymous)
+    let sessionResult;
+    if (userId) {
+      sessionResult = await query(`
+        SELECT es.id, es.exam_id, es.status, es.expires_at, es.started_at, es.user_id, es.ticket_id,
+               e.title as exam_title, e.passing_score
+        FROM exam_sessions es
+        JOIN exams e ON es.exam_id = e.id
+        WHERE es.id = $1 AND es.user_id = $2
+      `, [sessionId, userId]);
+    } else {
+      // Allow only ticket-based sessions without user
+      sessionResult = await query(`
+        SELECT es.id, es.exam_id, es.status, es.expires_at, es.started_at, es.user_id, es.ticket_id,
+               e.title as exam_title, e.passing_score
+        FROM exam_sessions es
+        JOIN exams e ON es.exam_id = e.id
+        WHERE es.id = $1 AND es.ticket_id IS NOT NULL AND es.user_id IS NULL
+      `, [sessionId]);
+    }
 
     if (sessionResult.rows.length === 0) {
+      // Distinguish not found vs unauthorized attempt on someone else's session
+      if (!userId) {
+        throw createNotFoundError('Exam session');
+      }
       throw createNotFoundError('Exam session');
     }
 
@@ -443,7 +495,7 @@ router.post('/sessions/:sessionId/submit',
 
         // Get question details and correct answer
         const questionResult = await query(`
-          SELECT eq.points, eq.correct_answer, eq.question_type, es.max_score
+          SELECT eq.points, eq.correct_answer, eq.question_type, es.max_score, es.heading_bank
           FROM exam_questions eq
           JOIN exam_sections es ON eq.section_id = es.id
           WHERE eq.id = $1 AND es.exam_id = $2
@@ -465,11 +517,48 @@ router.post('/sessions/:sessionId/submit',
           // Simple scoring for MCQ / Matching / True-False / Fill-blank by string equality (case-insensitive, trimmed)
           const normalize = (v: any) => String(v ?? '').trim().toLowerCase();
           const expected = question.correct_answer ? normalize(question.correct_answer) : '';
-          const received = normalize(studentAnswer);
+          let received = normalize(studentAnswer);
 
           let isCorrect = false;
           if (question.question_type === 'multiple_choice' || question.question_type === 'matching' || question.question_type === 'drag_drop') {
+            // Special handling for matching: if student selected an option letter (A, B, C ...)
+            // but correct answers are stored as heading letters (e.g., roman numerals: i, ii, iii),
+            // map the option letter position to the heading bank letter before comparing.
+            if (question.question_type === 'matching' && received && /^[a-z]$/.test(received)) {
+              try {
+                const bank = question.heading_bank ? JSON.parse(question.heading_bank) : null;
+                const options = Array.isArray(bank?.options) ? bank.options : [];
+                const idx = received.charCodeAt(0) - 97; // a->0
+                const mapped = options[idx]?.letter ? normalize(options[idx].letter) : '';
+                if (mapped) {
+                  received = mapped;
+                }
+              } catch (_e) {
+                // ignore parse errors; fall back to raw compare
+              }
+            }
             isCorrect = expected !== '' && received === expected;
+          } else if (question.question_type === 'multi_select') {
+            // Correct answer stored as pipe list (e.g. "A|C") or JSON array ["A","C"]. Student answer expected as array or joined string.
+            let expectedSet: string[] = [];
+            try {
+              if (question.correct_answer && question.correct_answer.trim().startsWith('[')) {
+                const arr = JSON.parse(question.correct_answer);
+                if (Array.isArray(arr)) expectedSet = arr.map((x:any)=>normalize(x));
+              }
+            } catch {}
+            if (expectedSet.length === 0 && question.correct_answer) {
+              expectedSet = question.correct_answer.split('|').map((p:string)=>normalize(p));
+            }
+            let studentSet: string[] = [];
+            if (Array.isArray(studentAnswer)) studentSet = (studentAnswer as any[]).map(v=>normalize(v));
+            else if (typeof studentAnswer === 'string') studentSet = studentAnswer.split('|').map(p=>normalize(p));
+            // Require exact two (or expected length) and same members ignoring order
+            expectedSet = Array.from(new Set(expectedSet));
+            studentSet = Array.from(new Set(studentSet));
+            if (expectedSet.length === studentSet.length && expectedSet.every(v => studentSet.includes(v))) {
+              isCorrect = true;
+            }
           } else if (question.question_type === 'true_false') {
             // Accept synonyms like T/F and not given variations
             const map: Record<string, string> = { 't': 'true', 'f': 'false', 'ng': 'not given', 'notgiven': 'not given' };
@@ -477,7 +566,47 @@ router.post('/sessions/:sessionId/submit',
             const exp = map[expected] || expected;
             isCorrect = exp !== '' && rec === exp;
           } else if (question.question_type === 'fill_blank') {
-            isCorrect = expected !== '' && received === expected;
+            // Support multiple acceptable answers:
+            // 1) pipe-delimited string: answer1|answer2|answer3
+            // 2) JSON array stored in correct_answer: ["answer1","answer2"]
+            // Matching is case-insensitive & trimmed. Numeric answers allow leading/trailing zeros differences.
+            let accepted: string[] = [];
+            try {
+              if (question.correct_answer && question.correct_answer.trim().startsWith('[')) {
+                const arr = JSON.parse(question.correct_answer);
+                if (Array.isArray(arr)) accepted = arr.map((a: any) => normalize(a));
+              }
+            } catch (_) { /* ignore JSON parse errors */ }
+            if (accepted.length === 0 && question.correct_answer) {
+              accepted = question.correct_answer.split('|').map((p: string) => normalize(p));
+            }
+            if (accepted.length === 0 && expected) accepted = [expected];
+            // Numeric normalization: if all accepted numeric, compare as numbers too
+            const recNum = Number(received);
+            const numericMode = accepted.every(a => /^[-+]?(\d+\.?\d*|\.\d+)$/.test(a));
+            // If metadata contains placeholders count and studentAnswer is an array -> all must be individually correct (AND)
+            if (Array.isArray(studentAnswer)) {
+              // Each element may have its own accepted set if correct_answer stored as JSON array of arrays, fallback to global accepted
+              try {
+                const meta = question.metadata ? JSON.parse(question.metadata) : null;
+                const placeholders: any[] = Array.isArray(meta?.placeholders) ? meta.placeholders : [];
+                // If correct_answer is JSON array of arrays, parse
+                let parsedCorrect: any = null;
+                try { parsedCorrect = question.correct_answer ? JSON.parse(question.correct_answer) : null; } catch { parsedCorrect = null; }
+                isCorrect = (studentAnswer as any[]).every((ans, idx) => {
+                  const recv = normalize(ans);
+                  let localAccepted = accepted;
+                  if (Array.isArray(parsedCorrect) && Array.isArray(parsedCorrect[idx])) {
+                    localAccepted = parsedCorrect[idx].map((x: any) => normalize(x));
+                  }
+                  const num = Number(recv);
+                  const localNumeric = localAccepted.every(a => /^[-+]?(\d+\.?\d*|\.\d+)$/.test(a));
+                  return localAccepted.some(a => a === recv || (localNumeric && !isNaN(num) && Number(a) === num));
+                });
+              } catch { isCorrect = false; }
+            } else {
+              isCorrect = accepted.some(a => a === received || (numericMode && !isNaN(recNum) && Number(a) === recNum));
+            }
           }
 
           if (isCorrect) {
@@ -516,7 +645,7 @@ router.post('/sessions/:sessionId/submit',
     `, [totalScore, percentageScore, isPassed, timeSpentSeconds, sessionId]);
 
     logger.info('Exam submitted', {
-      userId,
+      userId: userId || 'anonymous-ticket',
       sessionId,
       examId: session.exam_id,
       totalScore,

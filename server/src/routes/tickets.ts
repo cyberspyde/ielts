@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { query, logger } from '../config/database';
+import { query, logger } from '../config/database-no-redis';
 import { asyncHandler, createValidationError, createNotFoundError, AppError } from '../middleware/errorHandler';
 import { authMiddleware, optionalAuth, requireRole } from '../middleware/auth';
 
@@ -103,10 +103,10 @@ router.get('/:code/validate',
 
 // POST /api/tickets/:code/use - Use ticket (authenticated)
 router.post('/:code/use',
-  authMiddleware,
+  optionalAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const { code } = req.params;
-    const userId = req.user!.id;
+    const userId = req.user?.id || null;
 
     // Validate ticket first
     const ticketResult = await query(`
@@ -148,14 +148,16 @@ router.post('/:code/use',
     }
 
     // Check if user already has an active session for this exam
-    const existingSessionResult = await query(`
-      SELECT id FROM exam_sessions 
-      WHERE user_id = $1 AND exam_id = $2 AND status IN ('pending', 'in_progress')
-      AND expires_at > CURRENT_TIMESTAMP
-    `, [userId, ticket.exam_id]);
+    if (userId) {
+      const existingSessionResult = await query(`
+        SELECT id FROM exam_sessions 
+        WHERE user_id = $1 AND exam_id = $2 AND status IN ('pending', 'in_progress')
+        AND expires_at > CURRENT_TIMESTAMP
+      `, [userId, ticket.exam_id]);
 
-    if (existingSessionResult.rows.length > 0) {
-      throw new AppError('You already have an active session for this exam', 400);
+      if (existingSessionResult.rows.length > 0) {
+        throw new AppError('You already have an active session for this exam', 400);
+      }
     }
 
     // Update ticket usage

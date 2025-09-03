@@ -42,7 +42,36 @@ api.interceptors.response.use(
       switch (status) {
         case 401:
           // Unauthorized - clear token and redirect to login
+          // Attempt one-time refresh
+          const tried = (error.config as any)._retry;
+          if (!tried) {
+            (error.config as any)._retry = true;
+            const refreshToken = localStorage.getItem('refreshToken');
+            if (refreshToken) {
+              return api.post('/auth/refresh', { refreshToken })
+                .then((res) => {
+                  const tokens = (res.data?.data?.tokens) || (res.data?.data) || res.data;
+                  const newAccess = tokens?.accessToken || tokens?.access || tokens?.token;
+                  const newRefresh = tokens?.refreshToken || tokens?.refresh;
+                  if (newAccess) {
+                    localStorage.setItem('token', newAccess);
+                    if (newRefresh) localStorage.setItem('refreshToken', newRefresh);
+                    error.config.headers.Authorization = `Bearer ${newAccess}`;
+                    return api.request(error.config);
+                  }
+                  throw new Error('Refresh failed');
+                })
+                .catch(() => {
+                  localStorage.removeItem('token');
+                  localStorage.removeItem('refreshToken');
+                  localStorage.removeItem('user');
+                  window.location.href = '/login';
+                  toast.error('Session expired. Please login again.');
+                });
+            }
+          }
           localStorage.removeItem('token');
+          localStorage.removeItem('refreshToken');
           localStorage.removeItem('user');
           window.location.href = '/login';
           toast.error('Session expired. Please login again.');
@@ -58,13 +87,11 @@ api.interceptors.response.use(
           
         case 422:
           // Validation errors
-          if (data.errors) {
-            Object.values(data.errors).forEach((error: any) => {
-              toast.error(error);
-            });
-          } else {
-            toast.error(data.message || 'Validation failed.');
-          }
+          const details = (data?.details || data?.errors);
+          if (details) {
+            const values = Array.isArray(details) ? details : Object.values(details);
+            values.forEach((err: any) => toast.error(String(err)));
+          } else toast.error(data?.message || 'Validation failed.');
           break;
           
         case 500:
@@ -72,7 +99,7 @@ api.interceptors.response.use(
           break;
           
         default:
-          toast.error(data.message || 'An error occurred.');
+          toast.error(data?.message || 'An error occurred.');
       }
     } else {
       // Network error

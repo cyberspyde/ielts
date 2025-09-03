@@ -8,7 +8,8 @@ const TopNav: React.FC = () => {
   const { isAuthenticated, user, logout } = useAuth();
   const { pathname } = useLocation();
 
-  if (!isAuthenticated || HIDDEN_PATHS.has(pathname)) return null;
+  const isExamRoute = /^\/exam\//.test(pathname);
+  if (!isAuthenticated || HIDDEN_PATHS.has(pathname) || isExamRoute) return null;
 
   const isAdmin = user?.role === 'admin' || user?.role === 'super_admin';
 
@@ -22,7 +23,10 @@ const TopNav: React.FC = () => {
               <Link to="/dashboard" className="text-gray-700 hover:text-gray-900">Dashboard</Link>
               <Link to="/exams" className="text-gray-700 hover:text-gray-900">Exams</Link>
               {isAdmin && (
-                <Link to="/admin" className="text-gray-700 hover:text-gray-900">Admin</Link>
+                <>
+                  <Link to="/admin" className="text-gray-700 hover:text-gray-900">Admin</Link>
+                  <Link to="/admin/sessions" className="text-gray-700 hover:text-gray-900">Sessions</Link>
+                </>
               )}
             </nav>
           </div>

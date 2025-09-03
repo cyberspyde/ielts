@@ -4,10 +4,11 @@ export interface User {
   email: string;
   firstName: string;
   lastName: string;
-  role: 'student' | 'admin';
-  isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
+  role: 'student' | 'admin' | 'super_admin';
+  status: 'active' | 'inactive' | 'suspended' | 'pending';
+  emailVerified?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface AuthUser extends User {
@@ -19,23 +20,22 @@ export interface Exam {
   id: string;
   title: string;
   description: string;
-  duration: number; // in minutes
-  totalQuestions: number;
-  totalScore: number;
-  sections: ExamSection[];
-  isActive: boolean;
-  startDate: string;
-  endDate: string;
-  createdAt: string;
-  updatedAt: string;
+  examType: 'academic' | 'general_training';
+  durationMinutes: number; // in minutes
+  passingScore?: number;
+  maxAttempts?: number;
+  sections?: ExamSection[];
+  isActive?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ExamSection {
   id: string;
-  name: 'reading' | 'listening' | 'writing' | 'speaking';
+  sectionType: 'reading' | 'listening' | 'writing' | 'speaking';
   title: string;
   description: string;
-  duration: number; // in minutes
+  durationMinutes: number; // in minutes
   questions: Question[];
   order: number;
 }
@@ -43,21 +43,21 @@ export interface ExamSection {
 // Question Types
 export interface Question {
   id: string;
-  examId: string;
   sectionId: string;
-  type: QuestionType;
-  text: string;
+  questionType: QuestionType;
+  questionText: string;
   options?: QuestionOption[];
   correctAnswer?: string | string[];
   points: number;
-  order: number;
+  questionNumber: number;
   audioUrl?: string;
   imageUrl?: string;
-  passage?: string;
+  explanation?: string;
 }
 
 export type QuestionType = 
   | 'multiple_choice'
+  | 'multi_select'
   | 'true_false'
   | 'fill_blank'
   | 'matching'
@@ -70,7 +70,8 @@ export type QuestionType =
 export interface QuestionOption {
   id: string;
   text: string;
-  value: string;
+  letter?: string;
+  order?: number;
 }
 
 // Ticket Types
@@ -78,29 +79,30 @@ export interface Ticket {
   id: string;
   code: string;
   examId: string;
-  studentId?: string;
-  isUsed: boolean;
-  usedAt?: string;
-  expiresAt: string;
-  createdAt: string;
+  status: 'active' | 'used' | 'expired' | 'cancelled';
+  validFrom?: string;
+  validUntil: string;
+  maxUses?: number;
+  currentUses?: number;
+  createdAt?: string;
   exam?: Exam;
-  student?: User;
 }
 
 // Exam Session Types
 export interface ExamSession {
   id: string;
   examId: string;
-  studentId: string;
-  ticketId: string;
-  status: 'started' | 'in_progress' | 'completed' | 'abandoned';
-  startTime: string;
-  endTime?: string;
-  currentSection?: number;
-  answers: ExamAnswer[];
-  score?: number;
-  createdAt: string;
-  updatedAt: string;
+  ticketId?: string;
+  status: 'pending' | 'in_progress' | 'submitted' | 'expired' | 'cancelled';
+  startedAt?: string;
+  submittedAt?: string;
+  expiresAt: string;
+  currentSectionId?: string;
+  totalScore?: number;
+  percentageScore?: number;
+  timeSpentSeconds?: number;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ExamAnswer {

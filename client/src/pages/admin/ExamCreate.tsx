@@ -4,7 +4,7 @@ import { toast } from 'react-toastify';
 import { useNavigate } from 'react-router-dom';
 
 import { apiService } from '../../services/api';
-import MatchingBatchBuilder, { type MatchingBatch } from '../../components/admin/MatchingBatchBuilder';
+// Matching builder moved to Edit page
 
 type ExamPayload = {
   title: string;
@@ -20,19 +20,21 @@ type SectionDraft = {
   sectionType: 'listening' | 'reading' | 'writing' | 'speaking';
   title: string;
   description?: string;
-  durationMinutes: number;
+  durationMinutes: number | '';
   maxScore: number;
   sectionOrder: number;
   instructions?: string;
   audioUrl?: string;
   passageText?: string;
+  // Per-section default groups to create (can be empty => none)
+  defaultGroups?: QuestionGroup[];
 };
 
 type QuestionGroup = {
   questionType: 'multiple_choice' | 'true_false' | 'fill_blank' | 'matching' | 'short_answer' | 'essay' | 'speaking' | 'drag_drop' | 'speaking_task';
-  start: number;
-  end: number;
-  points?: number;
+  start: number | '';
+  end: number | '';
+  points?: number | '';
   questionText?: string;
   options?: Array<{ letter?: string; text?: string } | string>;
   correctAnswers?: Array<string>;
@@ -54,33 +56,15 @@ const AdminExamCreate: React.FC = () => {
 
   // Step 2: sections preset (toggleable)
   const [sections, setSections] = useState<SectionDraft[]>([
-    { sectionType: 'reading', title: 'Reading', durationMinutes: 60, maxScore: 9, sectionOrder: 1 },
-    { sectionType: 'listening', title: 'Listening', durationMinutes: 30, maxScore: 9, sectionOrder: 2 },
-    { sectionType: 'writing', title: 'Writing', durationMinutes: 60, maxScore: 9, sectionOrder: 3 },
+    { sectionType: 'reading', title: 'Reading', durationMinutes: 60, maxScore: 9, sectionOrder: 1, defaultGroups: [] },
+    { sectionType: 'listening', title: 'Listening', durationMinutes: 30, maxScore: 9, sectionOrder: 2, defaultGroups: [] },
+    { sectionType: 'writing', title: 'Writing', durationMinutes: 60, maxScore: 9, sectionOrder: 3, defaultGroups: [] },
   ]);
 
-  // Step 3: bulk groups per section
-  const [readingGroups, setReadingGroups] = useState<QuestionGroup[]>([
-    { questionType: 'multiple_choice', start: 9, end: 13, points: 1, questionText: '' },
-    { questionType: 'true_false', start: 14, end: 20, points: 1, questionText: '' },
-    { questionType: 'fill_blank', start: 21, end: 22, points: 1, questionText: '' },
-  ]);
-  const [readingMatching, setReadingMatching] = useState<MatchingBatch>({ start: 1, end: 8, points: 1, questionText: '', options: [], correctAnswers: Array(8).fill('') });
-  const [listeningGroups, setListeningGroups] = useState<QuestionGroup[]>([
-    { questionType: 'multiple_choice', start: 1, end: 10, points: 1 },
-  ]);
-  const [writingGroups, setWritingGroups] = useState<QuestionGroup[]>([
-    { questionType: 'essay', start: 1, end: 2, points: 0 },
-  ]);
-  const [speakingGroups, setSpeakingGroups] = useState<QuestionGroup[]>([
-    { questionType: 'speaking_task', start: 1, end: 3, points: 0, questionText: '' },
-  ]);
+  // Per-section default groups are configured inline in each section
 
   const hasSection = useMemo(() => ({
     reading: sections.some(s => s.sectionType === 'reading'),
-    listening: sections.some(s => s.sectionType === 'listening'),
-    writing: sections.some(s => s.sectionType === 'writing'),
-    speaking: sections.some(s => s.sectionType === 'speaking'),
   }), [sections]);
 
   const createExamMutation = useMutation({
@@ -92,63 +76,42 @@ const AdminExamCreate: React.FC = () => {
 
       // 2) Create sections
       const sectionsPayload = sections.map((s) => {
-        if (s.sectionType === 'reading' && (readingMatching.options?.length || 0) > 0) {
-          return { ...s, headingBank: { options: readingMatching.options } } as any;
+        const effectiveTitle = (s.title || '').trim().length >= 2
+          ? s.title.trim()
+          : s.sectionType.charAt(0).toUpperCase() + s.sectionType.slice(1);
+        const durationParsed = typeof s.durationMinutes === 'string' ? Number(s.durationMinutes) : s.durationMinutes;
+        if (!Number.isFinite(durationParsed) || durationParsed < 1) {
+          throw new Error('Each section must have a valid duration (min 1 minute).');
         }
-        return s as any;
+        return { ...s, title: effectiveTitle, durationMinutes: durationParsed } as any;
       });
-      const sectionsRes = await apiService.post<{ sections: Array<{ id: string }> }>(
+      const sectionsRes = await apiService.post<{ sections: Array<{ id: string; sectionType: string; title: string }> }>(
         `/admin/exams/${examId}/sections`,
         { sections: sectionsPayload }
       );
       if (!sectionsRes.success || !sectionsRes.data) throw new Error(sectionsRes.message || 'Failed to create sections');
 
       // Pick IDs for listening/reading/writing/speaking
-      const listening = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'listening');
-      const reading = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'reading');
-      const writing = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'writing');
-      const speaking = (sectionsRes.data as any).sections.find((s: any) => s.sectionType === 'speaking');
+      const createdSections = (sectionsRes.data as any).sections as Array<any>;
+      // No pre-picking; iterate alongside drafts
 
       // 3) Bulk questions per section (optional / if groups provided)
-      if (reading) {
-        const includeMatching = (readingMatching.end - readingMatching.start + 1) > 0;
-        const groups = [
-          ...readingGroups,
-          ...(includeMatching ? [{
-            questionType: 'matching',
-            start: readingMatching.start,
-            end: readingMatching.end,
-            points: readingMatching.points || 1,
-            questionText: readingMatching.questionText || '',
-            options: readingMatching.options,
-            correctAnswers: readingMatching.correctAnswers,
-          }] as any : [])
-        ];
+      for (let i = 0; i < createdSections.length && i < sections.length; i++) {
+        const draft = sections[i];
+        const groups = (draft.defaultGroups || [])
+          .map(g => ({
+            ...g,
+            start: typeof g.start === 'string' ? Number(g.start) : g.start,
+            end: typeof g.end === 'string' ? Number(g.end) : g.end,
+            points: typeof g.points === 'string' ? Number(g.points) : (g.points ?? 1),
+          }))
+          .filter(g => Number.isFinite(g.start) && Number.isFinite(g.end) && (g.end as number) >= (g.start as number));
         if (groups.length) {
           await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
-            sectionId: reading.id,
+            sectionId: createdSections[i].id,
             groups,
           });
         }
-      }
-      if (listening && listeningGroups.length) {
-        await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
-          sectionId: listening.id,
-          groups: listeningGroups,
-        });
-      }
-      if (writing && writingGroups.length) {
-        await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
-          sectionId: writing.id,
-          groups: writingGroups,
-        });
-      }
-
-      if (speaking && speakingGroups.length) {
-        await apiService.post(`/admin/exams/${examId}/questions/bulk`, {
-          sectionId: speaking.id,
-          groups: speakingGroups,
-        });
       }
 
       return examId;
@@ -216,11 +179,12 @@ const AdminExamCreate: React.FC = () => {
             <h2 className="text-lg font-semibold text-gray-900 mb-4">Sections</h2>
             <div className="space-y-4">
               {sections.map((s, idx) => (
-                <div key={idx} className="grid grid-cols-1 md:grid-cols-7 gap-3">
+                <div key={idx} className="grid grid-cols-1 md:grid-cols-7 gap-4">
                   <button type="button" onClick={() => setSections(prev => prev.filter((_, i) => i !== idx))} className="px-2 py-1 text-xs text-red-600 border border-red-200 rounded hover:bg-red-50">Remove</button>
                   <select className="rounded-md border-gray-300" value={s.sectionType} onChange={(e) => {
                     const next = [...sections];
-                    next[idx] = { ...s, sectionType: e.target.value as any };
+                    const newType = e.target.value as any;
+                    next[idx] = { ...s, sectionType: newType };
                     setSections(next);
                   }}>
                     <option value="listening">Listening</option>
@@ -228,138 +192,151 @@ const AdminExamCreate: React.FC = () => {
                     <option value="writing">Writing</option>
                     <option value="speaking">Speaking</option>
                   </select>
-                  <input className="rounded-md border-gray-300 md:col-span-2" placeholder="Title" value={s.title} onChange={(e) => {
-                    const next = [...sections];
-                    next[idx] = { ...s, title: e.target.value };
-                    setSections(next);
-                  }} />
-                  <input type="number" className="rounded-md border-gray-300" placeholder="Duration" value={s.durationMinutes} onChange={(e) => {
-                    const next = [...sections];
-                    next[idx] = { ...s, durationMinutes: Number(e.target.value) };
-                    setSections(next);
-                  }} />
-                  <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Max Score" value={s.maxScore} onChange={(e) => {
-                    const next = [...sections];
-                    next[idx] = { ...s, maxScore: Number(e.target.value) };
-                    setSections(next);
-                  }} />
-                  <input type="number" className="rounded-md border-gray-300" placeholder="Order" value={s.sectionOrder} onChange={(e) => {
-                    const next = [...sections];
-                    next[idx] = { ...s, sectionOrder: Number(e.target.value) };
-                    setSections(next);
-                  }} />
+                  <div className="md:col-span-2">
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Section Title</label>
+                    <input className="rounded-md border-gray-300 w-full" placeholder="Title" value={s.title} onChange={(e) => {
+                      const next = [...sections];
+                      next[idx] = { ...s, title: e.target.value };
+                      setSections(next);
+                    }} />
+                  </div>
+                  <div className="rounded-md border-gray-300">
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Duration (min)</label>
+                    <input type="number" placeholder="Duration" value={s.durationMinutes}
+                      onChange={(e) => {
+                        const next = [...sections];
+                        const val = e.target.value;
+                        next[idx] = { ...s, durationMinutes: val === '' ? '' : Number(val) };
+                        setSections(next);
+                      }} />
+                  </div>
+                  <div className="rounded-md border-gray-300">
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Max Score</label>
+                    <input type="number" step="0.5" placeholder="Max Score" value={s.maxScore} onChange={(e) => {
+                      const next = [...sections];
+                      next[idx] = { ...s, maxScore: Number(e.target.value) };
+                      setSections(next);
+                    }} />
+                  </div>
+                  <div className="rounded-md border-gray-300">
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Order</label>
+                    <input type="number" placeholder="Order" value={s.sectionOrder} onChange={(e) => {
+                      const next = [...sections];
+                      next[idx] = { ...s, sectionOrder: Number(e.target.value) };
+                      setSections(next);
+                    }} />
+                  </div>
                   {s.sectionType === 'listening' && (
-                    <input className="rounded-md border-gray-300 md:col-span-2" placeholder="Audio URL (optional)" value={s.audioUrl || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, audioUrl: e.target.value }; setSections(next); }} />
+                    <div className="rounded-md border-gray-300 md:col-span-2">
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Audio URL (optional)</label>
+                      <input placeholder="Audio URL (optional)" value={s.audioUrl || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, audioUrl: e.target.value }; setSections(next); }} />
+                    </div>
                   )}
                   {s.sectionType === 'reading' && (
-                    <textarea className="rounded-md border-gray-300 md:col-span-2" placeholder="Passage text" rows={2} value={s.passageText || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, passageText: e.target.value }; setSections(next); }} />
+                    <div className="rounded-md border-gray-300 md:col-span-2">
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Passage text</label>
+                      <textarea placeholder="Passage text" rows={2} value={s.passageText || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, passageText: e.target.value }; setSections(next); }} />
+                    </div>
                   )}
-                  <textarea className="rounded-md border-gray-300 md:col-span-2" placeholder="Section instructions (optional)" rows={2} value={s.instructions || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, instructions: e.target.value }; setSections(next); }} />
-                </div>
-              ))}
-              <div>
-                <button type="button" onClick={() => setSections(prev => [...prev, { sectionType: 'reading', title: 'New Section', durationMinutes: 60, maxScore: 9, sectionOrder: prev.length + 1 }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Section</button>
-              </div>
-            </div>
-          </div>
-
-          {/* Simple Matching Builder + Other Reading Groups */}
-          {hasSection.reading && (
-          <>
-            <MatchingBatchBuilder value={readingMatching} onChange={setReadingMatching} />
-            <div className="bg-white border border-gray-200 rounded-lg p-6 mt-4">
-              <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Reading - Others)</h2>
-              <p className="text-sm text-gray-600 mb-4">Define ranges like 9-13 multiple choice, 14-20 true/false, etc.</p>
-              <div className="space-y-3">
-                {readingGroups.map((g, i) => (
-                  <div key={i} className="grid grid-cols-1 md:grid-cols-6 gap-2">
-                    <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => {
-                      const next = [...readingGroups]; next[i] = { ...g, questionType: e.target.value as any }; setReadingGroups(next);
-                    }}>
-                      <option value="multiple_choice">Multiple Choice</option>
-                      <option value="true_false">True/False/NG</option>
-                      <option value="fill_blank">Fill in the Blank</option>
-                      <option value="short_answer">Short Answer</option>
-                      <option value="drag_drop">Drag & Drop</option>
-                    </select>
-                    <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setReadingGroups(next); }} />
-                    <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setReadingGroups(next); }} />
-                    <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 1} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, points: Number(e.target.value) }; setReadingGroups(next); }} />
-                    <input className="rounded-md border-gray-300 md:col-span-2" placeholder="Default question text (optional)" value={g.questionText || ''} onChange={(e) => { const next = [...readingGroups]; next[i] = { ...g, questionText: e.target.value }; setReadingGroups(next); }} />
+                  {/* Default groups editor below replaces the single toggle */}
+                  <div className="rounded-md border-gray-300 md:col-span-2">
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Section instructions (optional)</label>
+                    <textarea placeholder="Section instructions (optional)" rows={2} value={s.instructions || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, instructions: e.target.value }; setSections(next); }} />
                   </div>
-                ))}
-              </div>
-            </div>
-          </>
-          )}
-
-          {/* Listening Bulk */}
-          {hasSection.listening && (
-          <div className="bg-white border border-gray-200 rounded-lg p-6">
-            <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Listening)</h2>
-            <div className="space-y-3">
-              {listeningGroups.map((g, i) => (
-                <div key={i} className="grid grid-cols-1 md:grid-cols-6 gap-2">
-                  <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, questionType: e.target.value as any }; setListeningGroups(next); }}>
-                    <option value="multiple_choice">Multiple Choice</option>
-                    <option value="matching">Matching</option>
-                    <option value="fill_blank">Fill in the Blank</option>
-                    <option value="drag_drop">Drag & Drop</option>
-                  </select>
-                  <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, start: Number(e.target.value) }; setListeningGroups(next); }} />
-                  <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, end: Number(e.target.value) }; setListeningGroups(next); }} />
-                  <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 1} onChange={(e) => { const next = [...listeningGroups]; next[i] = { ...g, points: Number(e.target.value) }; setListeningGroups(next); }} />
-                </div>
-              ))}
-            </div>
-          </div>
-          )}
-
-          {/* Speaking Bulk */}
-          {hasSection.speaking && (
-          <div className="bg-white border border-gray-200 rounded-lg p-6">
-            <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Speaking)</h2>
-            <div className="space-y-3">
-              {speakingGroups.map((g, i) => (
-                <div key={i} className="grid grid-cols-1 md:grid-cols-8 gap-2">
-                  <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => {
-                    const next = [...speakingGroups]; next[i] = { ...g, questionType: e.target.value as any }; setSpeakingGroups(next);
-                  }}>
-                    <option value="speaking_task">Speaking Prompt</option>
-                    <option value="short_answer">Short Answer (typed)</option>
-                  </select>
-                  <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setSpeakingGroups(next); }} />
-                  <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setSpeakingGroups(next); }} />
-                  <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 0} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, points: Number(e.target.value) }; setSpeakingGroups(next); }} />
-                  <input className="rounded-md border-gray-300 md:col-span-3" placeholder="Default prompt (optional)" value={g.questionText || ''} onChange={(e) => { const next = [...speakingGroups]; next[i] = { ...g, questionText: e.target.value }; setSpeakingGroups(next); }} />
-                  <button type="button" onClick={() => setSpeakingGroups(prev => prev.filter((_, idx) => idx !== i))} className="px-2 py-1 text-xs text-red-600 border border-red-200 rounded hover:bg-red-50">Remove</button>
+                  {/* Per-section default groups */}
+                  <div className="md:col-span-7 border rounded p-3">
+                    <div className="text-sm font-medium text-gray-800 mb-2">Default questions for this section (optional)</div>
+                    <div className="space-y-3">
+                      {(s.defaultGroups || []).map((g, gi) => (
+                        <div key={gi} className="grid grid-cols-1 md:grid-cols-12 gap-x-6 gap-y-3 items-start">
+                          <div className="md:col-span-3">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">Type</label>
+                            <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => {
+                              const next = [...sections];
+                              const groups = [...(s.defaultGroups || [])];
+                              groups[gi] = { ...g, questionType: e.target.value as any };
+                              next[idx] = { ...s, defaultGroups: groups };
+                              setSections(next);
+                            }}>
+                              <option value="multiple_choice">Multiple Choice</option>
+                              <option value="true_false">True/False/NG</option>
+                              <option value="fill_blank">Fill in the Blank</option>
+                              <option value="short_answer">Short Answer</option>
+                              <option value="drag_drop">Drag & Drop</option>
+                              <option value="matching">Heading Matching</option>
+                              <option value="essay">Essay</option>
+                              <option value="speaking_task">Speaking</option>
+                            </select>
+                          </div>
+                          <div className="md:col-span-2">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">Start</label>
+                            <input type="number" className="rounded-md border-gray-300 w-full" placeholder="Start" value={g.start as any} onChange={(e) => {
+                              const next = [...sections];
+                              const groups = [...(s.defaultGroups || [])];
+                              const val = e.target.value;
+                              groups[gi] = { ...g, start: val === '' ? '' : Number(val) };
+                              next[idx] = { ...s, defaultGroups: groups };
+                              setSections(next);
+                            }} />
+                          </div>
+                          <div className="md:col-span-2">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">End</label>
+                            <input type="number" className="rounded-md border-gray-300 w-full" placeholder="End" value={g.end as any} onChange={(e) => {
+                              const next = [...sections];
+                              const groups = [...(s.defaultGroups || [])];
+                              const val = e.target.value;
+                              groups[gi] = { ...g, end: val === '' ? '' : Number(val) };
+                              next[idx] = { ...s, defaultGroups: groups };
+                              setSections(next);
+                            }} />
+                          </div>
+                          <div className="md:col-span-2">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">Points</label>
+                            <input type="number" step="0.5" className="rounded-md border-gray-300 w-full" placeholder="Points" value={(g.points as any) ?? ''} onChange={(e) => {
+                              const next = [...sections];
+                              const groups = [...(s.defaultGroups || [])];
+                              const val = e.target.value;
+                              groups[gi] = { ...g, points: val === '' ? '' : Number(val) };
+                              next[idx] = { ...s, defaultGroups: groups };
+                              setSections(next);
+                            }} />
+                          </div>
+                          <div className="md:col-span-3">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">Default question text (optional)</label>
+                            <input className="rounded-md border-gray-300 w-full" placeholder="Default question text (optional)" value={g.questionText || ''} onChange={(e) => {
+                              const next = [...sections];
+                              const groups = [...(s.defaultGroups || [])];
+                              groups[gi] = { ...g, questionText: e.target.value };
+                              next[idx] = { ...s, defaultGroups: groups };
+                              setSections(next);
+                            }} />
+                          </div>
+                          <button type="button" onClick={() => {
+                            const next = [...sections];
+                            const groups = (s.defaultGroups || []).filter((_, i) => i !== gi);
+                            next[idx] = { ...s, defaultGroups: groups };
+                            setSections(next);
+                          }} className="px-2 py-1 text-xs text-red-600 border border-red-200 rounded">Remove</button>
+                        </div>
+                      ))}
+                      <button type="button" onClick={() => {
+                        const next = [...sections];
+                        const groups = [...(s.defaultGroups || [])];
+                        groups.push({ questionType: 'multiple_choice', start: 1, end: 1, points: 1 });
+                        next[idx] = { ...s, defaultGroups: groups };
+                        setSections(next);
+                      }} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add group</button>
+                    </div>
+                  </div>
                 </div>
               ))}
               <div>
-                <button type="button" onClick={() => setSpeakingGroups(prev => [...prev, { questionType: 'speaking_task', start: (prev[prev.length-1]?.end || 0) + 1, end: (prev[prev.length-1]?.end || 0) + 1, points: 0, questionText: '' }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Speaking Group</button>
+                <button type="button" onClick={() => setSections(prev => [...prev, { sectionType: 'reading', title: 'New Section', durationMinutes: 60, maxScore: 9, sectionOrder: prev.length + 1, defaultGroups: [] }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Section</button>
               </div>
             </div>
           </div>
-          )}
 
-          {/* Writing Bulk */}
-          {hasSection.writing && (
-          <div className="bg-white border border-gray-200 rounded-lg p-6">
-            <h2 className="text-lg font-semibold text-gray-900 mb-2">Bulk Questions (Writing)</h2>
-            <div className="space-y-3">
-              {writingGroups.map((g, i) => (
-                <div key={i} className="grid grid-cols-1 md:grid-cols-6 gap-2">
-                  <select className="rounded-md border-gray-300" value={g.questionType} onChange={(e) => { const next = [...writingGroups]; next[i] = { ...g, questionType: e.target.value as any }; setWritingGroups(next); }}>
-                    <option value="essay">Task Prompts</option>
-                  </select>
-                  <input type="number" className="rounded-md border-gray-300" placeholder="Start" value={g.start} onChange={(e) => { const next = [...writingGroups]; next[i] = { ...g, start: Number(e.target.value) }; setWritingGroups(next); }} />
-                  <input type="number" className="rounded-md border-gray-300" placeholder="End" value={g.end} onChange={(e) => { const next = [...writingGroups]; next[i] = { ...g, end: Number(e.target.value) }; setWritingGroups(next); }} />
-                  <input type="number" step="0.5" className="rounded-md border-gray-300" placeholder="Points" value={g.points || 0} onChange={(e) => { const next = [...writingGroups]; next[i] = { ...g, points: Number(e.target.value) }; setWritingGroups(next); }} />
-                </div>
-              ))}
-            </div>
-          </div>
-          )}
+          {/* Global bulk cards removed from creation. Configure default groups per section above. */}
 
           <div className="flex justify-end gap-3">
             <button type="button" className="px-4 py-2 rounded-md border border-gray-300 bg-white text-gray-700" onClick={() => navigate('/admin/exams')}>Cancel</button>

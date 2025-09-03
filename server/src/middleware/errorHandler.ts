@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { logger } from '../config/database';
+import { logger } from '../config/database-no-redis';
 
 // Custom error class
 export class AppError extends Error {
@@ -104,7 +104,15 @@ export const errorHandler = (
     errorResponse.stack = error.stack;
   }
 
-  res.status(statusCode).json(errorResponse);
+  // Standardized wrapper expected by client
+  const { message: _msg, ...rest } = errorResponse; // avoid duplicate key confusion
+  const payload = {
+    success: false,
+    message, // canonical message
+    ...rest,
+  };
+
+  res.status(statusCode).json(payload);
 };
 
 // Async error wrapper

@@ -6,7 +6,7 @@ import * as yup from 'yup';
 import { Ticket, BookOpen, ArrowRight } from 'lucide-react';
 
 import { apiService } from '../../services/api';
-import type { TicketValidationForm, Ticket as TicketType } from '../../types';
+import type { TicketValidationForm } from '../../types';
 
 // Validation schema
 const ticketSchema = yup.object({
@@ -18,8 +18,10 @@ const ticketSchema = yup.object({
 
 export const TicketValidationPage: React.FC = () => {
   const [isValidating, setIsValidating] = useState(false);
-  const [ticket, setTicket] = useState<TicketType | null>(null);
+  // Store full validation payload from server: { valid, ticket: {...}, exam: {...} }
+  const [ticket, setTicket] = useState<any | null>(null);
   const [isValid, setIsValid] = useState(false);
+  const [showInvalid, setShowInvalid] = useState(false);
   
   const navigate = useNavigate();
 
@@ -35,17 +37,21 @@ export const TicketValidationPage: React.FC = () => {
   const onSubmit = async (data: TicketValidationForm) => {
     setIsValidating(true);
     try {
-      const response = await apiService.get<TicketType>(`/tickets/${data.code}`);
+      // Backend endpoint expects /tickets/:code/validate
+      const response = await apiService.get<any>(`/tickets/${encodeURIComponent(data.code)}/validate`);
       
       if (response.success && response.data) {
         setTicket(response.data);
         setIsValid(true);
+        setShowInvalid(false);
       } else {
+        setShowInvalid(true);
         throw new Error(response.message || 'Invalid ticket code');
       }
     } catch (error: any) {
       setIsValid(false);
       setTicket(null);
+      setShowInvalid(true);
       console.error('Ticket validation error:', error);
     } finally {
       setIsValidating(false);
@@ -54,15 +60,16 @@ export const TicketValidationPage: React.FC = () => {
 
   const useTicket = async () => {
     if (!ticket) return;
-    
     try {
-      const response = await apiService.post(`/tickets/${ticket.code}/use`);
-      
-      if (response.success) {
-        // Redirect to exam page
-        navigate(`/exam/${ticket.examId}`);
+      // Start session directly with ticketCode so usage increments once at session creation
+      const examId = ticket.exam?.id;
+      const code = ticket.ticket?.code || ticket.code;
+      if (!examId || !code) throw new Error('Missing exam or ticket code');
+      const startRes = await apiService.post<any>(`/exams/${examId}/start`, { ticketCode: code });
+      if (startRes.success && startRes.data?.sessionId) {
+        navigate(`/exam/${examId}?sid=${encodeURIComponent(startRes.data.sessionId)}`);
       } else {
-        throw new Error(response.message || 'Failed to use ticket');
+        navigate(`/exam/${examId}`); // fallback
       }
     } catch (error: any) {
       console.error('Use ticket error:', error);
@@ -73,6 +80,7 @@ export const TicketValidationPage: React.FC = () => {
     reset();
     setTicket(null);
     setIsValid(false);
+    setShowInvalid(false);
   };
 
   return (
@@ -155,21 +163,29 @@ export const TicketValidationPage: React.FC = () => {
               
               <div>
                 <p className="text-sm font-medium text-gray-700">Ticket Code:</p>
-                <p className="text-sm text-gray-900 font-mono">{ticket.code}</p>
+                <p className="text-sm text-gray-900 font-mono">{ticket.ticket?.code || ticket.code}</p>
               </div>
               
               <div>
                 <p className="text-sm font-medium text-gray-700">Expires:</p>
                 <p className="text-sm text-gray-900">
-                  {new Date(ticket.expiresAt).toLocaleDateString()} at{' '}
-                  {new Date(ticket.expiresAt).toLocaleTimeString()}
+                  {(() => {
+                    const raw = ticket.ticket?.validUntil || ticket.validUntil || ticket.expiresAt;
+                    try {
+                      const d = new Date(raw);
+                      if (!isNaN(d.getTime())) {
+                        return `${d.toLocaleDateString()} at ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+                      }
+                    } catch {}
+                    return 'Unknown';
+                  })()}
                 </p>
               </div>
               
               {ticket.exam && (
                 <div>
                   <p className="text-sm font-medium text-gray-700">Duration:</p>
-                  <p className="text-sm text-gray-900">{ticket.exam.duration} minutes</p>
+                  <p className="text-sm text-gray-900">{ticket.exam.durationMinutes || ticket.exam.duration || ''} minutes</p>
                 </div>
               )}
             </div>
@@ -192,8 +208,8 @@ export const TicketValidationPage: React.FC = () => {
           </div>
         )}
 
-        {/* Invalid Ticket Message */}
-        {!isValid && ticket === null && !isValidating && (
+        {/* Invalid Ticket Message (only after a failed attempt) */}
+        {showInvalid && !isValidating && (
           <div className="mt-6 bg-red-50 border border-red-200 rounded-md p-4">
             <div className="flex">
               <div className="flex-shrink-0">

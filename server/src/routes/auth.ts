@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import { registerUser, loginUser, refreshToken, logoutUser, changePassword, getUserById } from '../services/authService';
 import { asyncHandler, createValidationError } from '../middleware/errorHandler';
 import { authMiddleware, rateLimitByUser } from '../middleware/auth';
-import { logger } from '../config/database';
+import { logger } from '../config/database-no-redis';
 
 const router = Router();
 
@@ -231,7 +231,7 @@ router.get('/me',
 // POST /api/auth/change-password - Change user password
 router.post('/change-password',
   authMiddleware,
-  rateLimitByUser(3, 60), // 3 attempts per hour per user
+  ...(process.env.DISABLE_ROUTE_RATE_LIMIT === '1' ? [] : [rateLimitByUser(3, 3600)]), // optional rate limit
   validatePasswordChange,
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);

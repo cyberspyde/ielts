@@ -22,12 +22,15 @@ import AdminExamEdit from './pages/admin/ExamEdit';
 import AdminStudents from './pages/admin/Students';
 import AdminTickets from './pages/admin/Tickets';
 import AdminAnalytics from './pages/admin/Analytics';
+import AdminSessions from './pages/admin/AdminSessions';
+import AdminSessionResults from './pages/admin/AdminSessionResults';
 import { StudentDashboard } from './pages/student/Dashboard';
 import ExamList from './pages/student/ExamList';
 import ExamTaking from './pages/student/ExamTaking';
 import ExamResults from './pages/student/ExamResults';
 import { NotFoundPage } from './pages/NotFoundPage';
 import TopNav from './components/ui/TopNav';
+import ErrorBoundary from './components/ui/ErrorBoundary';
 
 // Create a client
 const queryClient = new QueryClient({
@@ -47,6 +50,7 @@ function App() {
           <SocketProvider>
             <div className="min-h-screen bg-gray-50">
               <TopNav />
+              <ErrorBoundary>
               <Routes>
                 {/* Public Routes */}
                 <Route path="/login" element={<LoginPage />} />
@@ -89,6 +93,16 @@ function App() {
                     <AdminAnalytics />
                   </AdminRoute>
                 } />
+                <Route path="/admin/sessions" element={
+                  <AdminRoute>
+                    <AdminSessions />
+                  </AdminRoute>
+                } />
+                <Route path="/admin/sessions/:sessionId" element={
+                  <AdminRoute>
+                    <AdminSessionResults />
+                  </AdminRoute>
+                } />
                 
                 {/* Student Routes */}
                 <Route path="/dashboard" element={
@@ -101,11 +115,7 @@ function App() {
                     <ExamList />
                   </ProtectedRoute>
                 } />
-                <Route path="/exam/:examId" element={
-                  <ProtectedRoute>
-                    <ExamTaking />
-                  </ProtectedRoute>
-                } />
+                <Route path="/exam/:examId" element={<ExamTaking />} />
                 <Route path="/results/:sessionId" element={
                   <ProtectedRoute>
                     <ExamResults />
@@ -116,6 +126,7 @@ function App() {
                 <Route path="/" element={<Navigate to="/dashboard" replace />} />
                 <Route path="*" element={<NotFoundPage />} />
               </Routes>
+              </ErrorBoundary>
               
               {/* Global Components */}
               <ToastContainer

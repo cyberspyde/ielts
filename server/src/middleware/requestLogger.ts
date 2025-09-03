@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { logger } from '../config/database';
+import { logger } from '../config/database-no-redis';
 
 // Extend Request interface to include correlationId
 declare global {
@@ -33,7 +33,8 @@ export const requestLogger = (req: Request, res: Response, next: NextFunction): 
     timestamp: new Date().toISOString(),
   };
 
-  if ((process.env.CONSOLE_LOG_LEVEL || process.env.LOG_LEVEL || 'error') !== 'error') {
+  const consoleLevel = process.env.CONSOLE_LOG_LEVEL || process.env.LOG_LEVEL || 'error';
+  if (consoleLevel === 'info' || consoleLevel === 'debug') {
     logger.info('Request started', requestLog);
   }
 
@@ -54,7 +55,7 @@ export const requestLogger = (req: Request, res: Response, next: NextFunction): 
     if (res.statusCode >= 400) {
       logger.warn('Request completed with error', { ...requestLog, ...responseLog });
     } else {
-      if ((process.env.CONSOLE_LOG_LEVEL || process.env.LOG_LEVEL || 'error') !== 'error') {
+      if (consoleLevel === 'info' || consoleLevel === 'debug') {
         logger.info('Request completed successfully', { ...requestLog, ...responseLog });
       }
     }
