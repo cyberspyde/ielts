@@ -4,26 +4,30 @@ import {
   Plus, 
   Edit, 
   Trash2, 
-  Eye, 
   Search, 
-  Filter, 
   Calendar,
   Clock,
   BookOpen,
-  Users,
   MoreVertical,
   Copy
 } from 'lucide-react';
-import type { Exam, ExamSection, Question } from '../../types';
+import type { Exam, ExamSection } from '../../types';
 import { apiService } from '../../services/api';
 
+interface SimpleSectionDraft {
+  id: string;
+  sectionType: ExamSection['sectionType'];
+  title: string;
+  durationMinutes: number;
+  description?: string;
+}
 interface CreateExamForm {
   title: string;
   description: string;
-  duration: number;
-  sections: ExamSection[];
-  status: 'draft' | 'active' | 'inactive';
-  difficulty: 'easy' | 'medium' | 'hard';
+  examType: Exam['examType'];
+  durationMinutes: number;
+  sections: SimpleSectionDraft[];
+  isActive: boolean;
 }
 
 const AdminExams: React.FC = () => {
@@ -32,8 +36,9 @@ const AdminExams: React.FC = () => {
   const [editingExam, setEditingExam] = useState<Exam | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [examToDelete, setExamToDelete] = useState<Exam | null>(null);
 
-  const { data: exams, isLoading } = useQuery({
+  const { data: examsResp, isLoading } = useQuery({
     queryKey: ['admin-exams'],
     queryFn: () => apiService.get<Exam[]>('/admin/exams')
   });
@@ -69,15 +74,24 @@ const AdminExams: React.FC = () => {
     }
   });
 
-  const filteredExams = exams?.filter(exam => {
-    const matchesSearch = exam.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                         exam.description.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchesStatus = statusFilter === 'all' || exam.status === statusFilter;
+  const exams: Exam[] = (examsResp?.data as any) || [];
+  const filteredExams = exams.filter((exam: Exam) => {
+    const matchesSearch = (exam.title || '').toLowerCase().includes(searchTerm.toLowerCase()) || (exam.description || '').toLowerCase().includes(searchTerm.toLowerCase());
+    const matchesStatus = statusFilter === 'all' || (statusFilter === 'active' ? exam.isActive : statusFilter === 'inactive' ? !exam.isActive : true);
     return matchesSearch && matchesStatus;
   });
 
-  const handleCreateExam = (examData: CreateExamForm) => {
-    createExamMutation.mutate(examData);
+  const handleCreateExam = (examData: CreateExamForm | Partial<CreateExamForm>) => {
+    // Ensure required fields exist before cast
+    const payload: CreateExamForm = {
+      title: examData.title || '',
+      description: examData.description || '',
+      examType: (examData as any).examType || 'academic',
+      durationMinutes: (examData as any).durationMinutes || 60,
+      sections: (examData as any).sections || [],
+      isActive: (examData as any).isActive || false
+    };
+    createExamMutation.mutate(payload);
   };
 
   const handleUpdateExam = (examData: Partial<CreateExamForm>) => {
@@ -86,11 +100,15 @@ const AdminExams: React.FC = () => {
     }
   };
 
-  const handleDeleteExam = (examId: string) => {
-    if (window.confirm('Are you sure you want to delete this exam? This action cannot be undone.')) {
-      deleteExamMutation.mutate(examId);
+  const handleDeleteExam = (exam: Exam) => {
+    setExamToDelete(exam);
+  };
+  const confirmDelete = () => {
+    if (examToDelete) {
+      deleteExamMutation.mutate(examToDelete.id, { onSuccess: () => setExamToDelete(null) });
     }
   };
+  const cancelDelete = () => setExamToDelete(null);
 
   const handleDuplicateExam = (examId: string) => {
     duplicateExamMutation.mutate(examId);
@@ -140,7 +158,6 @@ const AdminExams: React.FC = () => {
             className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
           >
             <option value="all">All Status</option>
-            <option value="draft">Draft</option>
             <option value="active">Active</option>
             <option value="inactive">Inactive</option>
           </select>
@@ -152,7 +169,7 @@ const AdminExams: React.FC = () => {
 
       {/* Exam Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {filteredExams?.map((exam) => (
+  {filteredExams.map((exam: Exam) => (
           <div key={exam.id} className="bg-white rounded-lg shadow-sm border hover:shadow-md transition-shadow">
             <div className="p-6">
               <div className="flex items-start justify-between mb-4">
@@ -180,7 +197,7 @@ const AdminExams: React.FC = () => {
                       Duplicate
                     </button>
                     <button
-                      onClick={() => handleDeleteExam(exam.id)}
+                      onClick={() => handleDeleteExam(exam)}
                       className="flex items-center w-full px-3 py-2 text-sm text-red-600 hover:bg-red-50"
                     >
                       <Trash2 className="h-4 w-4 mr-2" />
@@ -193,35 +210,31 @@ const AdminExams: React.FC = () => {
               <div className="space-y-2 mb-4">
                 <div className="flex items-center text-sm text-gray-600">
                   <BookOpen className="h-4 w-4 mr-2" />
-                  <span>{exam.sections.length} section{exam.sections.length !== 1 ? 's' : ''}</span>
+                  <span>{exam.sections?.length || 0} section{(exam.sections?.length || 0) !== 1 ? 's' : ''}</span>
                 </div>
                 <div className="flex items-center text-sm text-gray-600">
                   <Clock className="h-4 w-4 mr-2" />
-                  <span>{exam.duration} minutes</span>
+                  <span>{exam.durationMinutes} minutes</span>
                 </div>
                 <div className="flex items-center text-sm text-gray-600">
                   <Calendar className="h-4 w-4 mr-2" />
-                  <span>Created {new Date(exam.createdAt).toLocaleDateString()}</span>
+                  <span>Created {exam.createdAt ? new Date(exam.createdAt).toLocaleDateString() : ''}</span>
                 </div>
               </div>
 
               <div className="flex items-center justify-between">
                 <div className="flex flex-wrap gap-1">
-                  {exam.sections.map((section) => (
+                  {exam.sections?.map((section: ExamSection) => (
                     <span
                       key={section.id}
                       className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-md"
                     >
-                      {section.type}
+                      {section.sectionType}
                     </span>
                   ))}
                 </div>
-                <div className={`px-2 py-1 rounded-full text-xs font-medium ${
-                  exam.status === 'active' ? 'bg-green-100 text-green-800' :
-                  exam.status === 'draft' ? 'bg-yellow-100 text-yellow-800' :
-                  'bg-gray-100 text-gray-800'
-                }`}>
-                  {exam.status}
+                <div className={`px-2 py-1 rounded-full text-xs font-medium ${ exam.isActive ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800' }`}>
+                  {exam.isActive ? 'active' : 'inactive'}
                 </div>
               </div>
             </div>
@@ -249,6 +262,28 @@ const AdminExams: React.FC = () => {
           isLoading={createExamMutation.isPending || updateExamMutation.isPending}
         />
       )}
+      {examToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-md">
+            <div className="p-5 border-b">
+              <h3 className="text-lg font-semibold text-gray-900">Delete Exam</h3>
+            </div>
+            <div className="p-5 space-y-4">
+              <p className="text-sm text-gray-700">Are you sure you want to permanently delete <span className="font-medium">{examToDelete.title}</span>? This will remove all its sections, questions, sessions, answers, and tickets. This action cannot be undone.</p>
+              <div className="bg-red-50 border border-red-200 rounded p-3 text-xs text-red-700">
+                Cascade deletions: sessions, answers, section questions, options, tickets.
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-3 p-5 border-t">
+              <button onClick={cancelDelete} className="px-4 py-2 rounded border border-gray-300 text-gray-700 hover:bg-gray-50 text-sm">Cancel</button>
+              <button onClick={confirmDelete} disabled={deleteExamMutation.isPending} className="px-4 py-2 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 text-sm flex items-center gap-2">
+                <Trash2 className="h-4 w-4" />
+                {deleteExamMutation.isPending ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -269,10 +304,10 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
   const [formData, setFormData] = useState<CreateExamForm>({
     title: exam?.title || '',
     description: exam?.description || '',
-    duration: exam?.duration || 60,
-    sections: exam?.sections || [],
-    status: exam?.status || 'draft',
-    difficulty: exam?.difficulty || 'medium'
+    examType: exam?.examType || 'academic',
+    durationMinutes: exam?.durationMinutes || 60,
+    sections: (exam?.sections || []).map(s => ({ id: s.id, sectionType: s.sectionType, title: s.title, durationMinutes: s.durationMinutes, description: s.description })),
+    isActive: !!exam?.isActive
   });
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -281,18 +316,8 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
   };
 
   const addSection = () => {
-    const newSection: ExamSection = {
-      id: `temp-${Date.now()}`,
-      type: 'reading',
-      title: '',
-      description: '',
-      questions: [],
-      timeLimit: 30
-    };
-    setFormData(prev => ({
-      ...prev,
-      sections: [...prev.sections, newSection]
-    }));
+    const newSection: SimpleSectionDraft = { id: `temp-${Date.now()}`, sectionType: 'reading', title: '', durationMinutes: 30, description: '' };
+    setFormData(prev => ({ ...prev, sections: [...prev.sections, newSection] }));
   };
 
   const removeSection = (index: number) => {
@@ -302,12 +327,10 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
     }));
   };
 
-  const updateSection = (index: number, field: keyof ExamSection, value: any) => {
+  const updateSection = (index: number, field: keyof SimpleSectionDraft, value: any) => {
     setFormData(prev => ({
       ...prev,
-      sections: prev.sections.map((section, i) =>
-        i === index ? { ...section, [field]: value } : section
-      )
+      sections: prev.sections.map((section, i) => i === index ? { ...section, [field]: value } : section)
     }));
   };
 
@@ -341,8 +364,8 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
               </label>
               <input
                 type="number"
-                value={formData.duration}
-                onChange={(e) => setFormData(prev => ({ ...prev, duration: parseInt(e.target.value) }))}
+                value={formData.durationMinutes}
+                onChange={(e) => setFormData(prev => ({ ...prev, durationMinutes: parseInt(e.target.value) }))}
                 className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 min="1"
                 required
@@ -351,31 +374,24 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Difficulty
+                Active
               </label>
-              <select
-                value={formData.difficulty}
-                onChange={(e) => setFormData(prev => ({ ...prev, difficulty: e.target.value as any }))}
-                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              >
-                <option value="easy">Easy</option>
-                <option value="medium">Medium</option>
-                <option value="hard">Hard</option>
-              </select>
+              <label className="inline-flex items-center gap-2 text-sm text-gray-700">
+                <input type="checkbox" checked={formData.isActive} onChange={(e)=> setFormData(prev=>({...prev, isActive: e.target.checked}))} className="rounded border-gray-300" /> Active
+              </label>
             </div>
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Status
+                Exam Type
               </label>
               <select
-                value={formData.status}
-                onChange={(e) => setFormData(prev => ({ ...prev, status: e.target.value as any }))}
+                value={formData.examType}
+                onChange={(e) => setFormData(prev => ({ ...prev, examType: e.target.value as any }))}
                 className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               >
-                <option value="draft">Draft</option>
-                <option value="active">Active</option>
-                <option value="inactive">Inactive</option>
+                <option value="academic">Academic</option>
+                <option value="general_training">General Training</option>
               </select>
             </div>
           </div>
@@ -416,8 +432,8 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
                         Section Type
                       </label>
                       <select
-                        value={section.type}
-                        onChange={(e) => updateSection(index, 'type', e.target.value)}
+                        value={section.sectionType}
+                        onChange={(e) => updateSection(index, 'sectionType', e.target.value as any)}
                         className="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                       >
                         <option value="reading">Reading</option>
@@ -432,8 +448,8 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
                       </label>
                       <input
                         type="number"
-                        value={section.timeLimit}
-                        onChange={(e) => updateSection(index, 'timeLimit', parseInt(e.target.value))}
+                        value={section.durationMinutes}
+                        onChange={(e) => updateSection(index, 'durationMinutes', parseInt(e.target.value))}
                         className="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                         min="1"
                       />
@@ -458,7 +474,7 @@ const CreateEditExamModal: React.FC<CreateEditExamModalProps> = ({
                       value={section.title}
                       onChange={(e) => updateSection(index, 'title', e.target.value)}
                       className="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      placeholder={`${section.type.charAt(0).toUpperCase() + section.type.slice(1)} Section`}
+                      placeholder={`${section.sectionType.charAt(0).toUpperCase() + section.sectionType.slice(1)} Section`}
                     />
                   </div>
                 </div>

@@ -1,4 +1,7 @@
 import { Router, Request, Response } from 'express';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
 import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
 import { query, logger } from '../config/database-no-redis';
@@ -6,6 +9,50 @@ import { asyncHandler, createValidationError, createNotFoundError, AppError } fr
 import { authMiddleware, requireRole, requireAdmin, requireSuperAdmin, rateLimitByUser } from '../middleware/auth';
 
 const router = Router();
+
+// File upload (audio) setup
+const uploadsRoot = process.env.UPLOADS_DIR || path.join(process.cwd(), 'uploads');
+if (!fs.existsSync(uploadsRoot)) {
+  fs.mkdirSync(uploadsRoot, { recursive: true });
+}
+const audioStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(uploadsRoot, 'audio');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g,'_');
+    cb(null, `${Date.now()}_${base}${ext}`);
+  }
+});
+const audioFilter: multer.Options['fileFilter'] = (req, file, cb) => {
+  const allowed = ['audio/mpeg','audio/mp3','audio/wav','audio/x-wav','audio/wave'];
+  if (allowed.includes(file.mimetype)) cb(null, true); else cb(new AppError('Invalid audio file type', 400));
+};
+const uploadAudio = multer({ storage: audioStorage, fileFilter: audioFilter, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB
+
+// POST /api/admin/sections/:sectionId/audio - upload or replace listening section audio
+// NOTE: Frontend sends the file under the key 'file' (apiService.upload). Accept that here.
+// Secure audio upload (auth first to avoid processing file for unauthenticated users)
+router.post('/sections/:sectionId/audio', authMiddleware, requireRole(['admin','super_admin']), uploadAudio.single('file'), asyncHandler(async (req: Request, res: Response) => {
+  const { sectionId } = req.params;
+  // Support both 'file' and legacy 'audio' field names just in case
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (!file) throw new AppError('Audio file required', 400);
+  // Verify listening section
+  const sec = await query('SELECT id, exam_id, section_type, audio_url FROM exam_sections WHERE id = $1', [sectionId]);
+  if (sec.rowCount === 0) throw createNotFoundError('Section');
+  if (sec.rows[0].section_type !== 'listening') throw new AppError('Audio can only be uploaded for listening sections', 400);
+  const publicPath = `/uploads/audio/${path.basename(file.path)}`;
+  // exam_sections table lacks updated_at; just update audio_url
+  await query('UPDATE exam_sections SET audio_url = $1 WHERE id = $2', [publicPath, sectionId]);
+  const userId = (req.user && (req.user as any).id) || '00000000-0000-0000-0000-000000000000';
+  const absoluteUrl = `${req.protocol}://${req.get('host')}${publicPath}`;
+  await logAdminAction(userId, 'UPLOAD_SECTION_AUDIO', 'exam', sec.rows[0].exam_id, { sectionId, audio: publicPath, absoluteUrl });
+  res.status(201).json({ success: true, message: 'Audio uploaded', data: { audioUrl: publicPath, absoluteUrl } });
+}));
 
 // All admin routes require authentication and admin role or higher
 router.use(authMiddleware);
@@ -188,6 +235,31 @@ router.put('/exams/:examId',
   })
 );
 
+// DELETE /api/admin/exams/:examId - Delete exam and dependent data
+router.delete('/exams/:examId', asyncHandler(async (req: Request, res: Response) => {
+  const { examId } = req.params;
+  // Verify exists
+  const exists = await query('SELECT id FROM exams WHERE id = $1', [examId]);
+  if (exists.rowCount === 0) throw createNotFoundError('Exam');
+  await query('BEGIN');
+  try {
+    // Delete answers -> sessions -> question options -> questions -> sections -> tickets -> exam
+    await query('DELETE FROM exam_session_answers WHERE session_id IN (SELECT id FROM exam_sessions WHERE exam_id = $1)', [examId]);
+    await query('DELETE FROM exam_sessions WHERE exam_id = $1', [examId]);
+    await query('DELETE FROM exam_question_options WHERE question_id IN (SELECT id FROM exam_questions WHERE section_id IN (SELECT id FROM exam_sections WHERE exam_id = $1))', [examId]);
+    await query('DELETE FROM exam_questions WHERE section_id IN (SELECT id FROM exam_sections WHERE exam_id = $1)', [examId]);
+    await query('DELETE FROM exam_sections WHERE exam_id = $1', [examId]);
+    await query('DELETE FROM tickets WHERE exam_id = $1', [examId]);
+    await query('DELETE FROM exams WHERE id = $1', [examId]);
+    await query('COMMIT');
+  } catch (e) {
+    await query('ROLLBACK');
+    throw e;
+  }
+  await logAdminAction(req.user!.id, 'DELETE_EXAM', 'exam', examId, {});
+  res.json({ success: true, message: 'Exam deleted' });
+}));
+
 // PUT /api/admin/exams/:examId/sections/:sectionId - Update a section
 router.put('/exams/:examId/sections/:sectionId',
   body('title').optional().isString(),
@@ -223,9 +295,34 @@ router.put('/exams/:examId/sections/:sectionId',
   })
 );
 
+// DELETE /api/admin/sections/:sectionId - Delete a single section and its questions/options/answers
+router.delete('/sections/:sectionId', asyncHandler(async (req: Request, res: Response) => {
+  const { sectionId } = req.params;
+  // Lookup section + exam for logging
+  const sec = await query('SELECT id, exam_id FROM exam_sections WHERE id = $1', [sectionId]);
+  if (sec.rowCount === 0) throw createNotFoundError('Section');
+  await query('BEGIN');
+  try {
+    // Delete answers related to questions in this section
+    await query('DELETE FROM exam_session_answers WHERE question_id IN (SELECT id FROM exam_questions WHERE section_id = $1)', [sectionId]);
+    // Delete question options
+    await query('DELETE FROM exam_question_options WHERE question_id IN (SELECT id FROM exam_questions WHERE section_id = $1)', [sectionId]);
+    // Delete questions
+    await query('DELETE FROM exam_questions WHERE section_id = $1', [sectionId]);
+    // Finally delete section
+    await query('DELETE FROM exam_sections WHERE id = $1', [sectionId]);
+    await query('COMMIT');
+  } catch (e) {
+    await query('ROLLBACK');
+    throw e;
+  }
+  await logAdminAction(req.user!.id, 'DELETE_SECTION', 'exam', sec.rows[0].exam_id, { sectionId });
+  res.json({ success: true, message: 'Section deleted' });
+}));
+
 // PUT /api/admin/questions/:questionId - Update a question
 router.put('/questions/:questionId',
-  body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop']),
+  body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1']),
   body('questionText').optional().isString(),
   body('correctAnswer').optional().isString(),
   body('points').optional().isFloat({ min: 0 }),
@@ -254,6 +351,72 @@ router.put('/questions/:questionId',
     await query(`UPDATE exam_questions SET ${fields.join(', ')}, created_at = created_at WHERE id = $${p}`, values);
     await logAdminAction(req.user!.id, 'UPDATE_QUESTION', 'question', questionId, fields);
     res.json({ success: true, message: 'Question updated' });
+  })
+);
+
+// POST /api/admin/sections/:sectionId/questions - Create a single question
+router.post('/sections/:sectionId/questions',
+  body('questionType').isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1']).withMessage('Invalid question type'),
+  body('questionText').optional().isString(),
+  body('correctAnswer').optional().isString(),
+  body('points').optional().isFloat({ min: 0 }),
+  body('questionNumber').optional().isInt({ min: 1 }),
+  body('metadata').optional(),
+  asyncHandler(async (req: Request, res: Response) => {
+    checkValidationErrors(req);
+    const { sectionId } = req.params;
+    const { questionType, questionText = '', correctAnswer, points = 1, questionNumber, metadata } = req.body;
+    // Verify section
+    const sec = await query('SELECT id, exam_id FROM exam_sections WHERE id = $1', [sectionId]);
+    if (sec.rowCount === 0) throw createNotFoundError('Section');
+    let qNum = questionNumber;
+    if (!qNum) {
+      const r = await query('SELECT COALESCE(MAX(question_number),0)+1 AS next FROM exam_questions WHERE section_id = $1', [sectionId]);
+      qNum = Number(r.rows[0].next) || 1;
+    }
+    let newId: string | null = null;
+    // Retry a few times if duplicate question_number due to race conditions
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const rQ = await query(`
+          INSERT INTO exam_questions (section_id, question_type, question_text, question_number, points, correct_answer, metadata)
+          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+        `, [sectionId, questionType, questionText, qNum, points, correctAnswer || null, metadata ? JSON.stringify(metadata) : null]);
+        newId = rQ.rows[0].id; break;
+      } catch (e: any) {
+        if (e?.code === '23505' && /uq_exam_questions_section_question/i.test(e?.constraint || '')) {
+          // Increment and retry
+            qNum = (qNum || 0) + 1;
+            continue;
+        }
+        throw e;
+      }
+    }
+    if (!newId) throw new AppError('Failed to create question after retries', 500);
+    await logAdminAction(req.user!.id, 'CREATE_QUESTION', 'exam', sec.rows[0].exam_id, { sectionId, questionType, questionNumber: qNum });
+    res.status(201).json({ success: true, message: 'Question created', data: { id: newId, questionNumber: qNum } });
+  })
+);
+
+// DELETE /api/admin/questions/:questionId - Delete a single question and its options & session answers
+router.delete('/questions/:questionId',
+  asyncHandler( async (req: Request, res: Response) => {
+    const { questionId } = req.params;
+    // Get section/exam for logging
+    const info = await query('SELECT q.id, q.section_id, s.exam_id FROM exam_questions q JOIN exam_sections s ON q.section_id = s.id WHERE q.id = $1', [questionId]);
+    if (info.rowCount === 0) throw createNotFoundError('Question');
+    await query('BEGIN');
+    try {
+      await query('DELETE FROM exam_session_answers WHERE question_id = $1', [questionId]);
+      await query('DELETE FROM exam_question_options WHERE question_id = $1', [questionId]);
+      await query('DELETE FROM exam_questions WHERE id = $1', [questionId]);
+      await query('COMMIT');
+    } catch (e) {
+      await query('ROLLBACK');
+      throw e;
+    }
+    await logAdminAction(req.user!.id, 'DELETE_QUESTION', 'exam', info.rows[0].exam_id, { questionId });
+    res.json({ success: true, message: 'Question deleted' });
   })
 );
 
@@ -348,13 +511,14 @@ router.post('/exams/:examId/sections',
 router.post('/exams/:examId/questions/bulk',
   body('sectionId').isUUID().withMessage('Valid sectionId is required'),
   body('groups').isArray({ min: 1 }).withMessage('Groups array is required'),
-  body('groups.*.questionType').isIn(['multiple_choice', 'true_false', 'fill_blank', 'matching', 'short_answer', 'essay', 'speaking', 'speaking_task', 'drag_drop']).withMessage('Invalid question type'),
+  body('groups.*.questionType').isIn(['multiple_choice', 'true_false', 'fill_blank', 'matching', 'short_answer', 'essay', 'writing_task1', 'speaking', 'speaking_task', 'drag_drop']).withMessage('Invalid question type'),
   body('groups.*.start').isInt({ min: 1 }).withMessage('Start question number required'),
   body('groups.*.end').isInt({ min: 1 }).withMessage('End question number required'),
   body('groups.*.points').optional().isFloat({ min: 0 }).withMessage('Points must be >= 0'),
   body('groups.*.options').optional().isArray().withMessage('Options must be an array when provided'),
   body('groups.*.correctAnswers').optional().isArray().withMessage('correctAnswers must be an array when provided'),
   body('groups.*.questionTexts').optional().isArray().withMessage('questionTexts must be an array when provided'),
+  body('groups.*.fillMissing').optional().isBoolean(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
 
@@ -374,25 +538,60 @@ router.post('/exams/:examId/questions/bulk',
       if (endNum < startNum) {
         throw new AppError('Group end must be >= start', 400);
       }
+      // Pre-check for existing question numbers in requested range to avoid partial inserts & 500 errors
+      const existingNums = await query(
+        'SELECT question_number FROM exam_questions WHERE section_id = $1 AND question_number BETWEEN $2 AND $3 ORDER BY question_number',
+        [sectionId, startNum, endNum]
+      );
+      const existingSet = new Set(existingNums.rows.map((r: any) => r.question_number));
+      if (existingSet.size > 0 && !g.fillMissing) {
+        const nums = Array.from(existingSet.values()).sort((a:any,b:any)=>a-b).join(',');
+        throw new AppError(`Cannot create questions. Numbers already exist in this section: ${nums}`, 409);
+      }
       // Map client-friendly types to DB enum values
       const typeMap: Record<string, string> = {
-        short_answer: 'essay',
         speaking: 'speaking_task',
       };
       const dbQuestionType = (typeMap[g.questionType] || g.questionType) as string;
+      // Special handling for drag_drop ranges: first question is the anchor (manages tokens/options),
+      // subsequent ones become group members with metadata.groupMemberOf pointing at anchor id.
+      let dragDropAnchorId: string | null = null;
       for (let num = startNum; num <= endNum; num++) {
+        if (existingSet.has(num)) {
+          // Skip existing when fillMissing true
+          if (g.fillMissing) continue; else break;
+        }
+        const questionText = (Array.isArray(g.questionTexts) ? g.questionTexts[num - startNum] : g.questionText) || '';
+        const points = g.points || 1.0;
+        let metadata: any = null;
+        if (dbQuestionType === 'drag_drop') {
+          if (num === startNum) {
+            // Anchor: provide a default layout if not specified by client and store group range end
+            metadata = { layout: (g.layout || 'rows'), groupRangeEnd: endNum };
+          } else {
+            if (!dragDropAnchorId) {
+              throw new AppError('Internal error creating drag_drop group (missing anchor id)', 500);
+            }
+            metadata = { groupMemberOf: dragDropAnchorId };
+          }
+        }
+
         const rQ = await query(`
           INSERT INTO exam_questions (
-            section_id, question_type, question_text, question_number, points
-          ) VALUES ($1, $2, $3, $4, $5) RETURNING id
+            section_id, question_type, question_text, question_number, points, metadata
+          ) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
         `, [
           sectionId,
           dbQuestionType,
-          (Array.isArray(g.questionTexts) ? g.questionTexts[num - startNum] : g.questionText) || '',
+          questionText,
           num,
-          g.points || 1.0
+          points,
+          metadata ? JSON.stringify(metadata) : null
         ]);
         const questionId = rQ.rows[0].id;
+        if (dbQuestionType === 'drag_drop' && num === startNum) {
+          dragDropAnchorId = questionId;
+        }
 
         // If provided, set correct answer per question by index within group
         if (Array.isArray(g.correctAnswers)) {
@@ -408,6 +607,11 @@ router.post('/exams/:examId/questions/bulk',
           options = g.options;
         } else if (dbQuestionType === 'matching') {
           options = ['A','B','C','D','E','F','G'];
+        }
+
+        // For drag_drop anchors with no provided options, seed a small default token set for convenience
+        if (!options && dbQuestionType === 'drag_drop' && num === startNum) {
+          options = ['A','B','C','D'];
         }
 
         if (options) {
@@ -945,6 +1149,42 @@ router.get('/sessions',
     });
   })
 );
+
+// POST /api/admin/sessions/:sessionId/stop - Force stop an in-progress or pending session (mark expired + submitted_at if desired)
+router.post('/sessions/:sessionId/stop', asyncHandler(async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const sess = await query('SELECT id, status FROM exam_sessions WHERE id = $1', [sessionId]);
+  if (sess.rowCount === 0) throw createNotFoundError('Exam session');
+  const status = sess.rows[0].status;
+  if (status === 'submitted') {
+    return res.status(400).json({ success: false, message: 'Session already submitted' });
+  }
+  await query(`UPDATE exam_sessions SET status = 'expired', submitted_at = COALESCE(submitted_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [sessionId]);
+  await logAdminAction(req.user!.id, 'STOP_SESSION', 'session', sessionId, { previousStatus: status });
+  res.json({ success: true, message: 'Session stopped', data: { status: 'expired' } });
+}));
+
+// DELETE /api/admin/sessions/:sessionId - Remove a session and its answers (only if not submitted OR force=true)
+router.delete('/sessions/:sessionId', asyncHandler(async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const force = (req.query.force || '').toString() === 'true';
+  const sess = await query('SELECT id, status FROM exam_sessions WHERE id = $1', [sessionId]);
+  if (sess.rowCount === 0) throw createNotFoundError('Exam session');
+  if (sess.rows[0].status === 'submitted' && !force) {
+    return res.status(400).json({ success: false, message: 'Cannot delete submitted session without force=true' });
+  }
+  await query('BEGIN');
+  try {
+    await query('DELETE FROM exam_session_answers WHERE session_id = $1', [sessionId]);
+    await query('DELETE FROM exam_sessions WHERE id = $1', [sessionId]);
+    await query('COMMIT');
+  } catch (e) {
+    await query('ROLLBACK');
+    throw e;
+  }
+  await logAdminAction(req.user!.id, 'DELETE_SESSION', 'session', sessionId, { force });
+  res.json({ success: true, message: 'Session deleted' });
+}));
 
 // GET /api/admin/sessions/:sessionId/results - Get results for any session (including ticket-based anonymous)
 router.get('/sessions/:sessionId/results',

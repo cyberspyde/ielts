@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import ConfirmDialog from '../../components/ui/ConfirmDialog';
 import { Link } from 'react-router-dom';
 import { Search, RefreshCcw, Eye, Ticket, User, Clock, Loader2 } from 'lucide-react';
 import { apiService } from '../../services/api';
@@ -44,6 +45,29 @@ const AdminSessions: React.FC = () => {
 
   const sessions: AdminSession[] = data?.sessions || [];
   const pagination = data?.pagination;
+
+  const queryClient = useQueryClient();
+  const stopSession = useMutation({
+    mutationFn: async (id: string) => apiService.post(`/admin/sessions/${id}/stop`, {}),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-sessions'] }); }
+  });
+  const deleteSession = useMutation({
+    mutationFn: async ({ id, force }: { id: string; force?: boolean }) => apiService.delete(`/admin/sessions/${id}${force ? '?force=true' : ''}`),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-sessions'] }); }
+  });
+
+  // Dialog state for replacing window.confirm
+  const [dialog, setDialog] = React.useState<{ mode: 'stop' | 'delete'; session?: AdminSession }>(() => ({ mode: 'stop' }));
+  const openDialog = (mode: 'stop' | 'delete', session: AdminSession) => setDialog({ mode, session });
+  const closeDialog = () => setDialog(d => ({ ...d, session: undefined }));
+  const confirmDialog = () => {
+    if (!dialog.session) return;
+    if (dialog.mode === 'stop') {
+      stopSession.mutate(dialog.session.id, { onSuccess: closeDialog });
+    } else {
+      deleteSession.mutate({ id: dialog.session.id }, { onSuccess: closeDialog });
+    }
+  };
 
   return (
     <div className="container mx-auto px-4 py-8">
@@ -139,11 +163,25 @@ const AdminSessions: React.FC = () => {
                   <td className="px-3 py-2">
                     <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium ${session.status === 'submitted' ? 'bg-green-100 text-green-700' : session.status === 'in_progress' ? 'bg-blue-100 text-blue-700' : session.status === 'pending' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-200 text-gray-700'}`}>{session.status}</span>
                   </td>
-                  <td className="px-3 py-2 text-right">
+                  <td className="px-3 py-2 text-right space-x-2">
                     {session.status === 'submitted' && (
                       <Link to={`/admin/sessions/${session.id}`} className="inline-flex items-center text-blue-600 hover:text-blue-700 text-xs font-medium">
                         <Eye className="h-3 w-3 mr-1" /> View
                       </Link>
+                    )}
+                    {(session.status === 'in_progress' || session.status === 'pending') && (
+                      <button
+                        onClick={() => openDialog('stop', session)}
+                        className="text-xs px-2 py-1 rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
+                        disabled={stopSession.isPending}
+                      >Stop</button>
+                    )}
+                    {session.status !== 'submitted' && (
+                      <button
+                        onClick={() => openDialog('delete', session)}
+                        className="text-xs px-2 py-1 rounded border border-red-300 text-red-600 hover:bg-red-50"
+                        disabled={deleteSession.isPending}
+                      >Delete</button>
                     )}
                   </td>
                 </tr>
@@ -151,6 +189,20 @@ const AdminSessions: React.FC = () => {
             })}
           </tbody>
         </table>
+        <ConfirmDialog
+          open={!!dialog.session}
+          title={dialog.mode === 'stop' ? 'Stop Session' : 'Delete Session'}
+          description={dialog.mode === 'stop' ? (
+            <>This will immediately expire the selected session. The student will be unable to continue the exam.</>
+          ) : (
+            <>Delete this session and all related answers? This action cannot be undone.</>
+          )}
+          tone={dialog.mode === 'delete' ? 'danger' : 'warning'}
+          confirmText={dialog.mode === 'stop' ? 'Stop Session' : 'Delete'}
+          onCancel={closeDialog}
+          onConfirm={confirmDialog}
+          loading={stopSession.isPending || deleteSession.isPending}
+        />
         {pagination && (
           <div className="flex items-center justify-between px-4 py-3 border-t bg-gray-50 text-xs text-gray-600">
             <div>Page {pagination.currentPage} of {pagination.totalPages} • {pagination.totalCount} sessions</div>

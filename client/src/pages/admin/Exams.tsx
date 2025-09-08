@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
-import { useQuery, keepPreviousData } from '@tanstack/react-query';
+import { useQuery, keepPreviousData, useMutation, useQueryClient } from '@tanstack/react-query';
+import ConfirmDialog from '../../components/ui/ConfirmDialog';
 // removed toast
 
 import { apiService } from '../../services/api';
@@ -61,7 +62,15 @@ const AdminExams: React.FC = () => {
     refetch();
   };
 
+  const queryClient = useQueryClient();
+  const deleteExam = useMutation({
+    mutationFn: async (id: string) => apiService.delete(`/admin/exams/${id}`),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-exams'] }); }
+  });
+  const [dialogExam, setDialogExam] = useState<ExamListItem | null>(null);
+
   return (
+    <>
     <div className="min-h-screen bg-gray-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Header */}
@@ -175,12 +184,11 @@ const AdminExams: React.FC = () => {
                   <div className="col-span-2 text-right">
                     <div className="text-sm text-gray-500">{new Date(exam.createdAt).toLocaleDateString()}</div>
                     <div className="mt-2 inline-flex gap-2">
-                      <a
-                        href={`/admin/exams/${exam.id}/edit`}
-                        className="px-3 py-1.5 text-sm rounded-md border border-gray-300 text-gray-700 hover:bg-gray-50"
-                      >
-                        Edit
-                      </a>
+                      <a href={`/admin/exams/${exam.id}/edit`} className="px-3 py-1.5 text-sm rounded-md border border-gray-300 text-gray-700 hover:bg-gray-50">Edit</a>
+                      <button
+                        onClick={() => setDialogExam(exam)}
+                        className="px-3 py-1.5 text-sm rounded-md border border-red-300 text-red-600 hover:bg-red-50"
+                      >Delete</button>
                     </div>
                   </div>
                 </div>
@@ -214,7 +222,21 @@ const AdminExams: React.FC = () => {
           )}
         </div>
       </div>
-    </div>
+  </div>
+  <ConfirmDialog
+      open={!!dialogExam}
+      title="Delete Exam"
+      tone="danger"
+      confirmText={deleteExam.isPending ? 'Deleting…' : 'Delete'}
+      description={<>
+        Are you sure you want to permanently delete exam <strong>{dialogExam?.title}</strong>?<br/>
+        All sections, questions, options, sessions, answers and tickets will be removed.
+      </>}
+      onCancel={() => setDialogExam(null)}
+      onConfirm={() => { if (dialogExam) deleteExam.mutate(dialogExam.id, { onSuccess: () => setDialogExam(null) }); }}
+      loading={deleteExam.isPending}
+    />
+  </>
   );
 };
 

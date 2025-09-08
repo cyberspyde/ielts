@@ -93,6 +93,9 @@ api.interceptors.response.use(
             values.forEach((err: any) => toast.error(String(err)));
           } else toast.error(data?.message || 'Validation failed.');
           break;
+        case 409:
+          toast.error(data?.message || 'Conflict: resource already exists or overlaps.');
+          break;
           
         case 500:
           toast.error('Server error. Please try again later.');

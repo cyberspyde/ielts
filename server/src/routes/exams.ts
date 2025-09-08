@@ -489,140 +489,137 @@ router.post('/sessions/:sessionId/submit',
     let totalScore = 0;
     let maxPossibleScore = 0;
 
-    if (answers && Array.isArray(answers)) {
-      for (const answer of answers) {
-        const { questionId, studentAnswer } = answer;
-
-        // Get question details and correct answer
-        const questionResult = await query(`
-          SELECT eq.points, eq.correct_answer, eq.question_type, es.max_score, es.heading_bank
-          FROM exam_questions eq
-          JOIN exam_sections es ON eq.section_id = es.id
-          WHERE eq.id = $1 AND es.exam_id = $2
-        `, [questionId, session.exam_id]);
-
-        if (questionResult.rows.length > 0) {
-          const question = questionResult.rows[0];
-          maxPossibleScore += parseFloat(question.points);
-
-          // Store answer
-          await query(`
-            INSERT INTO exam_session_answers (
-              session_id, question_id, student_answer, answered_at
-            ) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-            ON CONFLICT (session_id, question_id) 
-            DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP
-          `, [sessionId, questionId, JSON.stringify(studentAnswer)]);
-
-          // Simple scoring for MCQ / Matching / True-False / Fill-blank by string equality (case-insensitive, trimmed)
-          const normalize = (v: any) => String(v ?? '').trim().toLowerCase();
-          const expected = question.correct_answer ? normalize(question.correct_answer) : '';
-          let received = normalize(studentAnswer);
-
-          let isCorrect = false;
-          if (question.question_type === 'multiple_choice' || question.question_type === 'matching' || question.question_type === 'drag_drop') {
-            // Special handling for matching: if student selected an option letter (A, B, C ...)
-            // but correct answers are stored as heading letters (e.g., roman numerals: i, ii, iii),
-            // map the option letter position to the heading bank letter before comparing.
-            if (question.question_type === 'matching' && received && /^[a-z]$/.test(received)) {
-              try {
-                const bank = question.heading_bank ? JSON.parse(question.heading_bank) : null;
-                const options = Array.isArray(bank?.options) ? bank.options : [];
-                const idx = received.charCodeAt(0) - 97; // a->0
-                const mapped = options[idx]?.letter ? normalize(options[idx].letter) : '';
-                if (mapped) {
-                  received = mapped;
-                }
-              } catch (_e) {
-                // ignore parse errors; fall back to raw compare
-              }
-            }
-            isCorrect = expected !== '' && received === expected;
-          } else if (question.question_type === 'multi_select') {
-            // Correct answer stored as pipe list (e.g. "A|C") or JSON array ["A","C"]. Student answer expected as array or joined string.
-            let expectedSet: string[] = [];
+    if (answers && Array.isArray(answers) && answers.length) {
+      const normalize = (v: any) => String(v ?? '').trim().toLowerCase();
+      const answerMap: Record<string, any> = {};
+      for (const a of answers) answerMap[a.questionId] = a.studentAnswer;
+      const ids = Object.keys(answerMap);
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+      const questionRows = (await query(`
+        SELECT eq.id, eq.points, eq.correct_answer, eq.question_type, eq.metadata, eq.question_number,
+               es.heading_bank
+        FROM exam_questions eq
+        JOIN exam_sections es ON eq.section_id = es.id
+        WHERE eq.id IN (${placeholders}) AND es.exam_id = $${ids.length + 1}
+      `, [...ids, session.exam_id])).rows;
+  const byId: Record<string, any> = {}; questionRows.forEach((q: any) => { byId[q.id] = q; });
+      // Build grouping anchors (metadata.groupRangeEnd or groupMemberOf)
+      const anchors: Record<string, { anchor: any; members: any[] }> = {};
+      for (const q of questionRows) {
+        let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
+        if (meta?.groupMemberOf) {
+          anchors[meta.groupMemberOf] = anchors[meta.groupMemberOf] || { anchor: null, members: [] };
+          anchors[meta.groupMemberOf].members.push(q);
+        } else if (meta?.groupRangeEnd) {
+          anchors[q.id] = anchors[q.id] || { anchor: q, members: [] };
+        }
+      }
+      for (const q of questionRows) {
+        let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
+        if (meta?.groupMemberOf) continue; // skip member grading
+        const studentAnswer = answerMap[q.id];
+        if (studentAnswer === undefined) continue;
+        maxPossibleScore += parseFloat(q.points);
+        await query(`INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at)
+          VALUES ($1,$2,$3,CURRENT_TIMESTAMP)
+          ON CONFLICT (session_id, question_id)
+          DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP`, [sessionId, q.id, JSON.stringify(studentAnswer)]);
+        const expected = q.correct_answer ? normalize(q.correct_answer) : '';
+        let received = normalize(studentAnswer);
+        let isCorrect = false;
+  if (q.question_type === 'multiple_choice' || q.question_type === 'matching' || q.question_type === 'drag_drop') {
+          if (q.question_type === 'matching' && received && /^[a-z]$/.test(received)) {
             try {
-              if (question.correct_answer && question.correct_answer.trim().startsWith('[')) {
-                const arr = JSON.parse(question.correct_answer);
-                if (Array.isArray(arr)) expectedSet = arr.map((x:any)=>normalize(x));
-              }
+              const bank = q.heading_bank ? JSON.parse(q.heading_bank) : null;
+              const options = Array.isArray(bank?.options) ? bank.options : [];
+              const idx = received.charCodeAt(0) - 97;
+              const mapped = options[idx]?.letter ? normalize(options[idx].letter) : '';
+              if (mapped) received = mapped;
             } catch {}
-            if (expectedSet.length === 0 && question.correct_answer) {
-              expectedSet = question.correct_answer.split('|').map((p:string)=>normalize(p));
-            }
+          }
+          if (q.question_type === 'multiple_choice' && q.correct_answer && q.correct_answer.includes('|')) {
+            const expectedSet = Array.from(new Set(q.correct_answer.split('|').map((p:string)=>normalize(p))));
             let studentSet: string[] = [];
             if (Array.isArray(studentAnswer)) studentSet = (studentAnswer as any[]).map(v=>normalize(v));
-            else if (typeof studentAnswer === 'string') studentSet = studentAnswer.split('|').map(p=>normalize(p));
-            // Require exact two (or expected length) and same members ignoring order
-            expectedSet = Array.from(new Set(expectedSet));
+            else if (typeof studentAnswer === 'string') studentSet = studentAnswer.split('|').map((p:string)=>normalize(p));
             studentSet = Array.from(new Set(studentSet));
-            if (expectedSet.length === studentSet.length && expectedSet.every(v => studentSet.includes(v))) {
-              isCorrect = true;
-            }
-          } else if (question.question_type === 'true_false') {
-            // Accept synonyms like T/F and not given variations
-            const map: Record<string, string> = { 't': 'true', 'f': 'false', 'ng': 'not given', 'notgiven': 'not given' };
-            const rec = map[received] || received;
-            const exp = map[expected] || expected;
-            isCorrect = exp !== '' && rec === exp;
-          } else if (question.question_type === 'fill_blank') {
-            // Support multiple acceptable answers:
-            // 1) pipe-delimited string: answer1|answer2|answer3
-            // 2) JSON array stored in correct_answer: ["answer1","answer2"]
-            // Matching is case-insensitive & trimmed. Numeric answers allow leading/trailing zeros differences.
-            let accepted: string[] = [];
-            try {
-              if (question.correct_answer && question.correct_answer.trim().startsWith('[')) {
-                const arr = JSON.parse(question.correct_answer);
-                if (Array.isArray(arr)) accepted = arr.map((a: any) => normalize(a));
-              }
-            } catch (_) { /* ignore JSON parse errors */ }
-            if (accepted.length === 0 && question.correct_answer) {
-              accepted = question.correct_answer.split('|').map((p: string) => normalize(p));
-            }
-            if (accepted.length === 0 && expected) accepted = [expected];
-            // Numeric normalization: if all accepted numeric, compare as numbers too
-            const recNum = Number(received);
-            const numericMode = accepted.every(a => /^[-+]?(\d+\.?\d*|\.\d+)$/.test(a));
-            // If metadata contains placeholders count and studentAnswer is an array -> all must be individually correct (AND)
-            if (Array.isArray(studentAnswer)) {
-              // Each element may have its own accepted set if correct_answer stored as JSON array of arrays, fallback to global accepted
-              try {
-                const meta = question.metadata ? JSON.parse(question.metadata) : null;
-                const placeholders: any[] = Array.isArray(meta?.placeholders) ? meta.placeholders : [];
-                // If correct_answer is JSON array of arrays, parse
-                let parsedCorrect: any = null;
-                try { parsedCorrect = question.correct_answer ? JSON.parse(question.correct_answer) : null; } catch { parsedCorrect = null; }
-                isCorrect = (studentAnswer as any[]).every((ans, idx) => {
-                  const recv = normalize(ans);
-                  let localAccepted = accepted;
-                  if (Array.isArray(parsedCorrect) && Array.isArray(parsedCorrect[idx])) {
-                    localAccepted = parsedCorrect[idx].map((x: any) => normalize(x));
-                  }
-                  const num = Number(recv);
-                  const localNumeric = localAccepted.every(a => /^[-+]?(\d+\.?\d*|\.\d+)$/.test(a));
-                  return localAccepted.some(a => a === recv || (localNumeric && !isNaN(num) && Number(a) === num));
-                });
-              } catch { isCorrect = false; }
-            } else {
-              isCorrect = accepted.some(a => a === received || (numericMode && !isNaN(recNum) && Number(a) === recNum));
-            }
-          }
-
-          if (isCorrect) {
-            totalScore += parseFloat(question.points);
-            await query(`
-              UPDATE exam_session_answers 
-              SET is_correct = true, points_earned = $1
-              WHERE session_id = $2 AND question_id = $3
-            `, [question.points, sessionId, questionId]);
+            if (expectedSet.length === studentSet.length && (expectedSet as string[]).every((v: string) => studentSet.includes(v))) isCorrect = true;
           } else {
-            await query(`
-              UPDATE exam_session_answers 
-              SET is_correct = false, points_earned = 0
-              WHERE session_id = $1 AND question_id = $2
-            `, [sessionId, questionId]);
+            isCorrect = expected !== '' && received === expected;
           }
+        } else if (q.question_type === 'multi_select') {
+          let expectedSet: string[] = [];
+          try { if (q.correct_answer && q.correct_answer.trim().startsWith('[')) { const arr = JSON.parse(q.correct_answer); if (Array.isArray(arr)) expectedSet = arr.map((x:any)=>normalize(x)); } } catch {}
+          if (expectedSet.length === 0 && q.correct_answer) expectedSet = q.correct_answer.split('|').map((p:string)=>normalize(p));
+          let studentSet: string[] = [];
+          if (Array.isArray(studentAnswer)) studentSet = (studentAnswer as any[]).map(v=>normalize(v));
+          else if (typeof studentAnswer === 'string') studentSet = studentAnswer.split('|').map(p=>normalize(p));
+          expectedSet = Array.from(new Set(expectedSet));
+          studentSet = Array.from(new Set(studentSet));
+          if (expectedSet.length === studentSet.length && expectedSet.every(v => studentSet.includes(v))) isCorrect = true;
+        } else if (q.question_type === 'true_false') {
+          const mapTF: Record<string,string> = { 't':'true','f':'false','ng':'not given','notgiven':'not given' };
+          const rec = mapTF[received] || received; const exp = mapTF[expected] || expected; isCorrect = exp !== '' && rec === exp;
+  } else if (q.question_type === 'fill_blank') {
+          let accepted: string[] = [];
+            try { if (q.correct_answer && q.correct_answer.trim().startsWith('[')) { const arr = JSON.parse(q.correct_answer); if (Array.isArray(arr)) accepted = arr.map((a:any)=>normalize(a)); } } catch {}
+            if (accepted.length === 0 && q.correct_answer) accepted = q.correct_answer.split('|').map((p:string)=>normalize(p));
+            if (accepted.length === 0 && expected) accepted = [expected];
+            const recNum = Number(received);
+            const numericMode = accepted.every(a=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(a));
+            if (Array.isArray(studentAnswer)) {
+              if (q.correct_answer && q.correct_answer.includes(';')) {
+                const groupsRaw: string[] = q.correct_answer.split(';');
+                const groupAccepts: string[][] = groupsRaw.map((g:string)=>g.split('|').map((a:string)=>normalize(a.trim())).filter(Boolean));
+                isCorrect = (studentAnswer as any[]).every((ans, idx)=>{
+                  const recv = normalize(ans); const gAcc = groupAccepts[idx]||[]; if (!gAcc.length) return false; const num = Number(recv); const localNumeric = gAcc.every(a=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(a)); return gAcc.some(a=>a===recv || (localNumeric && !isNaN(num) && Number(a)===num));
+                }) && (studentAnswer as any[]).length === groupAccepts.length;
+              } else {
+                let parsedCorrect: any = null; try { parsedCorrect = q.correct_answer ? JSON.parse(q.correct_answer) : null; } catch {}
+                isCorrect = (studentAnswer as any[]).every((ans, idx)=>{
+                  const recv = normalize(ans); let localAccepted = accepted; if (Array.isArray(parsedCorrect) && Array.isArray(parsedCorrect[idx])) localAccepted = parsedCorrect[idx].map((x:any)=>normalize(x)); const num = Number(recv); const localNumeric = localAccepted.every(a=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(a)); return localAccepted.some(a=>a===recv || (localNumeric && !isNaN(num) && Number(a)===num));
+                });
+              }
+            } else {
+              isCorrect = accepted.some(a=>a===received || (numericMode && !isNaN(recNum) && Number(a)===recNum));
+            }
+        } else if (q.question_type === 'short_answer') {
+          // Accepted answers can be in correct_answer separated by | or metadata.acceptedAnswers array
+          let accepted: string[] = [];
+          try { if (q.metadata) { const meta = typeof q.metadata === 'string' ? JSON.parse(q.metadata) : q.metadata; if (Array.isArray(meta?.acceptedAnswers)) accepted = meta.acceptedAnswers.map((a:any)=>normalize(String(a))); } } catch {}
+          if (accepted.length === 0 && q.correct_answer) accepted = q.correct_answer.split('|').map((p:string)=>normalize(p));
+          const cleaned = received.replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();
+          // enforce 1-3 words, else mark incorrect automatically
+          const words = cleaned ? cleaned.split(' ') : [];
+            if (words.length >=1 && words.length <=3) {
+              isCorrect = accepted.some(a=>a===cleaned);
+            }
+        } else if (q.question_type === 'writing_task1' || q.question_type === 'essay') {
+          // Free-response, skip auto grading (leave false so points_earned 0). Could be manually graded later.
+        }
+        if (isCorrect) {
+          totalScore += parseFloat(q.points);
+          await query(`UPDATE exam_session_answers SET is_correct = true, points_earned = $1 WHERE session_id = $2 AND question_id = $3`, [q.points, sessionId, q.id]);
+        } else {
+          await query(`UPDATE exam_session_answers SET is_correct = false, points_earned = 0 WHERE session_id = $1 AND question_id = $2`, [sessionId, q.id]);
+        }
+      }
+      // Propagate anchor correctness to members
+      for (const anchorId of Object.keys(anchors)) {
+        const group = anchors[anchorId]; if (!group.anchor || !group.members.length) continue;
+        const r = await query('SELECT is_correct, points_earned FROM exam_session_answers WHERE session_id = $1 AND question_id = $2', [sessionId, anchorId]);
+        if (r.rowCount === 0) continue; const { is_correct } = r.rows[0];
+        for (const m of group.members) {
+          // ensure answer row exists (even if user didn't send it) using student's anchor answer value
+          if (!answerMap[m.id]) {
+            await query(`INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at, is_correct, points_earned)
+              VALUES ($1,$2,$3,CURRENT_TIMESTAMP,$4,$5)
+              ON CONFLICT (session_id, question_id) DO UPDATE SET is_correct = EXCLUDED.is_correct, points_earned = EXCLUDED.points_earned, answered_at = CURRENT_TIMESTAMP`, [sessionId, m.id, 'null', is_correct, is_correct ? m.points : 0]);
+          } else {
+            await query(`UPDATE exam_session_answers SET is_correct = $1, points_earned = $2 WHERE session_id = $3 AND question_id = $4`, [is_correct, is_correct ? m.points : 0, sessionId, m.id]);
+          }
+          if (is_correct) totalScore += parseFloat(m.points);
+          maxPossibleScore += parseFloat(m.points); // include member points in possible score
         }
       }
     }
