@@ -1,5 +1,618 @@
 import React, { useEffect, useState } from 'react';
+
+// --- Simple Table Editor extracted to prevent hook order violations ---
+const SimpleTableEditor: React.FC<{ question: any; updateQuestion: any; deleteQuestion: any; }> = ({ question: tq, updateQuestion, deleteQuestion }) => {
+  const [localRows, setLocalRows] = React.useState<any[][]>(() => (tq.metadata?.simpleTable?.rows || [[]]).map((r:any)=> r.map((c:any)=> ({ ...c }))));
+  const [dirty, setDirty] = React.useState(false);
+  const sequenceStart: number | undefined = tq.metadata?.simpleTable?.sequenceStart;
+  // Sync in external changes when not dirty
+  React.useEffect(()=> {
+    if (!dirty) {
+      setLocalRows((tq.metadata?.simpleTable?.rows || [[]]).map((r:any)=> r.map((c:any)=> ({ ...c }))));
+    }
+  }, [tq.metadata?.simpleTable?.rows, dirty]);
+  const commit = React.useCallback(() => {
+    if (!dirty) return;
+    const prevMeta = tq.metadata || {};
+    const meta = { ...prevMeta, simpleTable: { ...(prevMeta.simpleTable||{}), rows: localRows, sequenceStart: prevMeta.simpleTable?.sequenceStart } };
+    updateQuestion.mutate({ questionId: tq.id, data: { metadata: meta } });
+    setDirty(false);
+  }, [dirty, localRows, tq.id, tq.metadata, updateQuestion]);
+  const addRow = () => setLocalRows(r => { const newRow = new Array(r[0]?.length || 1).fill(null).map(()=> ({ type:'text', content:'' })); setDirty(true); return [...r, newRow]; });
+  const addCol = () => setLocalRows(r => { const next = r.map(row => [...row, { type:'text', content:'' }]); setDirty(true); return next; });
+  const deleteRow = (ri:number) => setLocalRows(r => { if (r.length===1) return r; setDirty(true); return r.filter((_,i)=> i!==ri); });
+  const deleteCol = (ci:number) => setLocalRows(r => { if (r[0]?.length===1) return r; setDirty(true); return r.map(row => row.filter((_,i)=> i!==ci)); });
+  const updateCell = (ri:number, ci:number, patch: any) => setLocalRows(r => { const next = r.map(row => [...row]); next[ri][ci] = { ...next[ri][ci], ...patch }; setDirty(true); return next; });
+  // Enumerate question cells row-major for display ordering (used for numbering preview)
+  const enumerateQuestionCells = (): { ri:number; ci:number; cell:any }[] => {
+    const acc: { ri:number; ci:number; cell:any }[] = [];
+    localRows.forEach((row, ri) => row.forEach((cell:any, ci:number) => { if (cell?.type === 'question') acc.push({ ri, ci, cell }); }));
+    return acc;
+  };
+  const questionCells = enumerateQuestionCells();
+  type NumberingMode = 'cells' | 'blanks' | 'underscores';
+  const autoAssignNumbers = (start: number, mode: NumberingMode) => {
+    // Strategy:
+    // cells: each question cell gets one number
+    // blanks: count occurrences of {answer} or ___ patterns inside cell.content; assign multiple numbers to a single cell by cloning logical display numbers stored in metadata
+    // underscores: count each underline sequence of 3+ underscores only
+    let cur = start;
+    const newRows = localRows.map(row => row.map((cell:any) => {
+      if (cell.type !== 'question') return cell;
+      if (mode === 'cells') {
+        const next = { ...cell, questionNumber: cur };
+        cur += 1;
+        return next;
+      }
+      const text: string = cell.content || '';
+      const tokens: number[] = [];
+      if (mode === 'blanks') {
+        const pattern = /\{answer\}|_{3,}/gi;
+  while (pattern.exec(text) !== null) tokens.push(cur++);
+      } else if (mode === 'underscores') {
+        const pattern = /_{3,}/g;
+  while (pattern.exec(text) !== null) tokens.push(cur++);
+      }
+      // Store array of numbers when multiple blanks; fallback to single questionNumber for student display mapping
+      if (tokens.length === 0) {
+        // treat as one blank
+        const next = { ...cell, questionNumber: cur };
+        cur += 1;
+        return next;
+      }
+      const next = { ...cell, questionNumber: tokens[0], multiNumbers: tokens };
+      return next;
+    }));
+    setLocalRows(newRows);
+    setDirty(true);
+    const prevMeta = tq.metadata || {};
+    const meta = { ...prevMeta, simpleTable: { ...(prevMeta.simpleTable||{}), rows: newRows, sequenceStart: start, numberingMode: mode } };
+    updateQuestion.mutate({ questionId: tq.id, data: { metadata: meta } });
+  };
+  const clearNumbers = () => {
+    setLocalRows(rows => rows.map(row => row.map((cell:any) => cell.type==='question' ? ({ ...cell, questionNumber: undefined }) : cell )));
+    setDirty(true);
+  };
+  const renumberSequential = (start: number) => {
+    // Renumber all question cells sequentially preserving blank counts (multiNumbers length)
+    let cur = start;
+    const numberingMode: NumberingMode = (tq.metadata?.simpleTable?.numberingMode as NumberingMode) || 'cells';
+    const newRows = localRows.map(row => row.map((cell:any) => {
+      if (cell.type !== 'question') return cell;
+      if (numberingMode === 'cells') {
+        const next = { ...cell, questionNumber: cur, multiNumbers: undefined };
+        cur += 1;
+        return next;
+      }
+      // For blanks/underscores modes, preserve number of blanks (multiNumbers length) if present, else treat as single
+      let count = Array.isArray(cell.multiNumbers) && cell.multiNumbers.length > 1 ? cell.multiNumbers.length : 1;
+      const assigned: number[] = [];
+      for (let i=0;i<count;i++) assigned.push(cur++);
+      const next = { ...cell, questionNumber: assigned[0], multiNumbers: count>1 ? assigned : undefined };
+      return next;
+    }));
+    setLocalRows(newRows);
+    setDirty(true);
+    const prevMeta = tq.metadata || {};
+    const meta = { ...prevMeta, simpleTable: { ...(prevMeta.simpleTable||{}), rows: newRows, sequenceStart: start } };
+    updateQuestion.mutate({ questionId: tq.id, data: { metadata: meta } });
+  };
+  return (
+    <div className="mb-4 border rounded bg-white" key={tq.id}>
+      <div className="px-3 py-2 border-b flex items-center justify-between">
+        <span className="text-xs font-semibold text-gray-700">Simple Table (Q{tq.questionNumber}) {dirty && <em className="ml-2 text-[10px] text-orange-600">Unsaved…</em>}</span>
+        <div className="flex items-center gap-2">
+          {dirty && (
+            <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-blue-300 text-blue-600" onClick={commit}>Save</button>
+          )}
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              className="text-[10px] px-2 py-0.5 border rounded border-indigo-300 text-indigo-700"
+              title="Assign sequential question numbers (one per question cell)"
+              onClick={() => {
+                const startStr = window.prompt('Start number (cells mode)', String(sequenceStart || tq.questionNumber || 1));
+                if (!startStr) return; const start = Number(startStr); if (isNaN(start) || start<=0) return alert('Invalid start');
+                autoAssignNumbers(start, 'cells');
+              }}
+            >Cells #</button>
+            <button
+              type="button"
+              className="text-[10px] px-2 py-0.5 border rounded border-indigo-300 text-indigo-700"
+              title="Assign numbers for each blank token {answer} or underline sequence ___"
+              onClick={() => {
+                const startStr = window.prompt('Start number (blanks mode)', String(sequenceStart || tq.questionNumber || 1));
+                if (!startStr) return; const start = Number(startStr); if (isNaN(start) || start<=0) return alert('Invalid start');
+                autoAssignNumbers(start, 'blanks');
+              }}
+            >Blanks #</button>
+            <button
+              type="button"
+              className="text-[10px] px-2 py-0.5 border rounded border-indigo-300 text-indigo-700"
+              title="Assign numbers only for underline sequences (___)"
+              onClick={() => {
+                const startStr = window.prompt('Start number (underscores mode)', String(sequenceStart || tq.questionNumber || 1));
+                if (!startStr) return; const start = Number(startStr); if (isNaN(start) || start<=0) return alert('Invalid start');
+                autoAssignNumbers(start, 'underscores');
+              }}
+            >Underlines #</button>
+          </div>
+          {questionCells.some(c => c.cell?.questionNumber) && (
+            <button
+              type="button"
+              className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-600"
+              title="Remove assigned numbers from question cells"
+              onClick={() => { if (window.confirm('Clear all assigned question numbers?')) clearNumbers(); }}
+            >Clear #</button>
+          )}
+          {questionCells.length > 0 && (
+            <button
+              type="button"
+              className="text-[10px] px-2 py-0.5 border rounded border-indigo-300 text-indigo-700"
+              title="Renumber sequentially (preserves number of blanks per cell)"
+              onClick={() => { const startStr = window.prompt('Start number for renumbering', String(tq.metadata?.simpleTable?.sequenceStart || 1)); if (!startStr) return; const start = Number(startStr); if (isNaN(start)||start<=0) return alert('Invalid start'); renumberSequential(start); }}
+            >Renumber</button>
+          )}
+          <button 
+            type="button" 
+            className="text-[10px] px-2 py-0.5 border rounded border-red-300 text-red-600" 
+            onClick={() => { if (window.confirm('Delete table?')) deleteQuestion.mutate({ questionId: tq.id }); }}
+          >Delete</button>
+        </div>
+      </div>
+      <div className="p-3 space-y-3">
+        {(() => {
+          // Detect numbering overlaps or gaps vs assigned multiNumbers
+          try {
+            const nums: number[] = [];
+            localRows.forEach(r => r.forEach((c:any) => {
+              if (c?.type==='question') {
+                if (Array.isArray(c.multiNumbers)) nums.push(...c.multiNumbers);
+                else if (typeof c.questionNumber === 'number') nums.push(c.questionNumber);
+              }
+            }));
+            if (nums.length) {
+              const counts: Record<number, number> = {} as any;
+              nums.forEach(n => { counts[n] = (counts[n]||0)+1; });
+              const unique = Array.from(new Set(nums)).sort((a,b)=>a-b);
+              const duplicates = unique.filter(n => counts[n] > 1);
+              const gaps: number[] = [];
+              for (let i=1;i<unique.length;i++) {
+                if (unique[i] !== unique[i-1] + 1) {
+                  for (let m = unique[i-1] + 1; m < unique[i]; m++) gaps.push(m);
+                }
+              }
+              if (gaps.length || duplicates.length) {
+                return (
+                  <div className="text-[10px] text-red-600 flex flex-wrap items-center gap-2">
+                    <span>Numbering issues:</span>
+                    {duplicates.length>0 && <span>Duplicates: {duplicates.join(', ')}</span>}
+                    {gaps.length>0 && <span>Missing: {gaps.join(', ')}</span>}
+                    <button
+                      type="button"
+                      className="ml-2 px-1.5 py-0.5 border rounded border-indigo-300 text-indigo-700 hover:bg-indigo-50"
+                      onClick={() => { const startStr = window.prompt('Start number for renumbering', String(unique[0] || 1)); if (!startStr) return; const start = Number(startStr); if (isNaN(start)||start<=0) return alert('Invalid start'); renumberSequential(start); }}
+                    >Fix</button>
+                  </div>
+                );
+              }
+            }
+          } catch {}
+          return null;
+        })()}
+        <div>
+          <label className="block text-[11px] text-gray-600 mb-1">Table Instructions/Title</label>
+          <textarea 
+            defaultValue={tq.questionText || ''} 
+            rows={2} 
+            className="w-full border rounded text-xs p-2" 
+            onBlur={(e) => { if (e.target.value !== (tq.questionText||'')) updateQuestion.mutate({ questionId: tq.id, data: { questionText: e.target.value } }); }} 
+          />
+        </div>
+        <div className="overflow-auto">
+          <table className="min-w-[400px] text-xs border border-gray-300">
+            <tbody>
+              {localRows.map((row, ri) => (
+                <tr key={ri} className="border-b last:border-b-0">
+                  {row.map((cell:any, ci:number) => (
+                    <td key={ci} className="border-r last:border-r-0 p-1 align-top min-w-[120px]">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-1">
+                          <select 
+                            value={cell?.type || 'text'} 
+                            onChange={(e) => updateCell(ri, ci, { type: e.target.value })}
+                            className="text-[10px] border rounded px-1 py-0.5 flex-1"
+                          >
+                            <option value="text">Text</option>
+                            <option value="question">Question</option>
+                          </select>
+                          {ri === 0 && row.length > 1 && (
+                            <button 
+                              type="button" 
+                              onClick={() => deleteCol(ci)} 
+                              className="text-[9px] px-1 py-0.5 bg-red-50 text-red-600 border border-red-200 rounded"
+                              title="Delete column"
+                            >-C</button>
+                          )}
+                          {ci === 0 && localRows.length > 1 && (
+                            <button 
+                              type="button" 
+                              onClick={() => deleteRow(ri)} 
+                              className="text-[9px] px-1 py-0.5 bg-red-50 text-red-600 border border-red-200 rounded"
+                              title="Delete row"
+                            >-R</button>
+                          )}
+                        </div>
+                        {cell?.type === 'text' ? (
+                          <textarea
+                            value={cell?.content || ''}
+                            onChange={(e) => updateCell(ri, ci, { content: e.target.value })}
+                            onBlur={commit}
+                            placeholder="Cell text..."
+                            className="w-full border rounded text-xs p-1 min-h-[60px] resize-none"
+                          />
+                        ) : (
+                          <div className="space-y-1">
+                            <div className="flex gap-1">
+                              <select 
+                                value={cell?.questionType || 'fill_blank'} 
+                                onChange={(e) => updateCell(ri, ci, { questionType: e.target.value })}
+                                onBlur={commit}
+                                className="text-[10px] border rounded px-1 py-0.5 flex-1"
+                              >
+                                <option value="fill_blank">Fill Blank</option>
+                                <option value="multiple_choice">Multiple Choice</option>
+                                <option value="true_false">True/False</option>
+                                <option value="short_answer">Short Answer</option>
+                              </select>
+                              <input
+                                type="number"
+                                value={cell?.points || 1}
+                                onChange={(e) => updateCell(ri, ci, { points: Number(e.target.value) || 1 })}
+                                onBlur={commit}
+                                className="w-12 text-[10px] border rounded px-1 py-0.5"
+                                placeholder="Pts"
+                                min="0.5"
+                                step="0.5"
+                              />
+                              {cell?.type==='question' && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 min-w-[28px] text-center" title="Assigned question number (student sees this)">
+                                  {cell.questionNumber ?? '—'}
+                                </span>
+                              )}
+                            </div>
+                            <textarea
+                              value={cell?.content || ''}
+                              onChange={(e) => updateCell(ri, ci, { content: e.target.value })}
+                              onBlur={commit}
+                              placeholder="Question text..."
+                              className="w-full border rounded text-xs p-1 min-h-[60px] resize-none"
+                            />
+                            {/* Correct answer authoring moved below table for clarity */}
+                            {cell?.questionType === 'fill_blank' && (
+                              <div className="text-[9px] text-gray-500 italic">Answers moved below the table ↓</div>
+                            )}
+                            {cell?.questionType === 'short_answer' && (
+                              <div className="space-y-0.5">
+                                <input
+                                  value={cell?.correctAnswer || ''}
+                                  onChange={(e) => updateCell(ri, ci, { correctAnswer: e.target.value })}
+                                  onBlur={commit}
+                                  placeholder="Accepted answers (| separated, 1-3 words each)"
+                                  className="w-full border rounded text-[10px] px-1 py-0.5"
+                                />
+                              </div>
+                            )}
+                            {cell?.questionType === 'multiple_choice' && (
+                              <div className="space-y-0.5">
+                                <div className="text-[10px] text-gray-500">Add options inline in the text (e.g. A) Paris  B) Rome  C) London)</div>
+                                <input
+                                  value={cell?.correctAnswer || ''}
+                                  onChange={(e) => updateCell(ri, ci, { correctAnswer: e.target.value.toUpperCase().replace(/[^A-Z|]/g,'') })}
+                                  onBlur={commit}
+                                  placeholder="Correct letter(s) e.g. A or A|C"
+                                  className="w-full border rounded text-[10px] px-1 py-0.5"
+                                />
+                              </div>
+                            )}
+                            {cell?.questionType === 'true_false' && (
+                              <div className="space-y-0.5">
+                                <select
+                                  value={cell?.correctAnswer || ''}
+                                  onChange={(e) => { updateCell(ri, ci, { correctAnswer: e.target.value }); commit(); }}
+                                  className="w-full border rounded text-[10px] px-1 py-0.5"
+                                >
+                                  <option value="">(No correct answer yet)</option>
+                                  <option value="true">True</option>
+                                  <option value="false">False</option>
+                                  <option value="not given">Not Given</option>
+                                </select>
+                              </div>
+                            )}
+                            {cell?.questionType === 'multiple_choice' && (
+                              <div className="text-[10px] text-gray-500">
+                                Add options: A) Option 1  B) Option 2  C) Option 3
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex gap-2 text-[10px]">
+          <button 
+            type="button" 
+            className="px-2 py-1 border rounded border-blue-300 text-blue-600" 
+            onClick={() => { addRow(); commit(); }}
+          >+ Row</button>
+          <button 
+            type="button" 
+            className="px-2 py-1 border rounded border-blue-300 text-blue-600" 
+            onClick={() => { addCol(); commit(); }}
+          >+ Column</button>
+          <span className="text-gray-500 self-center">
+            Text cells contain static content. Question cells will be interactive for students.
+          </span>
+        </div>
+        {/* Consolidated answer editor for question cells */}
+        {questionCells.length > 0 && (
+          <div className="mt-4 border rounded bg-gray-50 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[11px] font-semibold text-gray-700">Question Cell Answers (outside table)</span>
+              <button
+                type="button"
+                className="text-[10px] px-2 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-100"
+                onClick={() => {
+                  // Clear all correct answers for question cells
+                  setLocalRows(r => {
+                    const next = r.map(row => row.map((c:any) => c.type==='question' ? { ...c, correctAnswer: '' } : c));
+                    setDirty(true);
+                    return next;
+                  });
+                }}
+              >Clear All</button>
+            </div>
+            <div className="space-y-3 max-h-80 overflow-auto pr-1">
+              {questionCells.map(({ ri, ci, cell }: any) => {
+                const qNum = Array.isArray(cell.multiNumbers) ? (cell.multiNumbers.join(', ')) : (cell.questionNumber ?? '—');
+                const cellLabel = `R${ri+1}C${ci+1}`;
+                const qType = cell.questionType || 'fill_blank';
+                if (qType === 'fill_blank') {
+                  const raw = cell?.content || '';
+                  const blankMatches = raw.match(/\{answer\}|_{3,}/gi) || [];
+                  const blanks = blankMatches.length || 1;
+                  const existing = (cell?.correctAnswer || '').trim();
+                  let perBlank: string[] = existing ? existing.split(/\s*;\s*/).map((s: string)=>s.trim()) : [];
+                  if (perBlank.length < blanks) perBlank = [...perBlank, ...Array(blanks - perBlank.length).fill('')];
+                  else if (perBlank.length > blanks) perBlank = perBlank.slice(0, blanks);
+                  const updatePerBlank = (arr: string[]) => {
+                    updateCell(ri, ci, { correctAnswer: arr.join(';') });
+                  };
+                  return (
+                    <div key={`ans-${ri}-${ci}`} className="border rounded bg-white p-2 shadow-sm">
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-[10px] font-medium text-gray-700 flex flex-wrap gap-2">
+                          <span className="px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded">Q{qNum}</span>
+                          <span className="text-gray-500">{cellLabel}</span>
+                          <span className="text-gray-500 truncate max-w-[180px]" title={raw}>{raw ? raw.replace(/\s+/g,' ').slice(0,80) : '(blank question text)'}</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {blanks > 1 && <span className="text-[9px] text-gray-500">{blanks} blanks</span>}
+                          <button
+                            type="button"
+                            className="text-[9px] px-1.5 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-100"
+                            onClick={() => updatePerBlank(Array(blanks).fill(''))}
+                          >Clear</button>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        {perBlank.map((val: string, bi: number) => (
+                          <input
+                            key={bi}
+                            value={val}
+                            onChange={(e) => {
+                              const next = [...perBlank];
+                              next[bi] = e.target.value;
+                              updatePerBlank(next);
+                            }}
+                            onBlur={commit}
+                            placeholder={blanks > 1 ? `Blank ${bi+1} (variants with |)` : 'Answer or variants with |'}
+                            className="w-full border rounded text-[10px] px-1 py-0.5"
+                          />
+                        ))}
+                        <div className="text-[9px] text-gray-500 leading-snug">Variants with | . Points split equally across blanks. Case-insensitive; numeric answers compared numerically.</div>
+                      </div>
+                    </div>
+                  );
+                }
+                // Other question types inside table (short_answer, multiple_choice, true_false)
+                if (qType === 'short_answer') {
+                  return (
+                    <div key={`ans-${ri}-${ci}`} className="border rounded bg-white p-2 shadow-sm">
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-[10px] font-medium text-gray-700 flex flex-wrap gap-2">
+                          <span className="px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded">Q{qNum}</span>
+                          <span className="text-gray-500">{cellLabel}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="text-[9px] px-1.5 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-100"
+                          onClick={() => updateCell(ri, ci, { correctAnswer: '' })}
+                        >Clear</button>
+                      </div>
+                      <input
+                        value={cell?.correctAnswer || ''}
+                        onChange={(e) => updateCell(ri, ci, { correctAnswer: e.target.value })}
+                        onBlur={commit}
+                        placeholder="Accepted answers (| separated)"
+                        className="w-full border rounded text-[10px] px-1 py-0.5"
+                      />
+                    </div>
+                  );
+                }
+                if (qType === 'multiple_choice') {
+                  return (
+                    <div key={`ans-${ri}-${ci}`} className="border rounded bg-white p-2 shadow-sm">
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-[10px] font-medium text-gray-700 flex flex-wrap gap-2">
+                          <span className="px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded">Q{qNum}</span>
+                          <span className="text-gray-500">{cellLabel}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="text-[9px] px-1.5 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-100"
+                          onClick={() => updateCell(ri, ci, { correctAnswer: '' })}
+                        >Clear</button>
+                      </div>
+                      <input
+                        value={cell?.correctAnswer || ''}
+                        onChange={(e) => updateCell(ri, ci, { correctAnswer: e.target.value.toUpperCase().replace(/[^A-Z|]/g,'') })}
+                        onBlur={commit}
+                        placeholder="Correct letter(s) e.g. A or A|C"
+                        className="w-full border rounded text-[10px] px-1 py-0.5"
+                      />
+                    </div>
+                  );
+                }
+                if (qType === 'true_false') {
+                  return (
+                    <div key={`ans-${ri}-${ci}`} className="border rounded bg-white p-2 shadow-sm">
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-[10px] font-medium text-gray-700 flex flex-wrap gap-2">
+                          <span className="px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded">Q{qNum}</span>
+                          <span className="text-gray-500">{cellLabel}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="text-[9px] px-1.5 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-100"
+                          onClick={() => updateCell(ri, ci, { correctAnswer: '' })}
+                        >Clear</button>
+                      </div>
+                      <select
+                        value={cell?.correctAnswer || ''}
+                        onChange={(e) => { updateCell(ri, ci, { correctAnswer: e.target.value }); commit(); }}
+                        className="w-full border rounded text-[10px] px-1 py-0.5"
+                      >
+                        <option value="">(No correct answer yet)</option>
+                        <option value="true">True</option>
+                        <option value="false">False</option>
+                        <option value="not given">Not Given</option>
+                      </select>
+                    </div>
+                  );
+                }
+                return null;
+              })}
+            </div>
+            <div className="mt-2 text-[10px] text-gray-500">Edit all answers here. This keeps the table layout clean.</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+
 import ConfirmDialog from '../../components/ui/ConfirmDialog';
+
+// Exam-level audio manager component (upload + external URL)
+const ExamAudioManager: React.FC<{ exam: any; apiOrigin: string; onUpdate: (payload: { audioUrl?: string }) => void }> = ({ exam, apiOrigin, onUpdate }) => {
+  const [file, setFile] = useState<File | null>(null);
+  const [progress, setProgress] = useState<number>(0);
+  const [status, setStatus] = useState<'idle' | 'uploading' | 'error'>('idle');
+
+  const handleUpload = async () => {
+    if (!file) return;
+    if (file.size > 26 * 1024 * 1024) { toast.error('File too large (max 25MB)'); return; }
+    try {
+      setStatus('uploading');
+      setProgress(0);
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch(`${apiOrigin}/api/admin/exams/${exam.id}/audio`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token') || sessionStorage.getItem('token') || ''}`
+        }
+      });
+      if (!res.ok) throw new Error('Upload failed');
+      const data = await res.json();
+      if (!data.success) throw new Error(data.message || 'Upload failed');
+      toast.success('Exam audio uploaded');
+      onUpdate({}); // trigger refetch upstream via mutation onUpdate? We'll rely on invalidation outside
+      setFile(null);
+      setProgress(100);
+      setStatus('idle');
+    } catch (e: any) {
+      toast.error(e.message || 'Upload failed');
+      setStatus('error');
+    }
+  };
+
+  return (
+    <div className="space-y-4 text-xs">
+      {exam.audioUrl ? (
+        <div className="p-2 border rounded bg-gray-50 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="font-medium">Current Audio</span>
+            <button
+              type="button"
+              className="px-2 py-0.5 border rounded text-[11px] text-red-600 border-red-300 hover:bg-red-50"
+              onClick={() => onUpdate({ audioUrl: '' })}
+            >Remove</button>
+          </div>
+          <audio controls className="w-full">
+            <source src={exam.audioUrl.startsWith('http') ? exam.audioUrl : `${apiOrigin}${exam.audioUrl}`} />
+            Your browser does not support the audio element.
+          </audio>
+          <div className="text-[11px] break-all text-gray-500">{exam.audioUrl}</div>
+        </div>
+      ) : (
+        <div className="text-[11px] text-gray-500">No audio set. Upload a file or paste an external URL below.</div>
+      )}
+      <div className="flex items-center gap-2">
+        <input
+          type="file"
+          accept="audio/mpeg,audio/mp3,audio/wav,audio/*"
+          onChange={(e) => { const f = e.target.files?.[0] || null; setFile(f); setProgress(0); setStatus('idle'); }}
+          className="flex-1 text-[11px]"
+        />
+        <button
+          type="button"
+          disabled={!file || status === 'uploading'}
+          onClick={handleUpload}
+          className={`px-3 py-1 rounded border text-xs ${(!file || status==='uploading') ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : 'bg-blue-600 text-white border-blue-600 hover:bg-blue-500'}`}
+        >{status==='uploading' ? 'Uploading…' : (exam.audioUrl ? 'Replace' : 'Upload')}</button>
+      </div>
+      {file && (
+        <div className="flex justify-between text-[11px] text-gray-600">
+          <span>{file.name} ({(file.size/1024/1024).toFixed(2)} MB)</span>
+          {progress > 0 && <span>{progress}%</span>}
+        </div>
+      )}
+      <div>
+        <label className="block text-[11px] text-gray-600 mb-0.5">External Audio URL (optional)</label>
+        <input
+          placeholder="https://..."
+          defaultValue={exam.audioUrl && exam.audioUrl.startsWith('http') ? exam.audioUrl : ''}
+          onBlur={(e) => {
+            const val = e.target.value.trim();
+            onUpdate({ audioUrl: val });
+          }}
+          className="w-full rounded-md border-gray-300 text-xs"
+        />
+        <div className="text-[10px] text-gray-400 mt-0.5">External URL overrides uploaded file path.</div>
+      </div>
+      <div className="text-[10px] text-gray-500">Audio plays once globally in Listening. Max 25MB. Supported: MP3/WAV.</div>
+    </div>
+  );
+};
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
@@ -41,7 +654,7 @@ const AdminExamEdit: React.FC = () => {
   });
 
   const createSection = useMutation({
-    mutationFn: async (data: { sectionType: string; title: string; durationMinutes: number; maxScore: number; sectionOrder: number }) => apiService.post(`/admin/exams/${examId}/sections`, { sections: [data] }),
+    mutationFn: async (data: { sectionType: string; title: string; maxScore: number; sectionOrder: number }) => apiService.post(`/admin/exams/${examId}/sections`, { sections: [data] }),
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); toast.success('Section added'); },
     onError: (e: any) => toast.error(e.message || 'Failed to add section')
   });
@@ -59,7 +672,7 @@ const AdminExamEdit: React.FC = () => {
   });
 
   // Local draft for adding a section
-  const [newSection, setNewSection] = useState<{ sectionType: string; title: string; durationMinutes: number; maxScore: number }>({ sectionType: 'reading', title: '', durationMinutes: 30, maxScore: 9 });
+  const [newSection, setNewSection] = useState<{ sectionType: string; title: string; maxScore: number }>({ sectionType: 'reading', title: '', maxScore: 9 });
   const nextSectionOrder = () => {
     const orders = (exam.sections || []).map((s: any)=> s.sectionOrder || 0);
     return (orders.length ? Math.max(...orders) : 0) + 1;
@@ -105,7 +718,7 @@ const AdminExamEdit: React.FC = () => {
 
   const deleteQuestion = useMutation({
     mutationFn: async ({ questionId }: { questionId: string }) => apiService.delete(`/admin/questions/${questionId}`),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); toast.success('Question deleted'); },
+  onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); },
     onError: (e: any) => toast.error(e.message || 'Failed to delete question')
   });
 
@@ -127,27 +740,7 @@ const AdminExamEdit: React.FC = () => {
 
   // Dynamic shared MCQ options per section (letters list)
   const [sharedOptionLetters, setSharedOptionLetters] = useState<Record<string, string[]>>({});
-  // Audio upload (per listening section)
-  const [audioFiles, setAudioFiles] = useState<Record<string, File | null>>({});
-  const [audioProgress, setAudioProgress] = useState<Record<string, number>>({});
-
-  const uploadAudio = useMutation({
-    mutationFn: async ({ sectionId, file }: { sectionId: string; file: File }) => {
-      return apiService.upload<{ audioUrl: string }>(`/admin/sections/${sectionId}/audio`, file, (p) => {
-        setAudioProgress(prev => ({ ...prev, [sectionId]: p }));
-      });
-    },
-    onSuccess: (_res, vars) => {
-      toast.success('Audio uploaded');
-      setAudioFiles(prev => ({ ...prev, [vars.sectionId]: null }));
-      setAudioProgress(prev => ({ ...prev, [vars.sectionId]: 0 }));
-      queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] });
-    },
-    onError: (e: any, vars) => {
-      toast.error(e?.message || 'Upload failed');
-      setAudioProgress(prev => ({ ...prev, [vars.sectionId]: 0 }));
-    }
-  });
+  // Per-section audio logic removed (centralized exam audio)
 
   // Initialize letters from first MCQ question options if not already set
   useEffect(() => {
@@ -290,21 +883,24 @@ const AdminExamEdit: React.FC = () => {
               <label className="block text-xs text-gray-600 mb-1">Title (optional)</label>
               <input className="rounded-md border-gray-300 w-full" value={newSection.title} placeholder="Auto if blank" onChange={(e)=> setNewSection(s => ({ ...s, title: e.target.value }))} />
             </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">Duration (min)</label>
-              <input type="number" className="rounded-md border-gray-300 w-full" value={newSection.durationMinutes} onChange={(e)=> setNewSection(s => ({ ...s, durationMinutes: Number(e.target.value)||0 }))} />
-            </div>
+            {/* Removed per-section duration; global exam duration applies */}
             <div>
               <label className="block text-xs text-gray-600 mb-1">Max Score</label>
               <input type="number" step="0.5" className="rounded-md border-gray-300 w-full" value={newSection.maxScore} onChange={(e)=> setNewSection(s => ({ ...s, maxScore: Number(e.target.value)||0 }))} />
             </div>
             <div>
               <button type="button" className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm disabled:opacity-50" disabled={createSection.isPending} onClick={() => {
-                const data = { sectionType: newSection.sectionType, title: newSection.title || newSection.sectionType.charAt(0).toUpperCase()+newSection.sectionType.slice(1), durationMinutes: newSection.durationMinutes || 30, maxScore: newSection.maxScore || 9, sectionOrder: nextSectionOrder() };
+                const data = { sectionType: newSection.sectionType, title: newSection.title || newSection.sectionType.charAt(0).toUpperCase()+newSection.sectionType.slice(1), maxScore: newSection.maxScore || 9, sectionOrder: nextSectionOrder() };
                 createSection.mutate(data);
               }}>{createSection.isPending ? 'Adding...' : 'Add Section'}</button>
             </div>
           </div>
+        </div>
+
+        {/* Exam-level Listening Audio (centralized) */}
+        <div className="bg-white rounded-lg border p-6 mb-6">
+          <h3 className="text-sm font-medium text-gray-700 mb-3">Exam Listening Audio (single file for entire exam)</h3>
+          <ExamAudioManager exam={exam} apiOrigin={apiOrigin} onUpdate={(payload)=> updateExam.mutate(payload)} />
         </div>
 
         {/* Sections & Questions */}
@@ -315,10 +911,7 @@ const AdminExamEdit: React.FC = () => {
                 <label className="block text-sm text-gray-600 mb-1">Section Title</label>
                 <input defaultValue={section.title} onBlur={(e) => updateSection.mutate({ sectionId: section.id, data: { title: e.target.value } })} className="w-full rounded-md border-gray-300" />
               </div>
-              <div>
-                <label className="block text-sm text-gray-600 mb-1">Duration (min)</label>
-                <input type="number" defaultValue={section.durationMinutes} onBlur={(e) => updateSection.mutate({ sectionId: section.id, data: { durationMinutes: Number(e.target.value) } })} className="w-full rounded-md border-gray-300" />
-              </div>
+              {/* Duration field removed */}
               <div>
                 <label className="block text-sm text-gray-600 mb-1">Max Score</label>
                 <input type="number" step="0.5" defaultValue={section.maxScore} onBlur={(e) => updateSection.mutate({ sectionId: section.id, data: { maxScore: Number(e.target.value) } })} className="w-full rounded-md border-gray-300" />
@@ -330,77 +923,7 @@ const AdminExamEdit: React.FC = () => {
               <div className="flex items-end">
                 <button type="button" className="mt-5 px-3 py-1.5 text-xs rounded-md border border-red-300 text-red-600 hover:bg-red-50" onClick={() => openConfirm({ title: 'Delete Section', tone: 'danger', description: <>Delete section <strong>{section.title}</strong> and all its questions?</>, confirmText: 'Delete', onConfirm: () => deleteSection.mutate({ sectionId: section.id }) })}>Delete Section</button>
               </div>
-              {section.sectionType === 'listening' && (
-                <div className="md:col-span-5">
-                  <label className="block text-sm text-gray-600 mb-1">Listening Audio</label>
-                  {/* Existing URL (manual override) */}
-                  <div className="space-y-2">
-                    {section.audioUrl && (
-                      <div className="p-2 border rounded bg-gray-50 space-y-2">
-                        <div className="flex items-center justify-between text-xs text-gray-600">
-                          <span>Current file</span>
-                          <button
-                            type="button"
-                            className="px-2 py-0.5 border rounded text-[11px] text-red-600 border-red-300 hover:bg-red-50"
-                            onClick={() => updateSection.mutate({ sectionId: section.id, data: { audioUrl: '' } })}
-                          >Remove</button>
-                        </div>
-                        <audio controls className="w-full">
-                          <source src={section.audioUrl?.startsWith('http') ? section.audioUrl : `${apiOrigin}${section.audioUrl}`} />
-                          Your browser does not support the audio element.
-                        </audio>
-                        <div className="text-[11px] break-all text-gray-500">{section.audioUrl}</div>
-                      </div>
-                    )}
-                    <div className="flex items-center gap-2 text-xs">
-                      <input
-                        type="file"
-                        accept="audio/mpeg,audio/mp3,audio/wav,audio/*"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0] || null;
-                          setAudioFiles(prev => ({ ...prev, [section.id]: file }));
-                        }}
-                        className="flex-1 text-[11px]"
-                      />
-                      <button
-                        type="button"
-                        disabled={!audioFiles[section.id] || uploadAudio.status === 'pending'}
-                        onClick={() => {
-                          const f = audioFiles[section.id];
-                          if (!f) return;
-                          if (f.size > 26 * 1024 * 1024) { toast.error('File too large (max 25MB)'); return; }
-                          uploadAudio.mutate({ sectionId: section.id, file: f });
-                        }}
-                        className={`px-3 py-1 rounded border text-xs ${(!audioFiles[section.id] || uploadAudio.status === 'pending') ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : 'bg-blue-600 text-white border-blue-600 hover:bg-blue-500'}`}
-                      >{uploadAudio.status === 'pending' && audioFiles[section.id] ? 'Uploading...' : (section.audioUrl ? 'Replace' : 'Upload')}</button>
-                    </div>
-                    {audioFiles[section.id] && (
-                      <div className="text-[11px] text-gray-600 flex items-center justify-between">
-                        <span>{audioFiles[section.id]?.name} ({((audioFiles[section.id]!.size/1024/1024).toFixed(2))} MB)</span>
-                        {audioProgress[section.id] ? <span>{audioProgress[section.id]}%</span> : null}
-                      </div>
-                    )}
-                    {audioProgress[section.id] && audioProgress[section.id] > 0 && (
-                      <div className="h-2 bg-gray-200 rounded overflow-hidden">
-                        <div className="h-full bg-blue-600 transition-all" style={{ width: `${audioProgress[section.id]}%` }}></div>
-                      </div>
-                    )}
-                    <div className="pt-1">
-                      <label className="block text-[11px] text-gray-500 mb-0.5">Or set external audio URL (optional)</label>
-                      <input
-                        placeholder="https://..."
-                        defaultValue={section.audioUrl && section.audioUrl.startsWith('http') ? section.audioUrl : ''}
-                        onBlur={(e) => {
-                          const val = e.target.value.trim();
-                          if (val) updateSection.mutate({ sectionId: section.id, data: { audioUrl: val } });
-                        }}
-                        className="w-full rounded-md border-gray-300 text-xs"
-                      />
-                      <div className="text-[10px] text-gray-400 mt-0.5">Accepts MP3/WAV up to 25MB. Upload stores a local copy; external URL overrides.</div>
-                    </div>
-                  </div>
-                </div>
-              )}
+              {/* Per-section listening audio UI removed; centralized at exam level */}
               {section.sectionType === 'reading' && (
                 <div className="md:col-span-5">
                   <label className="block text-sm text-gray-600 mb-1">Passage Text</label>
@@ -408,6 +931,56 @@ const AdminExamEdit: React.FC = () => {
                 </div>
               )}
             </div>
+
+            {/* Simplified Table Editor */}
+            {section.sectionType === 'listening' && (
+              <div className="mb-6 border rounded bg-gray-50 p-4">
+                <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+                  <span className="text-sm font-medium text-gray-700">Simplified Tables</span>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50"
+                      title="Create a simple table with embedded questions"
+                      onClick={() => createQuestion.mutate({ 
+                        sectionId: section.id, 
+                        questionType: 'simple_table', 
+                        questionText: 'Table Instructions', 
+                        metadata: { 
+                          simpleTable: { 
+                            rows: [
+                              [
+                                { type: 'text', content: 'Name' },
+                                { type: 'question', content: '', questionType: 'fill_blank', points: 1 }
+                              ]
+                            ]
+                          } 
+                        } 
+                      })}
+                    >+ Simple Table</button>
+                  </div>
+                </div>
+                {(() => {
+                  const simpleTableQuestions = (section.questions || []).filter((q:any)=> q.questionType === 'simple_table');
+                  return simpleTableQuestions.map((tq:any)=> (
+                    <SimpleTableEditor key={tq.id} question={tq} updateQuestion={updateQuestion} deleteQuestion={deleteQuestion} />
+                  ));
+                })()}
+                {(() => { 
+                  const count = (section.questions || []).filter((q:any)=> q.questionType==='simple_table').length; 
+                  return count===0 ? (
+                    <div className="text-[11px] text-gray-500 italic">No simplified tables yet.</div>
+                  ) : null; 
+                })()}
+                
+                <div className="mt-4 text-[10px] text-gray-500 space-y-1">
+                  <div><strong>Simple Tables:</strong> Embed questions directly in table cells. No complex placeholder linking needed.</div>
+                  <div><strong>Text cells:</strong> Static content for headers, labels, instructions.</div>
+                  <div><strong>Question cells:</strong> Interactive fields that students can answer directly in the table.</div>
+                  <div><strong>Auto #:</strong> Assigns sequential question numbers to each question cell (row-major). These numbers appear inside blanks for students. Clearing numbers will remove them from all cells.</div>
+                </div>
+              </div>
+            )}
 
             {/* Quick bulk question creator for this section */}
             <div className="mb-6 border rounded bg-gray-50 p-4">
@@ -428,6 +1001,7 @@ const AdminExamEdit: React.FC = () => {
                         <option value="matching">Heading Matching</option>
                         <option value="essay">Essay</option>
                         <option value="speaking_task">Speaking</option>
+                        <option value="simple_table">Simple Table</option>
                       </select>
                     </div>
                     <div>
@@ -1305,6 +1879,7 @@ const AdminExamEdit: React.FC = () => {
                     <option value="fill_blank">Fill Blank</option>
                     <option value="matching">Matching</option>
                     <option value="drag_drop">Drag & Drop</option>
+                    <option value="simple_table">Simple Table</option>
                   </select>
                   <button className="text-xs px-2 py-1 border rounded" onClick={() => {
                     const sel = (document.getElementById(`add-type-${section.id}`) as HTMLSelectElement).value;
@@ -1346,6 +1921,7 @@ const AdminExamEdit: React.FC = () => {
                       <option value="writing_task1">Writing Task 1</option>
                       <option value="short_answer">Short Answer</option>
                       <option value="speaking_task">Speaking</option>
+                      <option value="simple_table">Simple Table</option>
                     </select>
                     </div>
                     <input defaultValue={q.questionText || ''} placeholder="Question text" onChange={() => setStatus(q.id, 'dirty')} onBlur={(e) => { setStatus(q.id, 'saving'); updateQuestion.mutate({ questionId: q.id, data: { questionText: e.target.value } }); }} className="md:col-span-3 rounded-md border-gray-300" />

@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
+
 import path from 'path';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -19,7 +20,7 @@ import healthRoutes from './routes/health';
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
 
-const app = express();
+export const app = express();
 const server = createServer(app);
 const io = new Server(server, {
   cors: {

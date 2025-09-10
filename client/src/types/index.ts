@@ -24,6 +24,7 @@ export interface Exam {
   durationMinutes: number; // in minutes
   passingScore?: number;
   maxAttempts?: number;
+  audioUrl?: string; // central listening audio for entire exam
   sections?: ExamSection[];
   isActive?: boolean;
   createdAt?: string;
@@ -35,9 +36,10 @@ export interface ExamSection {
   sectionType: 'reading' | 'listening' | 'writing' | 'speaking';
   title: string;
   description: string;
-  durationMinutes: number; // in minutes
+  // durationMinutes removed (global exam duration applies)
   questions: Question[];
   order: number;
+  // legacy per-section audio removed; use Exam.audioUrl instead
 }
 
 // Question Types

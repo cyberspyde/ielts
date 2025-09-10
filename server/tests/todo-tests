@@ -1,0 +1,11 @@
+Analyze test requirements and structure
+Implement server/tests/setup.ts for database test setup
+Write authentication tests for authService and routes
+Write exam route tests (exams.ts)
+Write admin route tests (admin.ts)
+Implement grading service tests (even if service is empty)
+Write end-to-end exam flow tests
+Test question type handling
+Test session and ticket management
+Add integration tests for WebSocket features
+Update jest.config.js if needed

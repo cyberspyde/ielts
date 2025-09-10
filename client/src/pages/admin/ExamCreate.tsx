@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import { useNavigate } from 'react-router-dom';
@@ -20,11 +20,9 @@ type SectionDraft = {
   sectionType: 'listening' | 'reading' | 'writing' | 'speaking';
   title: string;
   description?: string;
-  durationMinutes: number | '';
   maxScore: number;
   sectionOrder: number;
   instructions?: string;
-  audioUrl?: string;
   passageText?: string;
   // Per-section default groups to create (can be empty => none)
   defaultGroups?: QuestionGroup[];
@@ -56,16 +54,13 @@ const AdminExamCreate: React.FC = () => {
 
   // Step 2: sections preset (toggleable)
   const [sections, setSections] = useState<SectionDraft[]>([
-    { sectionType: 'reading', title: 'Reading', durationMinutes: 60, maxScore: 9, sectionOrder: 1, defaultGroups: [] },
-    { sectionType: 'listening', title: 'Listening', durationMinutes: 30, maxScore: 9, sectionOrder: 2, defaultGroups: [] },
-    { sectionType: 'writing', title: 'Writing', durationMinutes: 60, maxScore: 9, sectionOrder: 3, defaultGroups: [] },
+    { sectionType: 'reading', title: 'Reading', maxScore: 9, sectionOrder: 1, defaultGroups: [] },
+    { sectionType: 'listening', title: 'Listening', maxScore: 9, sectionOrder: 2, defaultGroups: [] },
+    { sectionType: 'writing', title: 'Writing', maxScore: 9, sectionOrder: 3, defaultGroups: [] },
   ]);
 
   // Per-section default groups are configured inline in each section
 
-  const hasSection = useMemo(() => ({
-    reading: sections.some(s => s.sectionType === 'reading'),
-  }), [sections]);
 
   const createExamMutation = useMutation({
     mutationFn: async () => {
@@ -79,11 +74,7 @@ const AdminExamCreate: React.FC = () => {
         const effectiveTitle = (s.title || '').trim().length >= 2
           ? s.title.trim()
           : s.sectionType.charAt(0).toUpperCase() + s.sectionType.slice(1);
-        const durationParsed = typeof s.durationMinutes === 'string' ? Number(s.durationMinutes) : s.durationMinutes;
-        if (!Number.isFinite(durationParsed) || durationParsed < 1) {
-          throw new Error('Each section must have a valid duration (min 1 minute).');
-        }
-        return { ...s, title: effectiveTitle, durationMinutes: durationParsed } as any;
+        return { ...s, title: effectiveTitle } as any;
       });
       const sectionsRes = await apiService.post<{ sections: Array<{ id: string; sectionType: string; title: string }> }>(
         `/admin/exams/${examId}/sections`,
@@ -116,7 +107,7 @@ const AdminExamCreate: React.FC = () => {
 
       return examId;
     },
-    onSuccess: (examId) => {
+  onSuccess: () => {
       toast.success('Exam created successfully');
       navigate('/admin/exams');
     },
@@ -200,16 +191,7 @@ const AdminExamCreate: React.FC = () => {
                       setSections(next);
                     }} />
                   </div>
-                  <div className="rounded-md border-gray-300">
-                    <label className="block text-xs font-medium text-gray-700 mb-1">Duration (min)</label>
-                    <input type="number" placeholder="Duration" value={s.durationMinutes}
-                      onChange={(e) => {
-                        const next = [...sections];
-                        const val = e.target.value;
-                        next[idx] = { ...s, durationMinutes: val === '' ? '' : Number(val) };
-                        setSections(next);
-                      }} />
-                  </div>
+                  {/* Per-section duration removed (global exam duration applies) */}
                   <div className="rounded-md border-gray-300">
                     <label className="block text-xs font-medium text-gray-700 mb-1">Max Score</label>
                     <input type="number" step="0.5" placeholder="Max Score" value={s.maxScore} onChange={(e) => {
@@ -226,12 +208,7 @@ const AdminExamCreate: React.FC = () => {
                       setSections(next);
                     }} />
                   </div>
-                  {s.sectionType === 'listening' && (
-                    <div className="rounded-md border-gray-300 md:col-span-2">
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Audio URL (optional)</label>
-                      <input placeholder="Audio URL (optional)" value={s.audioUrl || ''} onChange={(e) => { const next = [...sections]; next[idx] = { ...s, audioUrl: e.target.value }; setSections(next); }} />
-                    </div>
-                  )}
+                  {/* Listening audio now set at exam level; section audio input removed */}
                   {s.sectionType === 'reading' && (
                     <div className="rounded-md border-gray-300 md:col-span-2">
                       <label className="block text-xs font-medium text-gray-700 mb-1">Passage text</label>
@@ -331,7 +308,7 @@ const AdminExamCreate: React.FC = () => {
                 </div>
               ))}
               <div>
-                <button type="button" onClick={() => setSections(prev => [...prev, { sectionType: 'reading', title: 'New Section', durationMinutes: 60, maxScore: 9, sectionOrder: prev.length + 1, defaultGroups: [] }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Section</button>
+                <button type="button" onClick={() => setSections(prev => [...prev, { sectionType: 'reading', title: 'New Section', maxScore: 9, sectionOrder: prev.length + 1, defaultGroups: [] }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Section</button>
               </div>
             </div>
           </div>

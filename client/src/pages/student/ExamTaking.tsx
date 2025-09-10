@@ -64,10 +64,11 @@ const ExamTaking: React.FC = () => {
     return saved ? Number(saved) : 16;
   });
   const [prefFontFamily, setPrefFontFamily] = useState<string>(() => localStorage.getItem('readingFontFamily') || 'serif');
-  const [darkMode, setDarkMode] = useState<boolean>(() => localStorage.getItem('readingDarkMode') === '1');
+  // Default to light mode; previous implementation forced dark by stored localStorage key
+  const [darkMode, setDarkMode] = useState<boolean>(() => localStorage.getItem('examDarkMode') === '1');
   useEffect(() => { localStorage.setItem('readingFontSize', String(prefFontSize)); }, [prefFontSize]);
   useEffect(() => { localStorage.setItem('readingFontFamily', prefFontFamily); }, [prefFontFamily]);
-  useEffect(() => { localStorage.setItem('readingDarkMode', darkMode ? '1' : '0'); }, [darkMode]);
+  useEffect(() => { localStorage.setItem('examDarkMode', darkMode ? '1' : '0'); }, [darkMode]);
   
   // Derived style helpers
   const primaryTextClass = darkMode ? 'text-gray-100' : 'text-gray-900';
@@ -88,6 +89,10 @@ const ExamTaking: React.FC = () => {
   };
   // Matching drag & drop state
   const [draggingHeading, setDraggingHeading] = useState<string | null>(null);
+  // Inline table drag_drop token DnD visual state
+  const [draggingTokenAnchor, setDraggingTokenAnchor] = useState<string | null>(null);
+  const [dragOverDragDropQuestion, setDragOverDragDropQuestion] = useState<string | null>(null);
+  const [recentDropQuestion, setRecentDropQuestion] = useState<string | null>(null);
 
   // Fetch exam (with questions) - include sid so server can authorize question access for ticket-based (unauth) sessions
   const activeSid = sidFromUrl || sessionId || undefined;
@@ -102,6 +107,46 @@ const ExamTaking: React.FC = () => {
     },
     enabled: !!examId
   });
+
+  // Debug: table/question diagnostics. Enable with ?debugTables=1 or ?debug=1 or localStorage.debugTables=1. Toggle with Ctrl+Shift+D.
+  const [debugTables, setDebugTables] = useState<boolean>(() => {
+    try {
+      const qs = window.location.search;
+      if (/debugTables=1/i.test(qs) || /[?&]debug=1/i.test(qs)) return true;
+      if (localStorage.getItem('debugTables') === '1') return true;
+    } catch {}
+    return false;
+  });
+  useEffect(() => {
+    let lastToggle = 0;
+    const handler = (e: KeyboardEvent) => {
+      if (e.repeat) return; // ignore auto-repeat
+      if (e.key.toLowerCase() === 'd' && e.ctrlKey && e.shiftKey) {
+        const now = Date.now();
+        if (now - lastToggle < 250) return; // debounce fast double press
+        lastToggle = now;
+        setDebugTables(prev => {
+          const next = !prev; try { localStorage.setItem('debugTables', next ? '1':'0'); } catch {}
+          // eslint-disable-next-line no-console
+          console.info('[ExamTaking] debugTables toggled ->', next);
+          return next;
+        });
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  // Keep debug on if URL param persists even after internal toggles
+  useEffect(() => {
+    try {
+      const qs = window.location.search;
+      if ((/debugTables=1/i.test(qs) || /[?&]debug=1/i.test(qs)) && !debugTables) {
+        setDebugTables(true);
+      }
+    } catch {}
+  }, [debugTables]);
+  // (moved after currentSection definition to avoid TDZ)
 
   // Start session on load
   const startSession = useMutation({
@@ -138,8 +183,41 @@ const ExamTaking: React.FC = () => {
   // Submit
   const submit = useMutation({
     mutationFn: async (sid: string) => {
-      const payload = Object.values(answers).map(a => ({ questionId: a.questionId, studentAnswer: a.answer }));
-      return apiService.post(`/exams/sessions/${sid}/submit`, { answers: payload });
+      // Consolidate synthetic simple_table cell IDs (pattern: parentUUID_row_col or parentUUID_row_col_bN) into one answer per parent question
+      // Supports multi-blank cells (answers keyed with _b index) aggregated into arrays preserving order.
+      const simpleTableGroups: Record<string, { cells: Record<string, any> }> = {};
+      const directAnswers: { questionId: string; studentAnswer: any }[] = [];
+      const uuidLike = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+      Object.values(answers).forEach(a => {
+        const id = a.questionId;
+        const m = id.match(/^([0-9a-fA-F-]{36})_(\d+)_(\d+)(?:_b(\d+))?$/);
+        if (m && uuidLike.test(m[1])) {
+          const parentId = m[1];
+          const row = m[2];
+          const col = m[3];
+          const blankIndexRaw = m[4];
+          const cellKey = `${row}_${col}`;
+          if (!simpleTableGroups[parentId]) simpleTableGroups[parentId] = { cells: {} };
+          if (blankIndexRaw !== undefined) {
+            // multi-blank: aggregate into array
+            const idx = Number(blankIndexRaw);
+            if (!Array.isArray(simpleTableGroups[parentId].cells[cellKey])) simpleTableGroups[parentId].cells[cellKey] = [] as any[];
+            const arr = simpleTableGroups[parentId].cells[cellKey] as any[];
+            arr[idx] = a.answer; // preserve positional order
+          } else {
+            // single blank cell
+            simpleTableGroups[parentId].cells[cellKey] = a.answer;
+          }
+        } else {
+          directAnswers.push({ questionId: id, studentAnswer: a.answer });
+        }
+      });
+      // Convert grouped table answers to JSON strings so backend can store them (backend unaware yet of per-cell granularity)
+      Object.entries(simpleTableGroups).forEach(([parentId, data]) => {
+        // Send structured object; backend will stringify when persisting
+        directAnswers.push({ questionId: parentId, studentAnswer: { type: 'simple_table', version: 1, ...data } });
+      });
+      return apiService.post(`/exams/sessions/${sid}/submit`, { answers: directAnswers });
     },
     onSuccess: (res: any) => {
       setShowConfirmSubmit(false);
@@ -156,6 +234,12 @@ const ExamTaking: React.FC = () => {
   });
 
   const currentSection = exam?.sections?.[currentSectionIndex];
+  useEffect(() => {
+    if (debugTables && currentSection?.questions) {
+      // eslint-disable-next-line no-console
+      console.log('[ExamTaking][debugTables] section questions', currentSection.questions.map((q:any)=> ({ id:q.id, num:q.questionNumber, type:q.questionType, metaType: typeof q.metadata })));
+    }
+  }, [debugTables, currentSection]);
   const isListeningSection = (currentSection?.sectionType || '').toLowerCase() === 'listening';
   // Listening part helpers (IELTS style: 4 parts of up to 10 questions each)
   const listeningParts: number[] = React.useMemo(() => {
@@ -186,7 +270,9 @@ const ExamTaking: React.FC = () => {
     return (currentSection?.questions || [])
       .filter((q: any) => {
         const part = q.metadata?.listeningPart || (q.questionNumber ? Math.ceil(q.questionNumber / 10) : 1);
-        return part === currentListeningPart;
+  // Exclude simple_table container itself from generic question listings to avoid stray extra blank below table
+  if (q.questionType === 'simple_table') return false;
+  return part === currentListeningPart;
       })
       .sort((a: any,b: any)=> (a.questionNumber||0)-(b.questionNumber||0));
   }, [isListeningSection, currentSection, currentListeningPart]);
@@ -201,37 +287,55 @@ const ExamTaking: React.FC = () => {
     });
     return Array.from(map.entries()).map(([title, items]) => ({ title, items }));
   }, [isListeningSection, listeningPartQuestions]);
-  // Visible questions (exclude group member questions and matching which are handled in passage area)
-  const visibleQuestions = React.useMemo(() => {
-    const all = currentSection?.questions || [];
-    return all.filter((q: any) => !q.metadata?.groupMemberOf && q.questionType !== 'matching');
+  // Table container (rendered separately) - includes simple tables
+  const tableContainer = React.useMemo(() => {
+    const qs = currentSection?.questions || [];
+    for (const q of qs) {
+  // Treat legacy table_* and essay.tableBlock as single container render; simple_table is rendered separately above (Simple Tables block)
+  const isTable = (q.questionType === 'table_fill_blank' || q.questionType === 'table_drag_drop' || (q.questionType === 'essay' && (q.metadata?.tableBlock)));
+      if (isTable) return q;
+    }
+    return null;
   }, [currentSection]);
+  // Visible questions (exclude group members, matching (special UI), and table container which we render once above list)
+  const visibleQuestions = React.useMemo(() => {
+    // Normalize metadata (server may return JSON string) & include table containers
+    const raw = currentSection?.questions || [];
+    const all = raw.map((q: any) => {
+      if (q && q.metadata && typeof q.metadata === 'string') {
+        try { return { ...q, metadata: JSON.parse(q.metadata) }; } catch { /* ignore parse error */ }
+      }
+      return q;
+    });
+    // Include table container questions (table_fill_blank, table_drag_drop, simple_table, legacy essay.tableBlock) so table renders in flow
+    return all.filter((q: any) => {
+      if (q.metadata?.groupMemberOf) return false; // skip group members
+      if (q.questionType === 'matching') return false; // matching handled separately
+      if (tableContainer && q.id === tableContainer.id) return false; // skip container itself
+      return true;
+    }).sort((a:any,b:any)=> (a.questionNumber||0)-(b.questionNumber||0));
+  }, [currentSection, tableContainer]);
   // blankNumberMap: questionId -> assigned sequential numbers for blanks.
   // Modes:
   //   Default (no metadata.singleNumber): multi-blank fill_blank consumes one number per blank (displayed as a range Questions X–Y).
   //   If metadata.singleNumber === true: consumes only ONE number; all blanks share that number (IELTS style for certain tasks).
   const blankNumberMap = React.useMemo(() => {
     const map: Record<string, number[]> = {};
-    const list = [...visibleQuestions].sort((a: any,b: any)=> (a.questionNumber||0)-(b.questionNumber||0));
+    const list = [...visibleQuestions];
     if (!list.length) return map;
-    let cursor = list.reduce((min, q) => q.questionNumber && q.questionNumber < min ? q.questionNumber : min, list[0].questionNumber || 1);
+    // We now trust backend assigned questionNumber; do not resequence. Only map blanks for quick placeholder display.
     for (const q of list) {
-      if (q.questionNumber && q.questionNumber > cursor) cursor = q.questionNumber;
-      if (q.metadata?.groupRangeEnd) { cursor = q.metadata.groupRangeEnd + 1; continue; }
       if (q.questionType === 'fill_blank') {
         const text = q.questionText || '';
         const curly = (text.match(/\{answer\d+\}/gi) || []).length;
         const underscores = (text.match(/_{3,}/g) || []).length;
         const blanks = curly || underscores || 1;
-        if (blanks <= 1 || q.metadata?.singleNumber) {
-          map[q.id] = [cursor];
-          cursor += 1;
-        } else {
-          const nums: number[] = []; for (let i=0;i<blanks;i++) nums.push(cursor + i);
-          map[q.id] = nums; cursor += blanks;
+        // Use existing questionNumber as anchor; if multi-blank allocate synthetic subsequent numbers just for display (not persisted)
+        const base = q.questionNumber || 0;
+        if (blanks <=1 || q.metadata?.singleNumber) map[q.id] = [base];
+        else {
+          const nums: number[] = []; for (let i=0;i<blanks;i++) nums.push(base + i); map[q.id] = nums;
         }
-      } else {
-        map[q.id] = [cursor]; cursor += 1;
       }
     }
     return map;
@@ -440,6 +544,39 @@ const ExamTaking: React.FC = () => {
   const examSectionsLength = exam?.sections?.length || 0;
   const notFound = !exam && !examLoading;
   // Dedicated Listening layout (overrides default two-pane UI)
+  // Centralized exam-level listening audio (single player & optional single-play enforcement)
+  // Listening audio control (single, unstoppable playback)
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [audioStarted, setAudioStarted] = useState(false);
+  const [audioEnded, setAudioEnded] = useState(false);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const examAudioUrl = exam?.audioUrl;
+
+  // Enforce single auto-play (no pause/seek/replay) for listening sections
+  useEffect(() => {
+    if (!isListeningSection || !examAudioUrl) return;
+    const el = audioRef.current;
+    if (!el) return;
+    const onPlay = () => { setAudioStarted(true); setIsAudioPlaying(true); };
+    const onPause = () => { // Immediately resume if user attempts to pause before end
+      if (el.ended) { setIsAudioPlaying(false); return; }
+      // Resume shortly to avoid rapid pause/play loop
+      setTimeout(() => { el.play().catch(() => {}); }, 30);
+    };
+    const onEnded = () => { setIsAudioPlaying(false); setAudioEnded(true); };
+    el.addEventListener('play', onPlay);
+    el.addEventListener('pause', onPause);
+    el.addEventListener('ended', onEnded);
+    // Attempt autoplay
+    el.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
+    return () => {
+      el.removeEventListener('play', onPlay);
+      el.removeEventListener('pause', onPause);
+      el.removeEventListener('ended', onEnded);
+    };
+  }, [isListeningSection, examAudioUrl]);
+
   if (isListeningSection) {
     return (
       <div className={"h-screen flex flex-col overflow-hidden select-text " + (darkMode ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900')}>
@@ -450,13 +587,39 @@ const ExamTaking: React.FC = () => {
             <h1 className={"text-sm font-semibold " + primaryTextClass}>{exam?.title || 'Listening Test'}</h1>
           </div>
           <div className="flex items-center gap-4">
-            {currentSection?.audioUrl && (
-              <div className="flex items-center text-xs font-medium gap-1">
-                <span className={"inline-block w-2 h-2 rounded-full animate-pulse " + (darkMode ? 'bg-green-400' : 'bg-green-600')}></span>
-                <span className={secondaryTextClass}>Audio is playing</span>
+            {examAudioUrl && (
+              <div className="flex items-center text-xs font-medium gap-2">
+                {!audioStarted && !autoplayBlocked && (
+                  <>
+                    <span className={"inline-block w-2 h-2 rounded-full animate-pulse " + (darkMode ? 'bg-amber-400' : 'bg-amber-600')} />
+                    <span className={secondaryTextClass}>Loading audio…</span>
+                  </>
+                )}
+                {autoplayBlocked && !audioStarted && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const el = audioRef.current; if (!el || audioEnded) return; el.play().then(()=> setAutoplayBlocked(false)).catch(()=>{});
+                    }}
+                    className="px-2 py-1 rounded bg-blue-600 text-white hover:bg-blue-700"
+                  >Start Audio</button>
+                )}
+                {isAudioPlaying && (
+                  <>
+                    <span className={"inline-block w-2 h-2 rounded-full animate-pulse " + (darkMode ? 'bg-green-400' : 'bg-green-600')} />
+                    <span className={secondaryTextClass}>Audio playing</span>
+                  </>
+                )}
+                {audioEnded && (
+                  <>
+                    <span className={"inline-block w-2 h-2 rounded-full " + (darkMode ? 'bg-gray-500' : 'bg-gray-500')} />
+                    <span className={secondaryTextClass}>Audio finished</span>
+                  </>
+                )}
               </div>
             )}
-            <Timer darkMode={darkMode} duration={currentSection?.durationMinutes || exam?.durationMinutes || 30} onTimeUp={handleTimeUp} isPaused={isPaused} />
+            {/* Use global exam duration only (ignore per-section durations) */}
+            <Timer darkMode={darkMode} duration={exam?.durationMinutes || 30} onTimeUp={handleTimeUp} isPaused={isPaused} />
             <button onClick={() => setShowConfirmSubmit(true)} className="px-3 py-2 text-xs bg-red-600 text-white rounded hover:bg-red-700">Submit</button>
           </div>
         </div>
@@ -466,13 +629,192 @@ const ExamTaking: React.FC = () => {
           <span className="ml-4">Listen and answer questions {(currentListeningPart -1)*10 + 1}–{(currentListeningPart -1)*10 + listeningPartQuestions.length}.</span>
         </div>
         {/* Audio player sticky */}
-        {currentSection?.audioUrl && (
+        {examAudioUrl && (
           <div className={(darkMode ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200') + ' border-b px-4 py-3'}>
-            <audio controls preload="auto" src={currentSection.audioUrl} className="w-full" />
+            {(() => {
+              const apiFull = (import.meta.env.VITE_API_URL || 'http://localhost:7000/api');
+              const apiOrigin = apiFull.replace(/\/?api\/?$/, '');
+              const resolvedSrc = examAudioUrl?.startsWith('http') ? examAudioUrl : (examAudioUrl ? `${apiOrigin}${examAudioUrl}` : undefined);
+              return (
+                <audio
+                  ref={audioRef}
+                  preload="auto"
+                  src={resolvedSrc}
+                  style={{ display: 'none' }}
+                  onLoadedMetadata={(e) => {
+                    if (e.currentTarget.duration === Infinity || isNaN(e.currentTarget.duration)) {
+                      try { e.currentTarget.currentTime = 1; e.currentTarget.currentTime = 0; } catch {}
+                    }
+                  }}
+                  onError={(e) => {
+                    const el = e.currentTarget;
+                    const container = el.parentElement;
+                    if (container && !container.querySelector('.audio-error-msg')) {
+                      const div = document.createElement('div');
+                      div.className = 'audio-error-msg mt-1 text-[11px] text-red-600';
+                      div.textContent = 'Audio failed to load. Check URL or network.';
+                      container.appendChild(div);
+                    }
+                  }}
+                />
+              );
+            })()}
+            <div className="mt-1 text-[11px] text-gray-500">
+              {audioEnded ? 'Audio playback complete. Continue answering until time expires.' : 'Audio will play once and cannot be paused or replayed.'}
+              {autoplayBlocked && !audioStarted && ' (Click Start Audio above to begin)'}
+            </div>
           </div>
         )}
         {/* Questions area */}
         <div className="flex-1 overflow-auto px-4 py-4 space-y-10">
+          {/* Simple Tables (listening layout) */}
+          {(() => {
+            const simpleTables = (currentSection?.questions || []).filter((q:any)=> q.questionType==='simple_table').sort((a:any,b:any)=> (a.questionNumber||0)-(b.questionNumber||0));
+            if (!simpleTables.length) return null;
+            return simpleTables.map((q:any) => {
+              let meta: any = q.metadata;
+              if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
+              const rows: any[][] = meta?.simpleTable?.rows || [];
+              const seqStart: number | undefined = meta?.simpleTable?.sequenceStart;
+              // Build mapping cell -> assigned question number (prefer explicit cell.questionNumber, else derive sequentially if seqStart defined)
+              let derivedCounter = seqStart || 0;
+              if (!rows.length) return null;
+              return (
+                <div key={q.id} className="space-y-3 border-b pb-6 border-dashed border-gray-300 dark:border-gray-700">
+                  {q.questionText && <div className="font-semibold text-sm">{q.questionText}</div>}
+                  <div className="overflow-auto">
+                    <table className={'text-sm min-w-[480px] border ' + (darkMode ? 'border-gray-600' : 'border-gray-300')}>
+                      <tbody>
+                        {rows.map((row, ri) => (
+                          <tr key={ri} className={darkMode ? 'border-b border-gray-700 last:border-b-0' : 'border-b border-gray-200 last:border-b-0'}>
+                            {row.map((cell:any, ci:number) => {
+                              const answerKey = `${q.id}_${ri}_${ci}`; // synthetic key for now
+                              let displayNumber: number | undefined = cell?.questionNumber;
+                              if (displayNumber === undefined && cell?.type==='question' && seqStart) {
+                                if (derivedCounter === seqStart) { /* first use value as provided */ }
+                                if (!cell.__numberAssigned) {
+                                  // assign sequential on the fly (no mutation, display only)
+                                  displayNumber = derivedCounter;
+                                  derivedCounter += 1;
+                                  cell.__numberAssigned = displayNumber; // cache in runtime
+                                } else displayNumber = cell.__numberAssigned;
+                              }
+                              const baseTd = (darkMode ? 'border-r border-gray-700' : 'border-r border-gray-200') + ' last:border-r-0 p-3 align-top';
+                              if (cell?.type === 'text') {
+                                return <td key={ci} className={baseTd}><div className="whitespace-pre-wrap">{cell?.content || ''}</div></td>;
+                              }
+                              if (cell?.type === 'question') {
+                                // Treat missing questionType as fill_blank by default
+                                const effectiveType = cell?.questionType || 'fill_blank';
+                                const isFill = effectiveType === 'fill_blank';
+                                const rawContent: string = cell?.content || '';
+                                const inlinePatternGlobal = /_{3,}|\{answer\}/gi;
+                                const hasInlineBlank = isFill && inlinePatternGlobal.test(rawContent);
+                                inlinePatternGlobal.lastIndex = 0; // reset after test
+                                const multiNumbers: number[] | undefined = cell.multiNumbers;
+                                return (
+                                  <td key={ci} className={baseTd}>
+                                    <div className="space-y-2">
+                                      {!hasInlineBlank && rawContent && <div className="text-sm font-medium whitespace-pre-wrap">{rawContent}</div>}
+                                      {isFill && hasInlineBlank && (() => {
+                                        // Replace each blank with an input; if multiNumbers provided use them; else sequential fallback.
+                                        const parts: React.ReactNode[] = [];
+                                        let lastIndex = 0; let blankIdx = 0;
+                                        const matches = [...rawContent.matchAll(inlinePatternGlobal)];
+                                        matches.forEach((m, i) => {
+                                          const idx = m.index || 0;
+                                          if (idx > lastIndex) parts.push(rawContent.slice(lastIndex, idx));
+                                          const num = multiNumbers ? multiNumbers[i] : (displayNumber !== undefined ? (displayNumber + i) : undefined);
+                                          const key = `${answerKey}_b${i}`;
+                                          const val = (answers[key]?.answer as string) || '';
+                                          parts.push(
+                                            <span key={key} className="relative inline-flex align-middle mx-1">
+                                              <input
+                                                type="text"
+                                                value={val}
+                                                onChange={(e)=> handleAnswerChange(key, e.target.value)}
+                                                className={'px-2 py-1 rounded border focus:ring-2 text-center font-medium tracking-wide min-w-[70px] ' + (darkMode ? 'bg-gray-700 text-white border-gray-600 focus:ring-blue-500' : 'bg-white text-gray-900 border-gray-300 focus:ring-blue-300')}
+                                              />
+                                              {!val && num !== undefined && (
+                                                <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] font-semibold select-none ' + (darkMode ? 'text-gray-500' : 'text-gray-600')}>{num}</span>
+                                              )}
+                                            </span>
+                                          );
+                                          lastIndex = idx + m[0].length;
+                                          blankIdx++;
+                                        });
+                                        if (lastIndex < rawContent.length) parts.push(rawContent.slice(lastIndex));
+                                        return <div className="text-sm font-medium whitespace-pre-wrap leading-relaxed">{parts}</div>;
+                                      })()}
+                                      {isFill && !hasInlineBlank && (
+                                        <span className="relative inline-flex w-full">
+                                          <input
+                                            type="text"
+                                            value={(answers[answerKey]?.answer as string) || ''}
+                                            onChange={(e)=> handleAnswerChange(answerKey, e.target.value)}
+                                            className={'w-full px-2 py-1 rounded border focus:ring-2 text-center font-medium tracking-wide ' + (darkMode ? 'bg-gray-700 text-white border-gray-600 focus:ring-blue-500' : 'bg-white text-gray-900 border-gray-300 focus:ring-blue-300')}
+                                          />
+                                          {!(answers[answerKey]?.answer) && displayNumber !== undefined && (
+                                            <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] font-semibold select-none ' + (darkMode ? 'text-gray-500' : 'text-gray-600')}>{displayNumber}</span>
+                                          )}
+                                        </span>
+                                      )}
+                                      {effectiveType === 'multiple_choice' && cell?.content && (
+                                        <div className="space-y-1">
+                                          {cell.content.split(/[A-D]\)/).slice(1).map((opt:string, oi:number) => {
+                                            const letter = String.fromCharCode(65+oi);
+                                            const selected = (answers[answerKey]?.answer as string) === letter;
+                                            return (
+                                              <label key={letter} className={`flex items-start gap-2 cursor-pointer rounded px-2 py-1 border transition-colors ${selected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-gray-200 border-gray-300') : (darkMode ? 'border-gray-600 hover:bg-gray-700' : 'border-transparent hover:bg-gray-100')}`}
+                                                onClick={()=> handleAnswerChange(answerKey, letter)}>
+                                                <input type="radio" className={'mt-1 ' + (darkMode ? 'accent-blue-500':'')} checked={selected} onChange={()=> handleAnswerChange(answerKey, letter)} />
+                                                <span className={'text-sm select-none ' + (darkMode ? 'text-gray-100':'text-gray-900')}>{letter}) {opt.trim()}</span>
+                                              </label>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                      {effectiveType === 'true_false' && (
+                                        <div className="flex gap-2 flex-wrap">
+                                          {['True','False','Not Given'].map(val => {
+                                            const selected = (answers[answerKey]?.answer as string) === val;
+                                            return (
+                                              <button key={val} type="button" onClick={()=> handleAnswerChange(answerKey, val)} className={`px-2 py-1 rounded border text-xs ${selected ? 'bg-blue-600 text-white border-blue-600' : (darkMode ? 'border-gray-600 text-gray-200 hover:bg-gray-700' : 'border-gray-300 text-gray-700 hover:bg-gray-50')}`}>{val}</button>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                      {effectiveType === 'short_answer' && (
+                                        <input
+                                          type="text"
+                                          value={(answers[answerKey]?.answer as string) || ''}
+                                          onChange={(e)=> handleAnswerChange(answerKey, e.target.value)}
+                                          className={'w-full px-2 py-1 rounded border focus:ring-2 ' + (darkMode ? 'bg-gray-700 text-white border-gray-600 focus:ring-blue-500' : 'bg-white text-gray-900 border-gray-300 focus:ring-blue-300')}
+                                          placeholder="Short answer..."
+                                          maxLength={60}
+                                        />
+                                      )}
+                                      <div className="flex items-center justify-between">
+                                        {cell?.points && <div className="text-xs text-gray-500">({cell.points} pt{cell.points!==1?'s':''})</div>}
+                                        {displayNumber !== undefined && !multiNumbers && <div className="text-[10px] text-gray-400">Q{displayNumber}</div>}
+                                        {/* Range label suppressed for multi-blank cells to avoid duplicate numbering */}
+                                      </div>
+                                    </div>
+                                  </td>
+                                );
+                              }
+                              return <td key={ci} className={baseTd}><div className="text-gray-500 italic">?</div></td>;
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="text-xs text-gray-500">Answer directly in the table.</div>
+                </div>
+              );
+            });
+          })()}
           {/* Drag & Drop groups (rows layout) */}
           {(() => {
             const dragGroups = (currentSection?.questions || []).filter((q:any)=> q.questionType==='drag_drop' && !q.metadata?.groupMemberOf);
@@ -647,6 +989,19 @@ const ExamTaking: React.FC = () => {
 
   return (
   <div className={"h-screen flex flex-col overflow-hidden select-text " + (darkMode ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900') }>
+      {/* Local component animation styles */}
+      <style>{`
+        @keyframes tokenPop {0%{transform:scale(.5);opacity:0;}60%{transform:scale(1.06);opacity:1;}100%{transform:scale(1);opacity:1;}}
+        .token-pop { animation: tokenPop .35s cubic-bezier(.34,1.56,.64,1); }
+        @keyframes dropPulse {0%{box-shadow:0 0 0 0 rgba(59,130,246,.55);}70%{box-shadow:0 0 0 8px rgba(59,130,246,0);}100%{box-shadow:0 0 0 0 rgba(59,130,246,0);} }
+        .drop-pulse { animation: dropPulse .55s ease-out; }
+        .drag-token-shadow { box-shadow:0 4px 14px -4px rgba(59,130,246,.45), 0 0 0 1px rgba(59,130,246,.5); }
+        .dark .drag-token-shadow { box-shadow:0 4px 14px -4px rgba(96,165,250,.55), 0 0 0 1px rgba(96,165,250,.55); }
+        .drop-target-bright { transition: background-color .18s, transform .18s, box-shadow .18s; }
+        .drop-target-bright.is-valid:not(.has-token){ background:linear-gradient(135deg, rgba(96,165,250,0.18), rgba(59,130,246,0.10)); }
+        .dark .drop-target-bright.is-valid:not(.has-token){ background:linear-gradient(135deg, rgba(59,130,246,0.28), rgba(29,78,216,0.15)); }
+        .drop-target-bright.is-over { transform:scale(1.07); }
+      `}</style>
       {examLoading && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/70 z-50">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
@@ -669,7 +1024,8 @@ const ExamTaking: React.FC = () => {
         </div>
         <div className="flex items-center gap-4">
           <button onClick={() => setShowSettings(s => !s)} className={(showSettings ? 'ring-2 ring-blue-500 ' : '') + "px-3 py-2 rounded text-sm border transition-colors " + (darkMode ? 'border-gray-600 bg-gray-700 hover:bg-gray-600 text-gray-100' : 'border-gray-300 bg-white hover:bg-gray-100 text-gray-700')}>Settings</button>
-          <Timer darkMode={darkMode} duration={currentSection?.durationMinutes || exam?.durationMinutes || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
+          {/* Global timer only (ignore per-section durations) */}
+          <Timer darkMode={darkMode} duration={exam?.durationMinutes || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
           {exam && <button onClick={() => setShowConfirmSubmit(true)} className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700">Submit</button>}
         </div>
       </div>
@@ -848,7 +1204,25 @@ const ExamTaking: React.FC = () => {
                     )}
                   </>
                 ) : (
-                  <div className="text-sm text-gray-500">Navigate questions using the chips below.</div>
+                  <>
+                    {/* Listening / other section contextual area (instructions, transcript placeholders, future audio notes) */}
+                    <div className={(darkMode ? 'text-gray-300' : 'text-gray-700') + ' text-sm leading-relaxed'}
+                      style={{
+                        fontSize: prefFontSize,
+                        lineHeight: 1.52,
+                        fontFamily: prefFontFamily === 'serif'
+                          ? 'Georgia, Cambria, Times New Roman, Times, serif'
+                          : prefFontFamily === 'mono'
+                            ? 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
+                            : 'system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif'
+                      }}>
+                      {currentSection?.passageText ? (
+                        <div className="whitespace-pre-wrap">{currentSection.passageText}</div>
+                      ) : (
+                        <div className="italic opacity-70">Adjust font size, family, or theme in Settings. Questions appear on the right.</div>
+                      )}
+                    </div>
+                  </>
                 )}
               </div>
             </div>
@@ -874,6 +1248,32 @@ const ExamTaking: React.FC = () => {
           >
             <div className="flex flex-col h-full overflow-hidden min-h-0 border-l">
               <div ref={rightScrollRef} className="p-2 md:p-3 flex-1 overflow-auto relative min-h-0">
+                {debugTables && (
+                  <div className="mb-3 p-2 border rounded bg-yellow-50 text-[10px] text-gray-700 space-y-1 max-h-56 overflow-auto">
+                    <div className="font-semibold">[Debug] Question Inventory (Ctrl+Shift+D to toggle)</div>
+                    {(currentSection?.questions || []).map((dq:any) => {
+                      let meta: any = dq.metadata;
+                      if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch {} }
+                      const keys = meta ? Object.keys(meta) : [];
+                      const hasTable = !!meta?.table;
+                      const hasLegacy = !!meta?.tableBlock;
+                      if ((dq.questionType==='table_fill_blank' || dq.questionType==='table_drag_drop')) {
+                        // eslint-disable-next-line no-console
+                        console.log('[debugTables] table container', { id:dq.id, qnum:dq.questionNumber, type:dq.questionType, hasTable, keys });
+                      }
+                      return (
+                        <div key={dq.id} className="flex gap-2 items-center">
+                          <span className="font-mono">Q{dq.questionNumber}</span>
+                          <span>{dq.questionType}</span>
+                          <span className={hasTable? 'text-green-600':'text-red-600'}>table:{hasTable? 'Y':'N'}</span>
+                          {hasLegacy && <span className="text-purple-600">legacyBlock</span>}
+                          <span>metaKeys:[{keys.join(',')}]</span>
+                        </div>
+                      );
+                    })}
+                    <div className="pt-1 text-[9px] text-gray-600">Add ?debugTables=1 to URL or press Ctrl+Shift+D. Reload keeps state via localStorage.</div>
+                  </div>
+                )}
                 {isMatchingSection && headingOptions.length > 0 && (
                   <div className="mb-4 space-y-2">
                     {(() => { const gi = matchingQuestions[0]?.metadata?.groupInstruction; return gi ? <div className={"text-xs whitespace-pre-wrap border rounded p-2 " + (darkMode ? 'bg-gray-800 border-gray-700 text-gray-300' : 'bg-gray-50 text-gray-600 border-gray-200')}>{gi}</div> : null; })()}
@@ -900,6 +1300,223 @@ const ExamTaking: React.FC = () => {
                     <div className={"text-[10px] mt-1 " + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Drag a heading text onto a paragraph drop zone on the left. Each heading can be used once.</div>
                   </div>
                 )}
+                {/* Table container rendered (if any) before question list */}
+                {tableContainer && (() => {
+                  const q = tableContainer;
+                  
+                  // Simple Table Rendering
+                  if (q.questionType === 'simple_table') {
+                    // Ensure metadata parsed (backend may return JSON string)
+                    let meta: any = q.metadata;
+                    if (meta && typeof meta === 'string') {
+                      try { meta = JSON.parse(meta); } catch { meta = {}; }
+                    }
+                    const tableMeta = meta?.simpleTable || {};
+                    const rows: any[][] = Array.isArray(tableMeta.rows) ? tableMeta.rows : [];
+                    
+                    if (!rows.length) {
+                      return (
+                        <div className="mb-8 pb-4 border-b border-dashed border-gray-300 dark:border-gray-700">
+                          {q.questionText && <div className="mb-2 font-medium text-sm">{q.questionText}</div>}
+                          <div className="text-xs text-gray-500 italic">Table not configured yet (no rows). If you recently edited, ensure you clicked Save in the table editor.</div>
+                          {debugTables && <div className="mt-2 text-[10px] text-red-600">[Debug] simple_table metadata parsed but rows empty. Raw meta keys: {Object.keys(meta||{}).join(', ') || 'none'}</div>}
+                        </div>
+                      );
+                    }
+                    
+                    return (
+                      <div className="mb-8 pb-4 border-b border-dashed border-gray-300 dark:border-gray-700">
+                        {q.questionText && <div className="mb-2 font-medium text-sm">{q.questionText}</div>}
+                        <div className="overflow-auto">
+                          <table className={'text-sm min-w-[480px] border ' + (darkMode ? 'border-gray-600' : 'border-gray-300')}>
+                            <tbody>
+                              {rows.map((row, ri) => (
+                                <tr key={ri} className={darkMode ? 'border-b border-gray-700 last:border-b-0' : 'border-b border-gray-200 last:border-b-0'}>
+                                  {row.map((cell, ci) => (
+                                    <td key={ci} className={(darkMode ? 'border-r border-gray-700' : 'border-r border-gray-200') + ' last:border-r-0 p-3 align-top'}>
+                                      {cell?.type === 'text' ? (
+                                        <div className="whitespace-pre-wrap">{cell?.content || ''}</div>
+                                      ) : cell?.type === 'question' ? (
+                                        <div className="space-y-2">
+                                          {cell?.content && (
+                                            <div className="text-sm font-medium">{cell.content}</div>
+                                          )}
+                                          {cell?.questionType === 'fill_blank' && (() => {
+                                            // Detect multiple blanks inside a single cell content using {answer} tokens or runs of ___ (3+ underscores)
+                                            const raw: string = cell?.content || '';
+                                            const blankMatches = raw.match(/\{answer\}|_{3,}/gi) || [];
+                                            const blanks = blankMatches.length || 1;
+                                            if (blanks === 1) {
+                                              return (
+                                                <input
+                                                  type="text"
+                                                  value={(answers[`${q.id}_${ri}_${ci}`]?.answer as string) || ''}
+                                                  onChange={(e) => handleAnswerChange(`${q.id}_${ri}_${ci}`, e.target.value)}
+                                                  className={'w-full px-2 py-1 rounded border focus:ring-2 ' + (darkMode ? 'bg-gray-700 text-white border-gray-600 focus:ring-blue-500' : 'bg-white text-gray-900 border-gray-300 focus:ring-blue-300')}
+                                                  placeholder="Answer..."
+                                                />
+                                              );
+                                            }
+                                            // Multi-blank: render separate inputs; use synthetic IDs with _b index for aggregation
+                                            const numbers: number[] = Array.isArray(cell.multiNumbers) && cell.multiNumbers.length >= blanks
+                                              ? cell.multiNumbers.slice(0, blanks)
+                                              : (() => { const base = cell.questionNumber || 0; return Array.from({ length: blanks }, (_, i) => base + i); })();
+                                            return (
+                                              <div className="flex flex-wrap gap-1">
+                                                {Array.from({ length: blanks }).map((_, bi) => {
+                                                  const id = `${q.id}_${ri}_${ci}_b${bi}`;
+                                                  const val = (answers[id]?.answer as string) || '';
+                                                  const placeholderNum = numbers[bi];
+                                                  return (
+                                                    <span key={id} className="relative inline-flex">
+                                                      <input
+                                                        type="text"
+                                                        value={val}
+                                                        onChange={(e) => handleAnswerChange(id, e.target.value)}
+                                                        className={'px-2 py-1 rounded border text-center w-[70px] focus:ring-2 text-[13px] font-medium tracking-wide ' + (darkMode ? 'bg-gray-700 text-white border-gray-600 focus:ring-blue-500' : 'bg-white text-gray-900 border-gray-300 focus:ring-blue-300')}
+                                                      />
+                                                      {!val && placeholderNum !== undefined && (
+                                                        <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] font-semibold ' + (darkMode ? 'text-gray-500' : 'text-gray-600')}>{placeholderNum}</span>
+                                                      )}
+                                                    </span>
+                                                  );
+                                                })}
+                                              </div>
+                                            );
+                                          })()}
+                                          {cell?.questionType === 'multiple_choice' && cell?.content && (
+                                            <div className="space-y-1">
+                                              {cell.content.split(/[A-D]\)/).slice(1).map((option: string, oi: number) => {
+                                                const letter = String.fromCharCode(65 + oi);
+                                                const selected = (answers[`${q.id}_${ri}_${ci}`]?.answer as string) === letter;
+                                                return (
+                                                  <label
+                                                    key={letter}
+                                                    className={`flex items-start gap-2 cursor-pointer rounded px-2 py-1 border transition-colors ${selected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-gray-200 border-gray-300') : (darkMode ? 'border-gray-600 hover:bg-gray-700' : 'border-transparent hover:bg-gray-100')}`}
+                                                    onClick={() => handleAnswerChange(`${q.id}_${ri}_${ci}`, letter)}
+                                                  >
+                                                    <input
+                                                      type="radio"
+                                                      className={'mt-1 ' + (darkMode ? 'accent-blue-500' : '')}
+                                                      name={`question-${q.id}_${ri}_${ci}`}
+                                                      value={letter}
+                                                      checked={selected}
+                                                      onChange={() => handleAnswerChange(`${q.id}_${ri}_${ci}`, letter)}
+                                                    />
+                                                    <span className={'text-sm select-none ' + (darkMode ? 'text-gray-100' : 'text-gray-900')}>
+                                                      {letter}) {option.trim()}
+                                                    </span>
+                                                  </label>
+                                                );
+                                              })}
+                                            </div>
+                                          )}
+                                          {cell?.questionType === 'true_false' && (
+                                            <div className="flex gap-2">
+                                              {['True', 'False', 'Not Given'].map((val) => {
+                                                const selected = (answers[`${q.id}_${ri}_${ci}`]?.answer as string) === val;
+                                                return (
+                                                  <button
+                                                    key={val}
+                                                    onClick={() => handleAnswerChange(`${q.id}_${ri}_${ci}`, val)}
+                                                    className={`px-2 py-1 rounded border text-xs ${selected ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700 hover:bg-gray-50'}`}
+                                                  >{val}</button>
+                                                );
+                                              })}
+                                            </div>
+                                          )}
+                                          {cell?.questionType === 'short_answer' && (
+                                            <input
+                                              type="text"
+                                              value={(answers[`${q.id}_${ri}_${ci}`]?.answer as string) || ''}
+                                              onChange={(e) => handleAnswerChange(`${q.id}_${ri}_${ci}`, e.target.value)}
+                                              className={'w-full px-2 py-1 rounded border focus:ring-2 ' + (darkMode ? 'bg-gray-700 text-white border-gray-600 focus:ring-blue-500' : 'bg-white text-gray-900 border-gray-300 focus:ring-blue-300')}
+                                              placeholder="Short answer..."
+                                              maxLength={50}
+                                            />
+                                          )}
+                                          {cell?.points && (
+                                            <div className="text-xs text-gray-500">({cell.points} point{cell.points !== 1 ? 's' : ''})</div>
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <div className="text-gray-500 italic">Unknown cell type</div>
+                                      )}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-2">Answer the questions directly in the table above.</div>
+                      </div>
+                    );
+                  }
+                  
+                  // Legacy Table Rendering (existing complex system)
+                  const isLegacy = q.questionType === 'essay' && q.metadata?.tableBlock;
+                  const tableMeta = isLegacy ? (q.metadata?.tableBlock || {}) : (q.metadata?.table || {});
+                  const rows: string[][] = tableMeta.rows || [];
+                  if (!rows.length) {
+                    return debugTables ? (<div className="mb-6 text-xs text-red-600 border border-red-300 rounded p-2">[Debug] Table container Q{q.questionNumber} has empty rows array.</div>) : null;
+                  }
+                  return (
+                    <div className="mb-8 pb-4 border-b border-dashed border-gray-300 dark:border-gray-700">
+                      {q.questionText && <div className="mb-2 font-medium text-sm">{q.questionText}</div>}
+                      <div className="overflow-auto">
+                        <table className={'text-xs min-w-[480px] border ' + (darkMode ? 'border-gray-600' : 'border-gray-300')}>
+                          <tbody>
+                            {rows.map((r, ri) => (
+                              <tr key={ri} className={darkMode ? 'border-b border-gray-700 last:border-b-0' : 'border-b border-gray-200 last:border-b-0'}>
+                                {r.map((cell, ci) => {
+                                  const parts = String(cell||'').split(/(\[\[\d+\]\])/g).filter(Boolean);
+                                  return (
+                                    <td key={ci} className={(darkMode ? 'border-r border-gray-700' : 'border-r border-gray-200') + ' last:border-r-0 p-2 align-top whitespace-pre-wrap'}>
+                                      {parts.map((p, pi) => {
+                                        const mm = p.match(/^\[\[(\d+)\]\]$/);
+                                        if (mm) {
+                                          const num = Number(mm[1]);
+                                          const related = (currentSection?.questions || []).find((qq:any)=> qq.questionNumber === num);
+                                          if (related) {
+                                            if (['fill_blank','short_answer'].includes(related.questionType)) {
+                                              const val = (answers[related.id]?.answer as string) || '';
+                                              return (
+                                                <input
+                                                  key={pi}
+                                                  type="text"
+                                                  value={val}
+                                                  onChange={(e)=> handleAnswerChange(related.id, e.target.value)}
+                                                  className={'mx-0.5 inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-center focus:ring-2 ' + (darkMode ? 'bg-gray-700 text-white focus:ring-blue-500' : 'bg-white border border-gray-300 focus:ring-blue-300')}
+                                                  placeholder={String(num)}
+                                                  style={{ width: Math.max(34, Math.min(140, val.length*9 + 26)) }}
+                                                />
+                                              );
+                                            }
+                                            if (related.questionType === 'drag_drop') {
+                                              const currentTok = (answers[related.id]?.answer as string) || '';
+                                              return (
+                                                <span key={pi} className={'mx-0.5 inline-flex items-center justify-center rounded border px-2 py-0.5 text-[11px] min-w-[34px] ' + (currentTok ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-600 border-blue-600 text-white') : (darkMode ? 'border-gray-600 bg-gray-700 text-gray-300' : 'border-gray-300 bg-gray-100 text-gray-700'))}>
+                                                  {currentTok || num}
+                                                </span>
+                                              );
+                                            }
+                                          }
+                                          return <span key={pi} className="inline-block bg-purple-600 text-white text-[11px] px-2 py-0.5 rounded mx-0.5">{num}</span>;
+                                        }
+                                        return <span key={pi}>{p}</span>;
+                                      })}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
                 {(() => {
                   const lastInstructionPerType: Record<string, string | undefined> = {};
                   // Preprocess composite fill_blank templates: identify referenced question numbers and skip rule
@@ -1179,13 +1796,7 @@ const ExamTaking: React.FC = () => {
                       );
                     })()}
 
-                    {(currentSection?.sectionType || '').toLowerCase() === 'listening' && currentSection?.audioUrl && idx === 0 && (
-                      <div className="mb-3">
-                        <audio controls src={currentSection.audioUrl} className="w-full">
-                          Your browser does not support the audio element.
-                        </audio>
-                      </div>
-                    )}
+                    {/* Inline per-section audio removed; centralized exam-level audio player used */}
 
                     {(q.passage) && (
                       <div className={(darkMode ? 'bg-gray-700' : 'bg-gray-50') + ' p-3 rounded mb-3'}>
@@ -1306,7 +1917,221 @@ const ExamTaking: React.FC = () => {
                       </div>
                     )}
 
-                    {(q.questionType === 'essay' || q.questionType === 'writing_task1' || q.type === 'text' || q.questionType === 'speaking_task') && (
+                    {/* Table containers: new types (table_fill_blank, table_drag_drop) or legacy essay with metadata.tableBlock */}
+                    {/* Diagnostic log for table containers */}
+                    {(() => {
+                      if (q.questionType && (q.questionType === 'table_fill_blank' || q.questionType === 'table_drag_drop')) {
+                        try {
+                          // Log once per question id
+                          if (!(window as any).__loggedTableIds) (window as any).__loggedTableIds = new Set();
+                          if (!(window as any).__loggedTableIds.has(q.id)) {
+                            (window as any).__loggedTableIds.add(q.id);
+                            // eslint-disable-next-line no-console
+                            console.debug('[ExamTaking] Table container detected', {
+                              id: q.id, qnum: q.questionNumber, type: q.questionType, hasTable: !!q.metadata?.table, metadataKeys: q.metadata ? Object.keys(q.metadata) : []
+                            });
+                          }
+                        } catch {}
+                      }
+                      return null;
+                    })()}
+                    {(((q.questionType === 'table_fill_blank' || q.questionType === 'table_drag_drop') && (q.metadata?.table || q.questionNumber === 1)) || (q.questionType === 'essay' && q.metadata?.tableBlock)) && (() => {
+                      const tableData = (q.questionType === 'table_fill_blank' || q.questionType === 'table_drag_drop') ? q.metadata.table : q.metadata.tableBlock;
+                      const tableRows: string[][] = tableData?.rows || [];
+                      // Collect placeholder numbers [[n]] appearing anywhere in table to prep drag_drop token palettes
+                      const placeholderNums = Array.from(new Set(
+                        tableRows.flatMap(row => row.join(' ').match(/\[\[(\d+)\]\]/g) || [])
+                          .map(t => Number(t.replace(/[^0-9]/g,'')))
+                          .filter(n => !isNaN(n))
+                      ));
+                      // Build drag_drop groups for any drag_drop question numbers referenced
+                      const allQs = (currentSection?.questions || []);
+                      const dragMembers = allQs.filter((qq:any) => placeholderNums.includes(qq.questionNumber) && qq.questionType === 'drag_drop');
+                      interface DragGroup { anchor: any; members: any[] }
+                      const groupsMap: Record<string, DragGroup> = {};
+                      dragMembers.forEach((m: any) => {
+                        const anchorId = m.metadata?.groupMemberOf || m.id;
+                        if (!groupsMap[anchorId]) {
+                          const anchor = allQs.find((a:any) => a.id === anchorId) || m; // fallback to self
+                          groupsMap[anchorId] = { anchor, members: [] };
+                        }
+                        if (m.id !== groupsMap[m.metadata?.groupMemberOf || m.id].anchor.id) groupsMap[anchorId].members.push(m);
+                      });
+                      const dragGroups = Object.values(groupsMap);
+                      return (
+                        <div className="space-y-3 text-sm">
+                          {/* Token palettes for drag_drop groups */}
+                          {dragGroups.length > 0 && (
+                            <div className="space-y-2">
+                              {dragGroups.map(g => {
+                                const tokens: string[] = g.anchor.metadata?.tokens || [];
+                                const used = new Set(g.members.map(m => (answers[m.id]?.answer as string) || '').filter(Boolean));
+                                const available = tokens.filter(t => !used.has(t));
+                                return (
+                                  <div key={g.anchor.id} className="border rounded p-2 bg-gray-50 dark:bg-gray-800/40">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-[11px] font-semibold">Drag & Drop Tokens (Q{g.anchor.questionNumber}{g.anchor.metadata?.groupRangeEnd ? `–${g.anchor.metadata.groupRangeEnd}` : ''})</span>
+                                      <span className="text-[10px] text-gray-500">{available.length} available</span>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                      {available.map(tok => (
+                                        <button
+                                          key={tok}
+                                          type="button"
+                                          draggable
+                                          onDragStart={(e)=> { e.dataTransfer.setData('text/token', JSON.stringify({ token: tok, anchorId: g.anchor.id })); setDraggingTokenAnchor(g.anchor.id); (e.currentTarget as HTMLElement).classList.add('drag-token-shadow'); }}
+                                          onDragEnd={(e)=> { setDraggingTokenAnchor(null); setDragOverDragDropQuestion(null); (e.currentTarget as HTMLElement).classList.remove('drag-token-shadow'); }}
+                                          className={'px-2 py-1 text-[11px] rounded border font-medium cursor-grab active:cursor-grabbing transition-all duration-200 ' + (darkMode ? 'bg-gray-700 border-gray-600 text-gray-100 hover:bg-gray-600' : 'bg-white border-gray-300 text-gray-800 hover:bg-gray-100')}
+                                          style={{ transformOrigin:'center center' }}
+                                        >{tok}</button>
+                                      ))}
+                                      {!available.length && <span className="text-[10px] italic text-gray-500">All placed</span>}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {/* Optional question text with inline references */}
+                          {q.questionText && (
+                            <div className={'text-sm font-medium ' + (darkMode ? 'text-gray-200' : 'text-gray-800')}>
+                              {q.questionText.split(/(\[\[\d+\]\])/g).map((seg:string,i:number)=> {
+                                const m = seg.match(/^\[\[(\d+)\]\]$/);
+                                if (m) {
+                                  const num = Number(m[1]);
+                                  const related = allQs.find((qq:any)=> qq.questionNumber === num);
+                                  if (related && ['fill_blank','short_answer'].includes(related.questionType)) {
+                                    const val = (answers[related.id]?.answer as string) || '';
+                                    return (
+                                      <input
+                                        key={i}
+                                        type="text"
+                                        value={val}
+                                        onChange={(e)=> handleAnswerChange(related.id, e.target.value)}
+                                        className={'mx-1 inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-center focus:ring-2 ' + (darkMode ? 'bg-gray-700 text-white focus:ring-blue-500' : 'bg-white border border-gray-300 focus:ring-blue-300')}
+                                        placeholder={String(num)}
+                                        style={{ width: Math.max(34, Math.min(120, val.length*10 + 24)) }}
+                                      />
+                                    );
+                                  }
+                                  return <span key={i} className="inline-block bg-purple-600 text-white text-[11px] px-2 py-0.5 rounded mx-0.5">{num}</span>;
+                                }
+                                return <span key={i}>{seg}</span>;
+                              })}
+                            </div>
+                          )}
+                          <div className="overflow-auto">
+                            <table className={'text-xs min-w-[480px] border ' + (darkMode ? 'border-gray-600' : 'border-gray-300')}>
+                              <tbody>
+                                {tableRows.map((row, ri) => {
+                                  const sizeRow = (tableData?.sizes && tableData.sizes[ri]) || [];
+                                  return (
+                                    <tr key={ri} className={darkMode ? 'border-b border-gray-700 last:border-b-0' : 'border-b border-gray-200 last:border-b-0'}>
+                                      {row.map((cell, ci) => {
+                                        const sz = sizeRow[ci] || {};
+                                        const width = sz.w ? Number(sz.w) : undefined;
+                                        const height = sz.h ? Number(sz.h) : undefined;
+                                        const parts = cell.split(/(\[\[\d+\]\])/g).filter(Boolean);
+                                        return (
+                                          <td key={ci} style={width ? { width, minWidth: width } : {}} className={(darkMode ? 'border-r border-gray-700' : 'border-r border-gray-200') + ' last:border-r-0 p-2 align-top whitespace-pre-wrap'}>
+                                            <div style={height ? { minHeight: height } : {}} className="w-full">
+                                              {parts.map((p, pi) => {
+                                                const mm = p.match(/^\[\[(\d+)\]\]$/);
+                                                if (mm) {
+                                                  const num = Number(mm[1]);
+                                                  const related = allQs.find((qq:any)=> qq.questionNumber === num);
+                                                  if (related) {
+                                                    if (['fill_blank','short_answer'].includes(related.questionType)) {
+                                                      const val = (answers[related.id]?.answer as string) || '';
+                                                      return (
+                                                        <input
+                                                          key={pi}
+                                                          type="text"
+                                                          value={val}
+                                                          onChange={(e)=> handleAnswerChange(related.id, e.target.value)}
+                                                          className={'mx-0.5 inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-center focus:ring-2 ' + (darkMode ? 'bg-gray-700 text-white focus:ring-blue-500' : 'bg-white border border-gray-300 focus:ring-blue-300')}
+                                                          placeholder={String(num)}
+                                                          style={{ width: Math.max(34, Math.min(140, val.length*9 + 26)) }}
+                                                        />
+                                                      );
+                                                    } else if (related.questionType === 'drag_drop') {
+                                                      const anchorId = related.metadata?.groupMemberOf || related.id;
+                                                      const currentTok = (answers[related.id]?.answer as string) || '';
+                                                      return (
+                                                        <span
+                                                          key={pi}
+                                                          onDragOver={(e)=> { if (draggingTokenAnchor === anchorId) e.preventDefault(); }}
+                                                          onDragEnter={(e)=> { if (draggingTokenAnchor === anchorId) { e.preventDefault(); setDragOverDragDropQuestion(related.id); } }}
+                                                          onDragLeave={()=> { if (dragOverDragDropQuestion === related.id) setDragOverDragDropQuestion(null); }}
+                                                          onDrop={(e)=> {
+                                                            e.preventDefault();
+                                                            try {
+                                                              const data = JSON.parse(e.dataTransfer.getData('text/token') || '{}');
+                                                              if (!data.token) return;
+                                                              if (data.anchorId !== anchorId) return; // wrong group
+                                                              // ensure uniqueness within group
+                                                              allQs.filter((qq:any)=> qq.questionType==='drag_drop' && (qq.metadata?.groupMemberOf || qq.id)===anchorId).forEach((m:any)=> {
+                                                                if ((answers[m.id]?.answer as string) === data.token && m.id !== related.id) {
+                                                                  handleAnswerChange(m.id, '');
+                                                                }
+                                                              });
+                                                              handleAnswerChange(related.id, data.token);
+                                                              setRecentDropQuestion(related.id);
+                                                              setTimeout(()=> { setRecentDropQuestion(qid=> qid===related.id ? null : qid); }, 650);
+                                                            } catch {}
+                                                            setDraggingTokenAnchor(null);
+                                                            setDragOverDragDropQuestion(null);
+                                                          }}
+                                                          className={(function(){
+                                                            const base = 'mx-0.5 inline-flex items-center justify-center rounded border px-2 py-0.5 text-[11px] min-w-[34px] min-h-[22px] transition-all duration-150 drop-target-bright ';
+                                                            const state = currentTok ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-600 border-blue-600 text-white') : (darkMode ? 'border-gray-600 bg-gray-700 text-gray-300' : 'border-gray-300 bg-gray-100 text-gray-700');
+                                                            const valid = draggingTokenAnchor === anchorId && !currentTok;
+                                                            const over = dragOverDragDropQuestion === related.id;
+                                                            const ring = over ? ' ring-2 ring-offset-1 ' + (darkMode ? 'ring-blue-400 ring-offset-gray-800' : 'ring-blue-500 ring-offset-white') : valid ? ' ring-1 ' + (darkMode ? 'ring-blue-400' : 'ring-blue-300') : '';
+                                                            const pulse = (recentDropQuestion === related.id && currentTok) ? ' drop-pulse token-pop ' : '';
+                                                            const flags = (valid ? ' is-valid' : '') + (over ? ' is-over' : '') + (currentTok ? ' has-token' : '');
+                                                            return base + state + ring + pulse + flags;
+                                                          })()}
+                                                        >
+                                                          {currentTok || num}
+                                                          {currentTok && (
+                                                            <button
+                                                              type="button"
+                                                              onClick={(e)=> { e.preventDefault(); e.stopPropagation(); handleAnswerChange(related.id, ''); }}
+                                                              className={'ml-1 text-[10px] ' + (darkMode ? 'text-white/80 hover:text-white' : 'text-white/80 hover:text-white')}
+                                                            >×</button>
+                                                          )}
+                                                        </span>
+                                                      );
+                                                    } else {
+                                                      const answered = (answers[related.id]?.answer as string) || '';
+                                                      return (
+                                                        <span key={pi} className="inline-flex mx-0.5 relative">
+                                                          <span className={(answered? 'bg-blue-600 text-white':'bg-gray-200 text-gray-700') + ' rounded px-2 py-0.5 text-[11px] font-semibold select-none'}>{num}</span>
+                                                        </span>
+                                                      );
+                                                    }
+                                                  }
+                                                  return <span key={pi} className="inline-block bg-gray-300 text-gray-700 rounded px-1.5 py-0.5 text-[11px] font-semibold">{num}</span>;
+                                                }
+                                                return <span key={pi}>{p}</span>;
+                                              })}
+                                            </div>
+                                          </td>
+                                        );
+                                      })}
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                          <div className={'text-[10px] ' + (darkMode ? 'text-gray-500':'text-gray-500')}>Enter answers directly into the inline fields above.</div>
+                        </div>
+                      );
+                    })()}
+
+                    {(q.questionType === 'essay' || q.questionType === 'writing_task1' || q.type === 'text' || q.questionType === 'speaking_task') && !q.metadata?.tableBlock && (
                       <div className="space-y-2">
                         {q.questionType === 'writing_task1' && (
                           <div className={'text-xs rounded px-3 py-2 ' + (darkMode ? 'bg-blue-900/40 text-blue-200' : 'bg-blue-50 text-blue-700')}>
@@ -1389,16 +2214,19 @@ const ExamTaking: React.FC = () => {
           >Prev</button>
           <div className="flex-1 flex flex-wrap gap-1 overflow-y-auto max-h-20">
     {visibleQuestions.map((q: any, idx: number) => {
-              const isAnswered = answers[q.id];
-              const isCurrent = idx === currentQuestionIndex;
-              const label = q.questionNumber || idx + 1;
-              const title = q.metadata?.groupRangeEnd ? `Questions ${q.questionNumber}–${q.metadata.groupRangeEnd}` : `Question ${label}`;
-              return (
-                <button key={q.id} title={title} onClick={() => goToQuestion(currentSectionIndex, idx)} className={`w-8 h-8 text-[11px] rounded border flex items-center justify-center ${chipClass(isCurrent, !!isAnswered)}`}>
-                  {label}
-                </button>
-              );
-            })}
+      const isAnswered = answers[q.id];
+      const isCurrent = idx === currentQuestionIndex;
+      // Hide chip for pure table container (no direct response; new types & legacy) - but keep navigation clickable if desired
+      const isTableContainer = (q.questionType === 'table_fill_blank' || q.questionType === 'table_drag_drop' || q.questionType === 'simple_table' || (q.questionType==='essay' && q.metadata?.tableBlock));
+      if (isTableContainer) return null;
+      const label = q.questionNumber || idx + 1;
+      const title = q.metadata?.groupRangeEnd ? `Questions ${q.questionNumber}–${q.metadata.groupRangeEnd}` : `Question ${label}`;
+      return (
+        <button key={q.id} title={title} onClick={() => goToQuestion(currentSectionIndex, idx)} className={`w-8 h-8 text-[11px] rounded border flex items-center justify-center ${chipClass(isCurrent, !!isAnswered)}`}>
+          {label}
+        </button>
+      );
+    })}
           </div>
           <button
             onClick={goToNextQuestion}

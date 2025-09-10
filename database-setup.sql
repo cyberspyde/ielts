@@ -53,7 +53,7 @@ CREATE TYPE user_status AS ENUM ('active', 'inactive', 'suspended', 'pending');
 -- Exam types and sections
 CREATE TYPE exam_type AS ENUM ('academic', 'general_training');
 CREATE TYPE exam_section_type AS ENUM ('listening', 'reading', 'writing', 'speaking');
-CREATE TYPE question_type AS ENUM ('multiple_choice', 'true_false', 'fill_blank', 'essay', 'speaking_task', 'drag_drop', 'matching');
+CREATE TYPE question_type AS ENUM ('multiple_choice', 'true_false', 'fill_blank', 'essay', 'speaking_task', 'drag_drop', 'matching', 'short_answer', 'writing_task1', 'table_fill_blank', 'table_drag_drop', 'simple_table', 'multi_select');
 
 -- Exam session statuses
 CREATE TYPE session_status AS ENUM ('pending', 'in_progress', 'completed', 'submitted', 'expired', 'cancelled');

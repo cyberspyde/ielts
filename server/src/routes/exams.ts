@@ -107,8 +107,8 @@ router.get('/:id',
 
     // Get exam details
     const examResult = await query(`
-      SELECT id, title, description, exam_type, duration_minutes,
-             passing_score, max_attempts, instructions, is_active, created_at
+  SELECT id, title, description, exam_type, duration_minutes,
+     passing_score, max_attempts, instructions, audio_url, is_active, created_at
       FROM exams 
       WHERE id = $1 AND is_active = true
     `, [id]);
@@ -121,8 +121,8 @@ router.get('/:id',
 
     // Get sections
     let sectionsSql = `
-      SELECT id, section_type, title, description, duration_minutes,
-             max_score, section_order, instructions, audio_url, passage_text, heading_bank
+      SELECT id, section_type, title, description,
+        max_score, section_order, instructions, audio_url, passage_text, heading_bank
       FROM exam_sections 
       WHERE exam_id = $1`;
     const params: any[] = [id];
@@ -162,7 +162,8 @@ router.get('/:id',
         sectionType: section.section_type,
         title: section.title,
         description: section.description,
-        durationMinutes: section.duration_minutes,
+        // durationMinutes removed (global exam duration applies)
+        durationMinutes: null as any,
         maxScore: section.max_score,
         sectionOrder: section.section_order,
         instructions: section.instructions,
@@ -196,6 +197,24 @@ router.get('/:id',
             metadata: question.metadata,
             options: []
           };
+
+          // Fallback: ensure table container questions always expose a metadata.table structure
+          try {
+            if ((questionData.questionType === 'table_fill_blank' || questionData.questionType === 'table_drag_drop')) {
+              // metadata may be stringified in some drivers or already parsed
+              let meta: any = questionData.metadata;
+              if (typeof meta === 'string') {
+                try { meta = JSON.parse(meta); } catch { meta = {}; }
+              }
+              if (!meta || typeof meta !== 'object') meta = {};
+              if (!meta.table || !Array.isArray(meta.table?.rows)) {
+                meta.table = meta.table && Array.isArray(meta.table.rows) ? meta.table : { rows: [[""]] };
+              }
+              questionData.metadata = meta;
+            }
+          } catch (e) {
+            logger.warn('Failed to normalize table_* metadata', { questionId: question.id, error: (e as any)?.message });
+          }
 
           // Include correctAnswer only for admins
           if (req.user && ['admin','super_admin'].includes((req.user as any).role)) {
@@ -259,6 +278,7 @@ router.get('/:id',
       passingScore: exam.passing_score,
       maxAttempts: exam.max_attempts,
       instructions: exam.instructions,
+      audioUrl: exam.audio_url,
       isActive: exam.is_active,
       createdAt: exam.created_at,
       sections,
@@ -390,11 +410,8 @@ router.post('/:id/start',
     }
 
     // Create exam session (support section-only)
-    let effectiveMinutes = exam.duration_minutes;
-    if (section) {
-      const secRes = await query(`SELECT duration_minutes FROM exam_sections WHERE exam_id = $1 AND section_type = $2 LIMIT 1`, [examId, section]);
-      if (secRes.rows.length > 0) effectiveMinutes = secRes.rows[0].duration_minutes;
-    }
+  // Section-level duration deprecated; always use exam.duration_minutes
+  const effectiveMinutes = exam.duration_minutes;
     const sessionExpiresAt = new Date(Date.now() + (effectiveMinutes * 60 * 1000) + (5 * 60 * 1000));
 
     const sessionResult = await query(`
@@ -489,7 +506,7 @@ router.post('/sessions/:sessionId/submit',
     let totalScore = 0;
     let maxPossibleScore = 0;
 
-    if (answers && Array.isArray(answers) && answers.length) {
+  if (answers && Array.isArray(answers) && answers.length) {
       const normalize = (v: any) => String(v ?? '').trim().toLowerCase();
       const answerMap: Record<string, any> = {};
       for (const a of answers) answerMap[a.questionId] = a.studentAnswer;
@@ -517,6 +534,90 @@ router.post('/sessions/:sessionId/submit',
       for (const q of questionRows) {
         let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
         if (meta?.groupMemberOf) continue; // skip member grading
+        // Skip legacy container table question types (no direct grading; their referenced cell sub-questions are separate)
+        if (q.question_type === 'table_fill_blank' || q.question_type === 'table_drag_drop') continue;
+        // Handle new simple_table aggregated question: grade each embedded cell
+        if (q.question_type === 'simple_table') {
+          let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
+          let studentObj: any = null;
+          const rawStudent = answerMap[q.id];
+          try { studentObj = typeof rawStudent === 'string' ? JSON.parse(rawStudent) : rawStudent; } catch {}
+          const rows = meta?.simpleTable?.rows || [];
+          const cellAnswers: any[] = [];
+          let tableScore = 0;
+          let tableMax = 0;
+          // Iterate cells
+          rows.forEach((row: any[], ri:number) => row.forEach((cell:any, ci:number) => {
+            if (!cell || cell.type !== 'question') return;
+            const key = `${ri}_${ci}`;
+            const qType = cell.questionType || 'fill_blank';
+            const pts = parseFloat(cell.points || 1);
+            let cellMax = pts;
+            const correctAnswerRaw = cell.correctAnswer || '';
+            const studentValRaw = studentObj?.cells?.[key];
+            // Multi-blank support: when studentValRaw is an array (from multiNumbers) we grade each blank equally splitting points.
+            if (Array.isArray(studentValRaw)) {
+              const perBlank = pts / (studentValRaw.length || 1);
+              let localScore = 0;
+              const blankResults: any[] = [];
+              const variantGroups = (correctAnswerRaw.includes(';') ? correctAnswerRaw.split(';') : [correctAnswerRaw]);
+              studentValRaw.forEach((sv: any, bi: number) => {
+                const norm = normalize(sv);
+                let correct = false;
+                const groupRaw = variantGroups[bi] || variantGroups[0] || '';
+                let variants = groupRaw.split('|').map((s:string)=>normalize(s)).filter(Boolean);
+                if (!variants.length && groupRaw) variants = [normalize(groupRaw)];
+                const numMode = variants.length>0 && variants.every((v:string)=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(v));
+                const recNum = Number(norm);
+                if (qType === 'multiple_choice') {
+                  const exp = variants; const got = norm ? norm.split('|').filter(Boolean):[]; const uniq = (arr:string[])=>Array.from(new Set(arr)); const eU = uniq(exp); const gU = uniq(got); correct = eU.length===gU.length && eU.every(v=>gU.includes(v));
+                } else if (qType === 'true_false') {
+                  const mapTF: Record<string,string> = { 't':'true','f':'false','ng':'not given','notgiven':'not given' }; const exp = mapTF[variants[0]]||variants[0]; const rec = mapTF[norm]||norm; correct = !!exp && exp===rec;
+                } else { // fill_blank / short_answer
+                  if (variants.some((v: string)=> v===norm || (numMode && !isNaN(recNum) && Number(v)===recNum))) correct = true;
+                }
+                if (correct) localScore += perBlank;
+                blankResults.push({ index: bi, student: sv, isCorrect: correct, pointsEarned: correct ? perBlank : 0, variants });
+              });
+              tableScore += localScore;
+              tableMax += cellMax;
+              cellAnswers.push({ key, questionType: qType, multi: true, blanks: blankResults, points: pts, pointsEarned: localScore });
+            } else {
+              const studentValNorm = normalize(studentValRaw);
+              tableMax += cellMax;
+              let correct = false;
+              if (qType === 'multiple_choice') {
+                const exp = (correctAnswerRaw || '').split('|').map((s:string)=>normalize(s)).filter(Boolean);
+                let got: string[] = [];
+                if (Array.isArray(studentValRaw)) got = (studentValRaw as any[]).map(v=>normalize(v));
+                else got = studentValNorm.split('|').filter(Boolean);
+                const uniq = (arr:string[]) => Array.from(new Set(arr));
+                const eU = uniq(exp); const gU = uniq(got);
+                if (eU.length === gU.length && eU.every(v=>gU.includes(v))) correct = true;
+              } else if (qType === 'true_false') {
+                const mapTF: Record<string,string> = { 't':'true','f':'false','ng':'not given','notgiven':'not given' };
+                const exp = mapTF[normalize(correctAnswerRaw)] || normalize(correctAnswerRaw);
+                const rec = mapTF[studentValNorm] || studentValNorm;
+                correct = !!(exp && rec && exp === rec);
+              } else if (qType === 'fill_blank' || qType === 'short_answer') {
+                let variants = (correctAnswerRaw || '').split('|').map((s:string)=>normalize(s)).filter(Boolean);
+                if (!variants.length && correctAnswerRaw) variants = [normalize(correctAnswerRaw)];
+                const numMode: boolean = variants.length > 0 && variants.every((v: string)=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(v));
+                const recNum = Number(studentValNorm);
+                if (variants.some((v: string) => v === studentValNorm || (numMode && !isNaN(recNum) && recNum === Number(v)))) correct = true;
+              }
+              if (correct) tableScore += pts;
+              cellAnswers.push({ key, questionType: qType, studentAnswer: studentValRaw, correctAnswer: correctAnswerRaw, points: pts, isCorrect: correct });
+            }
+          }));
+          maxPossibleScore += tableMax;
+          totalScore += tableScore;
+          await query(`INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at, is_correct, points_earned)
+            VALUES ($1,$2,$3,CURRENT_TIMESTAMP,$4,$5)
+            ON CONFLICT (session_id, question_id)
+            DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP, is_correct = EXCLUDED.is_correct, points_earned = EXCLUDED.points_earned`, [sessionId, q.id, JSON.stringify({ ...(studentObj||{}), graded: cellAnswers }), tableScore >= tableMax && tableMax>0, tableScore]);
+          continue;
+        }
         const studentAnswer = answerMap[q.id];
         if (studentAnswer === undefined) continue;
         maxPossibleScore += parseFloat(q.points);
@@ -675,9 +776,9 @@ router.get('/sessions/:sessionId/results',
 
     // Get session results
     const sessionResult = await query(`
-      SELECT es.id, es.status, es.started_at, es.submitted_at, es.total_score,
-             es.percentage_score, es.is_passed, es.time_spent_seconds,
-             e.title as exam_title, e.exam_type, e.passing_score, e.duration_minutes
+  SELECT es.id, es.status, es.started_at, es.submitted_at, es.total_score,
+     es.percentage_score, es.is_passed, es.time_spent_seconds,
+     e.title as exam_title, e.exam_type, e.passing_score, e.duration_minutes, e.audio_url
       FROM exam_sessions es
       JOIN exams e ON es.exam_id = e.id
       WHERE es.id = $1 AND es.user_id = $2 AND es.status = 'submitted'
@@ -690,16 +791,16 @@ router.get('/sessions/:sessionId/results',
     const session = sessionResult.rows[0];
 
     // Get detailed answers
-    const answersResult = await query(`
-      SELECT esa.question_id, esa.student_answer, esa.is_correct, esa.points_earned,
-             eq.question_text, eq.correct_answer, eq.explanation, eq.points,
-             es.section_type, es.title as section_title
-      FROM exam_session_answers esa
-      JOIN exam_questions eq ON esa.question_id = eq.id
-      JOIN exam_sections es ON eq.section_id = es.id
-      WHERE esa.session_id = $1
-      ORDER BY es.section_order, eq.question_number
-    `, [sessionId]);
+      const answersResult = await query(`
+        SELECT esa.question_id, esa.student_answer, esa.is_correct, esa.points_earned,
+               eq.question_text, eq.correct_answer, eq.explanation, eq.points, eq.metadata,
+               es.section_type, es.title as section_title
+        FROM exam_session_answers esa
+        JOIN exam_questions eq ON esa.question_id = eq.id
+        JOIN exam_sections es ON eq.section_id = es.id
+        WHERE esa.session_id = $1
+        ORDER BY es.section_order, eq.question_number
+      `, [sessionId]);
 
     const results = {
       session: {
@@ -716,7 +817,8 @@ router.get('/sessions/:sessionId/results',
         title: session.exam_title,
         type: session.exam_type,
         passingScore: session.passing_score,
-        durationMinutes: session.duration_minutes
+        durationMinutes: session.duration_minutes,
+        audioUrl: session.audio_url
       },
       answers: answersResult.rows.map((answer: any) => ({
         questionId: answer.question_id,
@@ -728,7 +830,8 @@ router.get('/sessions/:sessionId/results',
         correctAnswer: answer.correct_answer,
         explanation: answer.explanation,
         sectionType: answer.section_type,
-        sectionTitle: answer.section_title
+        sectionTitle: answer.section_title,
+        questionMetadata: (()=>{ try { return typeof answer.metadata === 'string' ? JSON.parse(answer.metadata) : answer.metadata; } catch { return null; } })()
       }))
     };
 

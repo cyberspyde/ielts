@@ -30,10 +30,10 @@ async function seed(): Promise<void> {
       ]);
       const examId = exam.rows[0].id;
       await db.query(`
-        INSERT INTO exam_sections (exam_id, section_type, title, description, duration_minutes, max_score, section_order, instructions)
+        INSERT INTO exam_sections (exam_id, section_type, title, description, max_score, section_order, instructions)
         VALUES 
-        ($1,'listening','Listening Section','IELTS Listening test with 4 parts',30,9.0,1,'Listen and answer the questions'),
-        ($1,'reading','Reading Section','IELTS Reading test with 3 passages',60,9.0,2,'Read and answer the questions')
+        ($1,'listening','Listening Section','IELTS Listening test with 4 parts',9.0,1,'Listen and answer the questions'),
+        ($1,'reading','Reading Section','IELTS Reading test with 3 passages',9.0,2,'Read and answer the questions')
       `, [examId]);
     }
 

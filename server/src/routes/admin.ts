@@ -54,6 +54,22 @@ router.post('/sections/:sectionId/audio', authMiddleware, requireRole(['admin','
   res.status(201).json({ success: true, message: 'Audio uploaded', data: { audioUrl: publicPath, absoluteUrl } });
 }));
 
+// POST /api/admin/exams/:examId/audio - upload or replace centralized exam listening audio
+router.post('/exams/:examId/audio', authMiddleware, requireRole(['admin','super_admin']), uploadAudio.single('file'), asyncHandler(async (req: Request, res: Response) => {
+  const { examId } = req.params;
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (!file) throw new AppError('Audio file required', 400);
+  // Ensure exam exists
+  const ex = await query('SELECT id FROM exams WHERE id = $1', [examId]);
+  if (ex.rowCount === 0) throw createNotFoundError('Exam');
+  const publicPath = `/uploads/audio/${path.basename(file.path)}`;
+  await query('UPDATE exams SET audio_url = $1 WHERE id = $2', [publicPath, examId]);
+  const userId = (req.user && (req.user as any).id) || '00000000-0000-0000-0000-000000000000';
+  const absoluteUrl = `${req.protocol}://${req.get('host')}${publicPath}`;
+  await logAdminAction(userId, 'UPLOAD_EXAM_AUDIO', 'exam', examId, { audio: publicPath, absoluteUrl });
+  res.status(201).json({ success: true, message: 'Exam audio uploaded', data: { audioUrl: publicPath, absoluteUrl } });
+}));
+
 // All admin routes require authentication and admin role or higher
 router.use(authMiddleware);
 router.use(requireRole(['admin', 'super_admin']));
@@ -172,19 +188,20 @@ router.post('/exams',
   body('description').optional().isString(),
   body('examType').isIn(['academic', 'general_training']).withMessage('Invalid exam type'),
   body('durationMinutes').isInt({ min: 1 }).withMessage('Duration is required'),
+  body('audioUrl').optional().isString(),
   body('passingScore').optional().isFloat({ min: 0, max: 9.0 }).withMessage('Passing score must be 0-9.0'),
   body('maxAttempts').optional().isInt({ min: 1, max: 10 }).withMessage('Max attempts must be 1-10'),
   body('instructions').optional().isString(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
 
-    const { title, description, examType, durationMinutes, passingScore = 0, maxAttempts = 1, instructions } = req.body;
+  const { title, description, examType, durationMinutes, passingScore = 0, maxAttempts = 1, instructions, audioUrl } = req.body;
 
     const result = await query(`
-      INSERT INTO exams (title, description, exam_type, duration_minutes, passing_score, max_attempts, instructions, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO exams (title, description, exam_type, duration_minutes, passing_score, max_attempts, instructions, audio_url, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING id, created_at
-    `, [title, description || null, examType, durationMinutes, passingScore, maxAttempts, instructions || null, req.user!.id]);
+    `, [title, description || null, examType, durationMinutes, passingScore, maxAttempts, instructions || null, audioUrl || null, req.user!.id]);
 
     const exam = result.rows[0];
 
@@ -204,6 +221,7 @@ router.put('/exams/:examId',
   body('description').optional().isString(),
   body('examType').optional().isIn(['academic', 'general_training']),
   body('durationMinutes').optional().isInt({ min: 1 }),
+  body('audioUrl').optional().isString(),
   body('passingScore').optional().isFloat({ min: 0, max: 9.0 }),
   body('maxAttempts').optional().isInt({ min: 1, max: 10 }),
   body('instructions').optional().isString(),
@@ -218,7 +236,7 @@ router.put('/exams/:examId',
     const map: Record<string, string> = {
       title: 'title', description: 'description', examType: 'exam_type',
       durationMinutes: 'duration_minutes', passingScore: 'passing_score',
-      maxAttempts: 'max_attempts', instructions: 'instructions'
+      maxAttempts: 'max_attempts', instructions: 'instructions', audioUrl: 'audio_url'
     };
     for (const key of Object.keys(map)) {
       const val = (req.body as any)[key];
@@ -264,7 +282,7 @@ router.delete('/exams/:examId', asyncHandler(async (req: Request, res: Response)
 router.put('/exams/:examId/sections/:sectionId',
   body('title').optional().isString(),
   body('description').optional().isString(),
-  body('durationMinutes').optional().isInt({ min: 1 }),
+  // durationMinutes deprecated (global exam duration enforced) – ignore if provided
   body('maxScore').optional().isFloat({ min: 0, max: 9.0 }),
   body('sectionOrder').optional().isInt({ min: 1 }),
   body('instructions').optional().isString(),
@@ -279,7 +297,7 @@ router.put('/exams/:examId/sections/:sectionId',
     const values: any[] = [];
     let p = 1;
     const map: Record<string, string> = {
-      title: 'title', description: 'description', durationMinutes: 'duration_minutes',
+      title: 'title', description: 'description',
       maxScore: 'max_score', sectionOrder: 'section_order', instructions: 'instructions',
       audioUrl: 'audio_url', passageText: 'passage_text', headingBank: 'heading_bank'
     };
@@ -322,7 +340,7 @@ router.delete('/sections/:sectionId', asyncHandler(async (req: Request, res: Res
 
 // PUT /api/admin/questions/:questionId - Update a question
 router.put('/questions/:questionId',
-  body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1']),
+  body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table']),
   body('questionText').optional().isString(),
   body('correctAnswer').optional().isString(),
   body('points').optional().isFloat({ min: 0 }),
@@ -356,7 +374,7 @@ router.put('/questions/:questionId',
 
 // POST /api/admin/sections/:sectionId/questions - Create a single question
 router.post('/sections/:sectionId/questions',
-  body('questionType').isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1']).withMessage('Invalid question type'),
+  body('questionType').isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table']).withMessage('Invalid question type'),
   body('questionText').optional().isString(),
   body('correctAnswer').optional().isString(),
   body('points').optional().isFloat({ min: 0 }),
@@ -366,6 +384,23 @@ router.post('/sections/:sectionId/questions',
     checkValidationErrors(req);
     const { sectionId } = req.params;
     const { questionType, questionText = '', correctAnswer, points = 1, questionNumber, metadata } = req.body;
+    // Auto-normalize table_fill_blank and simple_table: ensure metadata structure
+    let normMetadata = metadata;
+    if (questionType === 'table_fill_blank' || questionType === 'table_drag_drop') {
+      const baseTable = (metadata && (metadata as any).table) || (metadata && (metadata as any).tableBlock);
+      const rows = baseTable?.rows || [[" "]];
+      normMetadata = { ...(metadata||{}), table: { rows, sizes: baseTable?.sizes || [] } };
+      if (questionType.startsWith('table_') && (req.body.points === undefined || req.body.points === null)) {
+        (req.body as any).points = 0; // container not directly scored
+      }
+    } else if (questionType === 'simple_table') {
+      const baseTable = (metadata && (metadata as any).simpleTable);
+      const rows = baseTable?.rows || [[{ type: 'text', content: '' }]];
+      normMetadata = { ...(metadata||{}), simpleTable: { rows } };
+      if (req.body.points === undefined || req.body.points === null) {
+        (req.body as any).points = 0; // container not directly scored
+      }
+    }
     // Verify section
     const sec = await query('SELECT id, exam_id FROM exam_sections WHERE id = $1', [sectionId]);
     if (sec.rowCount === 0) throw createNotFoundError('Section');
@@ -381,7 +416,7 @@ router.post('/sections/:sectionId/questions',
         const rQ = await query(`
           INSERT INTO exam_questions (section_id, question_type, question_text, question_number, points, correct_answer, metadata)
           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-        `, [sectionId, questionType, questionText, qNum, points, correctAnswer || null, metadata ? JSON.stringify(metadata) : null]);
+        `, [sectionId, questionType, questionText, qNum, points, correctAnswer || null, normMetadata ? JSON.stringify(normMetadata) : null]);
         newId = rQ.rows[0].id; break;
       } catch (e: any) {
         if (e?.code === '23505' && /uq_exam_questions_section_question/i.test(e?.constraint || '')) {
@@ -472,7 +507,7 @@ router.post('/exams/:examId/sections',
   body('sections').isArray({ min: 1 }).withMessage('Sections array is required'),
   body('sections.*.sectionType').isIn(['listening', 'reading', 'writing', 'speaking']).withMessage('Invalid section type'),
   body('sections.*.title').trim().isLength({ min: 2 }).withMessage('Section title is required'),
-  body('sections.*.durationMinutes').isInt({ min: 1 }).withMessage('Section duration required'),
+  // durationMinutes fully deprecated; validation removed
   body('sections.*.maxScore').isFloat({ min: 0, max: 9.0 }).withMessage('Max score must be 0-9.0'),
   body('sections.*.sectionOrder').isInt({ min: 1 }).withMessage('Section order required'),
   body('sections.*.audioUrl').optional().isString(),
@@ -494,10 +529,10 @@ router.post('/exams/:examId/sections',
     for (const s of sections) {
       const r = await query(`
         INSERT INTO exam_sections (
-          exam_id, section_type, title, description, duration_minutes, max_score, section_order, instructions, audio_url, passage_text, heading_bank
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          exam_id, section_type, title, description, max_score, section_order, instructions, audio_url, passage_text, heading_bank
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id
-      `, [examId, s.sectionType, s.title, s.description || null, s.durationMinutes, s.maxScore, s.sectionOrder, s.instructions || null, s.audioUrl || null, s.passageText || null, s.headingBank ? JSON.stringify(s.headingBank) : null]);
+      `, [examId, s.sectionType, s.title, s.description || null, s.maxScore, s.sectionOrder, s.instructions || null, s.audioUrl || null, s.passageText || null, s.headingBank ? JSON.stringify(s.headingBank) : null]);
       created.push({ id: r.rows[0].id, sectionType: s.sectionType, title: s.title });
     }
 
@@ -511,7 +546,7 @@ router.post('/exams/:examId/sections',
 router.post('/exams/:examId/questions/bulk',
   body('sectionId').isUUID().withMessage('Valid sectionId is required'),
   body('groups').isArray({ min: 1 }).withMessage('Groups array is required'),
-  body('groups.*.questionType').isIn(['multiple_choice', 'true_false', 'fill_blank', 'matching', 'short_answer', 'essay', 'writing_task1', 'speaking', 'speaking_task', 'drag_drop']).withMessage('Invalid question type'),
+  body('groups.*.questionType').isIn(['multiple_choice', 'true_false', 'fill_blank', 'matching', 'short_answer', 'essay', 'writing_task1', 'speaking', 'speaking_task', 'drag_drop', 'table_fill_blank', 'table_drag_drop', 'simple_table']).withMessage('Invalid question type'),
   body('groups.*.start').isInt({ min: 1 }).withMessage('Start question number required'),
   body('groups.*.end').isInt({ min: 1 }).withMessage('End question number required'),
   body('groups.*.points').optional().isFloat({ min: 0 }).withMessage('Points must be >= 0'),
@@ -1097,7 +1132,7 @@ router.get('/sessions',
 
     queryParams.push(limit, offset);
 
-    const sessionsResult = await query(sessionsQuery, queryParams);
+  const sessionsResult = await query(sessionsQuery, queryParams);
 
     // Get total count
     const countQuery = `
