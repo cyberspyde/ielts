@@ -4,7 +4,10 @@ import { useLocation, useNavigate } from 'react-router-dom';
 const AdminTicketPrint: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation() as any;
-  const tickets = (location.state && Array.isArray(location.state.tickets)) ? location.state.tickets : [];
+  let tickets = (location.state && Array.isArray(location.state.tickets)) ? location.state.tickets : [];
+  if (!tickets.length) {
+    try { const cached = sessionStorage.getItem('tickets-print'); if (cached) tickets = JSON.parse(cached); } catch {}
+  }
 
   React.useEffect(() => {
     if (!tickets.length) return;

@@ -1240,6 +1240,10 @@ router.get('/sessions',
       queryParams.push(userId);
     }
 
+    if (String(todayOnly) === 'true') {
+      whereClause += " AND COALESCE(es.submitted_at, es.created_at) >= date_trunc('day', now()) AND COALESCE(es.submitted_at, es.created_at) < date_trunc('day', now()) + INTERVAL '1 day'";
+    }
+
     const sessionsQuery = `
       SELECT 
         es.id, es.status, es.started_at, es.submitted_at, es.expires_at,
@@ -1253,7 +1257,6 @@ router.get('/sessions',
       JOIN exams e ON es.exam_id = e.id
       LEFT JOIN tickets t ON es.ticket_id = t.id
       ${whereClause}
-      ${String(todayOnly) === 'true' ? " AND COALESCE(es.submitted_at, es.created_at) >= date_trunc('day', now()) AND COALESCE(es.submitted_at, es.created_at) < date_trunc('day', now()) + INTERVAL '1 day'" : ''}
       ORDER BY COALESCE(es.submitted_at, es.created_at) DESC
       LIMIT $${paramCount++} OFFSET $${paramCount++}
     `;
@@ -1269,7 +1272,6 @@ router.get('/sessions',
       LEFT JOIN users u ON es.user_id = u.id
       JOIN exams e ON es.exam_id = e.id
       ${whereClause}
-      ${String(todayOnly) === 'true' ? " AND COALESCE(es.submitted_at, es.created_at) >= date_trunc('day', now()) AND COALESCE(es.submitted_at, es.created_at) < date_trunc('day', now()) + INTERVAL '1 day'" : ''}
     `;
     const countResult = await query(countQuery, queryParams.slice(0, -2));
 
@@ -1382,18 +1384,20 @@ router.get('/sessions/:sessionId/results',
       throw new AppError('Session not yet submitted', 400);
     }
 
-    // Get answers
+    // Get answers including unanswered questions (LEFT JOIN against session answers)
     const answersResult = await query(`
-      SELECT esa.question_id, esa.student_answer, esa.is_correct, esa.points_earned,
+      SELECT eq.id as question_id,
+             esa.student_answer, esa.is_correct, esa.points_earned,
              eq.question_text, eq.correct_answer, eq.explanation, eq.points,
              eq.metadata AS question_metadata,
              esec.section_type, esec.title as section_title, eq.question_number, eq.question_type
-      FROM exam_session_answers esa
-      JOIN exam_questions eq ON esa.question_id = eq.id
+      FROM exam_questions eq
       JOIN exam_sections esec ON eq.section_id = esec.id
-      WHERE esa.session_id = $1
+      LEFT JOIN exam_session_answers esa 
+        ON esa.question_id = eq.id AND esa.session_id = $1
+      WHERE esec.exam_id = $2
       ORDER BY esec.section_order, eq.question_number
-    `, [sessionId]);
+    `, [sessionId, session.exam_id]);
 
     const answers = answersResult.rows.map((row: any) => {
       let parsedStudent: any = null;

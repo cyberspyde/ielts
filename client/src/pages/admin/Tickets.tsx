@@ -62,6 +62,7 @@ const AdminTickets: React.FC = () => {
   const openPrintPreview = () => {
     const selected = ticketsList.filter((t:any)=> selectedIds.includes(t.id));
     if (selected.length === 0) { toast.info('Select at least one ticket to print'); return; }
+    try { sessionStorage.setItem('tickets-print', JSON.stringify(selected)); } catch {}
     navigate('/admin/tickets/print', { state: { tickets: selected } });
   };
 

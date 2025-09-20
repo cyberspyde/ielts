@@ -21,6 +21,7 @@ import AdminExamCreate from './pages/admin/ExamCreate';
 import AdminExamEdit from './pages/admin/ExamEdit';
 import AdminStudents from './pages/admin/Students';
 import AdminTickets from './pages/admin/Tickets';
+import AdminTicketPrint from './pages/admin/AdminTicketPrint';
 import AdminAnalytics from './pages/admin/Analytics';
 import AdminSessions from './pages/admin/AdminSessions';
 import AdminSessionResults from './pages/admin/AdminSessionResults';
@@ -86,6 +87,11 @@ function App() {
                 <Route path="/admin/tickets" element={
                   <AdminRoute>
                     <AdminTickets />
+                  </AdminRoute>
+                } />
+                <Route path="/admin/tickets/print" element={
+                  <AdminRoute>
+                    <AdminTicketPrint />
                   </AdminRoute>
                 } />
                 <Route path="/admin/analytics" element={
