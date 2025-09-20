@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { yupResolver } from '@hookform/resolvers/yup';
 import * as yup from 'yup';
-import { Eye, EyeOff, Mail, Lock, BookOpen } from 'lucide-react';
+import { Eye, EyeOff, Mail, Lock, BookOpen, CheckCircle } from 'lucide-react';
 
 import { useAuth } from '../../contexts/AuthContext';
 import type { LoginForm } from '../../types';
@@ -52,7 +52,7 @@ export const LoginPage: React.FC = () => {
         {/* Header */}
         <div className="text-center">
           <div className="mx-auto h-12 w-12 flex items-center justify-center rounded-full bg-blue-100">
-            <BookOpen className="h-8 w-8 text-blue-600" />
+            <BookOpen className="h-8 w-8" color="#2563eb" />
           </div>
           <h2 className="mt-6 text-3xl font-extrabold text-gray-900">
             Welcome to IELTS Platform
@@ -72,7 +72,7 @@ export const LoginPage: React.FC = () => {
               </label>
               <div className="mt-1 relative">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                  <Mail className="h-5 w-5 text-gray-400" />
+                  <Mail className="h-5 w-5" color="#9ca3af" />
                 </div>
                 <input
                   {...register('email')}
@@ -97,7 +97,7 @@ export const LoginPage: React.FC = () => {
               </label>
               <div className="mt-1 relative">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                  <Lock className="h-5 w-5 text-gray-400" />
+                  <Lock className="h-5 w-5" color="#9ca3af" />
                 </div>
                 <input
                   {...register('password')}
@@ -115,9 +115,9 @@ export const LoginPage: React.FC = () => {
                   onClick={() => setShowPassword(!showPassword)}
                 >
                   {showPassword ? (
-                    <EyeOff className="h-5 w-5 text-gray-400 hover:text-gray-600" />
+                    <EyeOff className="h-5 w-5" color="#9ca3af" />
                   ) : (
-                    <Eye className="h-5 w-5 text-gray-400 hover:text-gray-600" />
+                    <Eye className="h-5 w-5" color="#9ca3af" />
                   )}
                 </button>
               </div>
@@ -156,25 +156,25 @@ export const LoginPage: React.FC = () => {
                 Sign up
               </Link>
             </div>
-            <div className="text-sm">
+            <div className="text-sm flex items-center gap-4">
               <Link
                 to="/ticket"
                 className="font-medium text-blue-600 hover:text-blue-500 transition-colors duration-200"
               >
                 Use exam ticket
               </Link>
+              <Link
+                to="/results"
+                className="inline-flex items-center gap-1 font-medium text-green-700 hover:text-green-600 transition-colors duration-200"
+                title="Check exam results"
+              >
+                <CheckCircle className="h-4 w-4" /> See results
+              </Link>
             </div>
           </div>
         </form>
 
-        {/* Demo Credentials */}
-        <div className="mt-6 p-4 bg-gray-50 rounded-lg">
-          <h3 className="text-sm font-medium text-gray-700 mb-2">Demo Credentials:</h3>
-          <div className="text-xs text-gray-600 space-y-1">
-            <p><strong>Admin:</strong> admin@bestcenter.com / admin123</p>
-            <p className="text-[11px] text-gray-500">Use these to access admin pages. You can also register a new student account.</p>
-          </div>
-        </div>
+        
       </div>
     </div>
   );

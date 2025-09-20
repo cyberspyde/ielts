@@ -14,7 +14,7 @@ import {
 
 import { useAuth } from '../../contexts/AuthContext';
 import { apiService } from '../../services/api';
-import type { Exam, ExamResult } from '../../types';
+// Types currently unused; keep imports minimal
 
 export const StudentDashboard: React.FC = () => {
   const { user } = useAuth();
@@ -146,7 +146,6 @@ export const StudentDashboard: React.FC = () => {
                       <div className="text-xs text-gray-500">Expires at {new Date(s.expiresAt).toLocaleString()}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Link to={`/results/${s.id}`} className="hidden"></Link>
                       <Link to={`/exam/${s.examId}`} className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700">Resume</Link>
                       <button
                         onClick={async () => { await apiService.delete(`/exams/sessions/${s.id}`); refetchActive(); }}
@@ -182,7 +181,7 @@ export const StudentDashboard: React.FC = () => {
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {availableExams.slice(0, 3).map((exam) => (
+                  {availableExams.slice(0, 3).map((exam: any) => (
                     <div
                       key={exam.id}
                       className="flex items-center justify-between p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
@@ -262,13 +261,7 @@ export const StudentDashboard: React.FC = () => {
                           Band {result.bandScore}
                         </div>
                       </div>
-                      <Link
-                        to={`/results/${result.examId}`}
-                        className="ml-4 inline-flex items-center px-3 py-2 border border-transparent text-sm font-medium rounded-md text-blue-600 bg-blue-50 hover:bg-blue-100 transition-colors duration-200"
-                      >
-                        View
-                        <ArrowRight className="ml-1 h-3 w-3" />
-                      </Link>
+                      {/* Results view disabled for students */}
                     </div>
                   ))}
                 </div>

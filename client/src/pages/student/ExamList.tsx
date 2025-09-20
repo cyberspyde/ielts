@@ -72,7 +72,7 @@ const ExamList: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
           {/* Search */}
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 h-4 w-4" />
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4" color="#9ca3af" />
             <input
               type="text"
               placeholder="Search exams..."
@@ -179,15 +179,15 @@ const ExamList: React.FC = () => {
 
               <div className="space-y-2 mb-4">
                 <div className="flex items-center text-sm text-gray-600">
-                  <BookOpen className="h-4 w-4 mr-2" />
+                  <BookOpen className="h-4 w-4 mr-2" color="#4b5563" />
                   <span>{exam.sectionCount ?? 0} section{(exam.sectionCount ?? 0) !== 1 ? 's' : ''}</span>
                 </div>
                 <div className="flex items-center text-sm text-gray-600">
-                  <Clock className="h-4 w-4 mr-2" />
+                  <Clock className="h-4 w-4 mr-2" color="#4b5563" />
                   <span>{exam.durationMinutes ?? exam.duration ?? 0} minutes</span>
                 </div>
                 <div className="flex items-center text-sm text-gray-600">
-                  <Calendar className="h-4 w-4 mr-2" />
+                  <Calendar className="h-4 w-4 mr-2" color="#4b5563" />
                   <span>Created {new Date(exam.createdAt).toLocaleDateString()}</span>
                 </div>
               </div>

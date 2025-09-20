@@ -30,8 +30,6 @@ router.get('/',
       whereClause += ` AND e.exam_type = $${paramCount++}`;
       queryParams.push(type);
     }
-
-    // Search filter
     if (search) {
       whereClause += ` AND (e.title ILIKE $${paramCount++} OR e.description ILIKE $${paramCount++})`;
       queryParams.push(`%${search}%`, `%${search}%`);
@@ -538,84 +536,97 @@ router.post('/sessions/:sessionId/submit',
         if (q.question_type === 'table_fill_blank' || q.question_type === 'table_drag_drop') continue;
         // Handle new simple_table aggregated question: grade each embedded cell
         if (q.question_type === 'simple_table') {
+          // Flatten each table cell (and each blank within multi-blank cells) into graded entries
           let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
-          let studentObj: any = null;
           const rawStudent = answerMap[q.id];
-          try { studentObj = typeof rawStudent === 'string' ? JSON.parse(rawStudent) : rawStudent; } catch {}
+          let studentObj: any = null; try { studentObj = typeof rawStudent === 'string' ? JSON.parse(rawStudent) : rawStudent; } catch {}
           const rows = meta?.simpleTable?.rows || [];
-          const cellAnswers: any[] = [];
+          const gradedEntries: any[] = [];
           let tableScore = 0;
           let tableMax = 0;
-          // Iterate cells
-          rows.forEach((row: any[], ri:number) => row.forEach((cell:any, ci:number) => {
+          const norm = normalize;
+          rows.forEach((row: any[], ri: number) => row.forEach((cell: any, ci: number) => {
             if (!cell || cell.type !== 'question') return;
-            const key = `${ri}_${ci}`;
+            const baseKey = `${ri}_${ci}`;
             const qType = cell.questionType || 'fill_blank';
             const pts = parseFloat(cell.points || 1);
-            let cellMax = pts;
-            const correctAnswerRaw = cell.correctAnswer || '';
-            const studentValRaw = studentObj?.cells?.[key];
-            // Multi-blank support: when studentValRaw is an array (from multiNumbers) we grade each blank equally splitting points.
-            if (Array.isArray(studentValRaw)) {
-              const perBlank = pts / (studentValRaw.length || 1);
-              let localScore = 0;
-              const blankResults: any[] = [];
-              const variantGroups = (correctAnswerRaw.includes(';') ? correctAnswerRaw.split(';') : [correctAnswerRaw]);
-              studentValRaw.forEach((sv: any, bi: number) => {
-                const norm = normalize(sv);
-                let correct = false;
-                const groupRaw = variantGroups[bi] || variantGroups[0] || '';
-                let variants = groupRaw.split('|').map((s:string)=>normalize(s)).filter(Boolean);
-                if (!variants.length && groupRaw) variants = [normalize(groupRaw)];
-                const numMode = variants.length>0 && variants.every((v:string)=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(v));
-                const recNum = Number(norm);
-                if (qType === 'multiple_choice') {
-                  const exp = variants; const got = norm ? norm.split('|').filter(Boolean):[]; const uniq = (arr:string[])=>Array.from(new Set(arr)); const eU = uniq(exp); const gU = uniq(got); correct = eU.length===gU.length && eU.every(v=>gU.includes(v));
-                } else if (qType === 'true_false') {
-                  const mapTF: Record<string,string> = { 't':'true','f':'false','ng':'not given','notgiven':'not given' }; const exp = mapTF[variants[0]]||variants[0]; const rec = mapTF[norm]||norm; correct = !!exp && exp===rec;
-                } else { // fill_blank / short_answer
-                  if (variants.some((v: string)=> v===norm || (numMode && !isNaN(recNum) && Number(v)===recNum))) correct = true;
-                }
-                if (correct) localScore += perBlank;
-                blankResults.push({ index: bi, student: sv, isCorrect: correct, pointsEarned: correct ? perBlank : 0, variants });
-              });
-              tableScore += localScore;
-              tableMax += cellMax;
-              cellAnswers.push({ key, questionType: qType, multi: true, blanks: blankResults, points: pts, pointsEarned: localScore });
-            } else {
-              const studentValNorm = normalize(studentValRaw);
-              tableMax += cellMax;
-              let correct = false;
+            const correctAnswerRaw: string = cell.correctAnswer || '';
+            const studentValRaw = studentObj?.cells?.[baseKey];
+            // Determine blank groups (for multi blank semantics). Use maximum of: multiNumbers length, student array length, answer groups length.
+            const groups = correctAnswerRaw.includes(';') ? correctAnswerRaw.split(';') : [correctAnswerRaw];
+            const multiNums: number[] = Array.isArray(cell.multiNumbers) ? cell.multiNumbers.filter((n: any) => Number.isInteger(n)) : [];
+            const studentArrLen = Array.isArray(studentValRaw) ? studentValRaw.length : 0;
+            let blankCount = Math.max(
+              multiNums.length > 1 ? multiNums.length : (multiNums.length === 1 ? 1 : 0),
+              studentArrLen,
+              groups.length > 1 ? groups.length : 1,
+              1
+            );
+            if (blankCount < 1) blankCount = 1; // safety
+            const baseNumber = (cell.questionNumber !== undefined ? cell.questionNumber : (multiNums[0] !== undefined ? multiNums[0] : undefined));
+            // Scoring rule: each blank is worth the cell's point value (IELTS style 1 mark per blank). If author configured pts>1, we still treat it per blank.
+            const perBlank = pts;
+            // If student provided a single string for multiple blanks, attempt to split into tokens (semicolon > comma > whitespace)
+            let studentArray: any[] | null = null;
+            if (Array.isArray(studentValRaw)) studentArray = studentValRaw;
+            else if (blankCount > 1 && typeof studentValRaw === 'string') {
+              const attempts = [
+                studentValRaw.split(';'),
+                studentValRaw.split(','),
+                studentValRaw.split(/\s+/)
+              ].map(arr => arr.map(s => (s||'').trim()).filter(Boolean));
+              for (const tokens of attempts) { if (tokens.length === blankCount) { studentArray = tokens; break; } }
+            }
+            for (let bi = 0; bi < blankCount; bi++) {
+              const groupRaw = groups[bi] || groups[0] || '';
+              let variants = groupRaw.split('|').map((s: string) => norm(s)).filter(Boolean);
+              if (!variants.length && groupRaw) variants = [norm(groupRaw)];
+              const studentValue = studentArray ? studentArray[bi] : (blankCount === 1 ? studentValRaw : undefined);
+              const studentNorm = norm(studentValue);
+              let isCorrect = false;
               if (qType === 'multiple_choice') {
-                const exp = (correctAnswerRaw || '').split('|').map((s:string)=>normalize(s)).filter(Boolean);
-                let got: string[] = [];
-                if (Array.isArray(studentValRaw)) got = (studentValRaw as any[]).map(v=>normalize(v));
-                else got = studentValNorm.split('|').filter(Boolean);
-                const uniq = (arr:string[]) => Array.from(new Set(arr));
-                const eU = uniq(exp); const gU = uniq(got);
-                if (eU.length === gU.length && eU.every(v=>gU.includes(v))) correct = true;
+                const got = studentNorm ? studentNorm.split('|').filter(Boolean) : [];
+                const uniq = (arr: string[]) => Array.from(new Set(arr));
+                const eU = uniq(variants); const gU = uniq(got);
+                isCorrect = eU.length === gU.length && eU.every(v => gU.includes(v));
               } else if (qType === 'true_false') {
-                const mapTF: Record<string,string> = { 't':'true','f':'false','ng':'not given','notgiven':'not given' };
-                const exp = mapTF[normalize(correctAnswerRaw)] || normalize(correctAnswerRaw);
-                const rec = mapTF[studentValNorm] || studentValNorm;
-                correct = !!(exp && rec && exp === rec);
-              } else if (qType === 'fill_blank' || qType === 'short_answer') {
-                let variants = (correctAnswerRaw || '').split('|').map((s:string)=>normalize(s)).filter(Boolean);
-                if (!variants.length && correctAnswerRaw) variants = [normalize(correctAnswerRaw)];
-                const numMode: boolean = variants.length > 0 && variants.every((v: string)=>/^[-+]?(\d+\.?\d*|\.\d+)$/.test(v));
-                const recNum = Number(studentValNorm);
-                if (variants.some((v: string) => v === studentValNorm || (numMode && !isNaN(recNum) && recNum === Number(v)))) correct = true;
+                const mapTF: Record<string, string> = { t: 'true', f: 'false', ng: 'not given', notgiven: 'not given' };
+                const exp = mapTF[variants[0]] || variants[0];
+                const rec = mapTF[studentNorm] || studentNorm;
+                isCorrect = !!exp && exp === rec;
+              } else { // fill_blank / short_answer
+                const numMode = variants.length > 0 && variants.every(v => /^[-+]?(\d+\.?\d*|\.\d+)$/.test(v));
+                const recNum = Number(studentNorm);
+                if (variants.some(v => v === studentNorm || (numMode && !isNaN(recNum) && Number(v) === recNum))) isCorrect = true;
               }
-              if (correct) tableScore += pts;
-              cellAnswers.push({ key, questionType: qType, studentAnswer: studentValRaw, correctAnswer: correctAnswerRaw, points: pts, isCorrect: correct });
+              if (isCorrect) tableScore += perBlank;
+              tableMax += perBlank;
+              gradedEntries.push({
+                key: blankCount > 1 ? `${baseKey}_b${bi}` : baseKey,
+                baseKey,
+                questionType: qType,
+                questionNumber: (multiNums[bi] !== undefined)
+                  ? multiNums[bi]
+                  : (baseNumber !== undefined ? (blankCount > 1 ? (baseNumber + bi) : baseNumber) : undefined),
+                studentAnswer: studentValue ?? null,
+                correctAnswer: groupRaw || null,
+                points: perBlank,
+                isCorrect
+              });
             }
           }));
           maxPossibleScore += tableMax;
-          totalScore += tableScore;
+            totalScore += tableScore;
           await query(`INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at, is_correct, points_earned)
             VALUES ($1,$2,$3,CURRENT_TIMESTAMP,$4,$5)
             ON CONFLICT (session_id, question_id)
-            DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP, is_correct = EXCLUDED.is_correct, points_earned = EXCLUDED.points_earned`, [sessionId, q.id, JSON.stringify({ ...(studentObj||{}), graded: cellAnswers }), tableScore >= tableMax && tableMax>0, tableScore]);
+            DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP, is_correct = EXCLUDED.is_correct, points_earned = EXCLUDED.points_earned`, [
+              sessionId,
+              q.id,
+              JSON.stringify({ ...(studentObj || {}), type: 'simple_table', version: 2, graded: gradedEntries }),
+              tableScore >= tableMax && tableMax > 0,
+              tableScore
+            ]);
           continue;
         }
         const studentAnswer = answerMap[q.id];
@@ -697,6 +708,29 @@ router.post('/sessions/:sessionId/submit',
             }
         } else if (q.question_type === 'writing_task1' || q.question_type === 'essay') {
           // Free-response, skip auto grading (leave false so points_earned 0). Could be manually graded later.
+        } else if (q.question_type === 'image_labeling') {
+          // Per-question credit: compare student's text with correct_answer (case/space-insensitive)
+          const norm = (s:string) => s.replace(/\s+/g,' ').trim().toLowerCase();
+          if (q.correct_answer) {
+            const expected = norm(String(q.correct_answer));
+            const got = norm(String(received||''));
+            isCorrect = expected.length>0 && got === expected;
+          } else {
+            isCorrect = false;
+          }
+        } else if (q.question_type === 'image_dnd') {
+          // Expect JSON: { placements: { [anchorId:string]: token:string } }
+          // Correct mapping provided in metadata.correctMap
+          let correctCount = 0; let max = 0;
+          try {
+            const meta = q.metadata ? (typeof q.metadata === 'string' ? JSON.parse(q.metadata) : q.metadata) : {};
+            const correct = meta?.correctMap || {};
+            const student = JSON.parse(received || '{}');
+            const placements = student?.placements || {};
+            for (const aid of Object.keys(correct)) { max += 1; if (placements[aid] && String(placements[aid]) === String(correct[aid])) correctCount += 1; }
+            // Consider correct only if all matched; partial scoring can be added later
+            isCorrect = (max > 0 && correctCount === max);
+          } catch { isCorrect = false; }
         }
         if (isCorrect) {
           totalScore += parseFloat(q.points);
@@ -767,78 +801,140 @@ router.post('/sessions/:sessionId/submit',
   })
 );
 
-// GET /api/exams/sessions/:sessionId/results - Get exam results
-router.get('/sessions/:sessionId/results',
-  authMiddleware,
+// GET /api/exams/sessions/:sessionId/answers - Fetch saved answers so far (autosave retrieval)
+router.get('/sessions/:sessionId/answers', optionalAuth, asyncHandler(async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const r = await query(`
+    SELECT esa.question_id, esa.student_answer, eq.question_number
+    FROM exam_session_answers esa
+    JOIN exam_questions eq ON eq.id = esa.question_id
+    WHERE esa.session_id = $1
+  `, [sessionId]);
+  const answers: Record<string, any> = {};
+  r.rows.forEach((row: any) => {
+    let parsed: any = null; try { parsed = JSON.parse(row.student_answer || 'null'); } catch { parsed = row.student_answer; }
+    answers[row.question_id] = { questionId: row.question_id, answer: parsed, questionNumber: row.question_number };
+  });
+  res.json({ success: true, data: { answers } });
+}));
+
+// POST /api/exams/sessions/:sessionId/answers - Incremental autosave for answers
+router.post('/sessions/:sessionId/answers', optionalAuth, asyncHandler(async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const { answers } = req.body as { answers: Array<{ questionId: string; answer: any }> };
+  if (!Array.isArray(answers) || answers.length === 0) { res.json({ success: true, message: 'No changes' }); return; }
+  // Ensure session is active (pending/in_progress/expired allowed; block submitted)
+  const s = await query('SELECT id, status FROM exam_sessions WHERE id = $1', [sessionId]);
+  if (s.rowCount === 0) throw createNotFoundError('Exam session');
+  if (s.rows[0].status === 'submitted') throw new AppError('Session already submitted', 400);
+  for (const a of answers) {
+    await query(`
+      INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at)
+      VALUES ($1,$2,$3,CURRENT_TIMESTAMP)
+      ON CONFLICT (session_id, question_id)
+      DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP
+    `, [sessionId, a.questionId, JSON.stringify(a.answer)]);
+  }
+  res.json({ success: true, message: 'Answers saved' });
+}));
+
+// GET /api/exams/results/:ticketCode - Public endpoint for ticket-based result check
+router.get('/results/:ticketCode',
   asyncHandler(async (req: Request, res: Response) => {
-    const { sessionId } = req.params;
-    const userId = req.user!.id;
-
-    // Get session results
-    const sessionResult = await query(`
-  SELECT es.id, es.status, es.started_at, es.submitted_at, es.total_score,
-     es.percentage_score, es.is_passed, es.time_spent_seconds,
-     e.title as exam_title, e.exam_type, e.passing_score, e.duration_minutes, e.audio_url
+    const { ticketCode } = req.params;
+    const sess = await query(`
+      SELECT es.id, es.status, es.submitted_at, es.is_approved, es.total_score, es.percentage_score,
+             e.title as exam_title, e.duration_minutes, e.exam_type
       FROM exam_sessions es
+      JOIN tickets t ON es.ticket_id = t.id
       JOIN exams e ON es.exam_id = e.id
-      WHERE es.id = $1 AND es.user_id = $2 AND es.status = 'submitted'
-    `, [sessionId, userId]);
-
-    if (sessionResult.rows.length === 0) {
-      throw createNotFoundError('Exam results');
+      WHERE t.ticket_code = $1
+      ORDER BY es.submitted_at DESC NULLS LAST
+      LIMIT 1
+    `, [ticketCode.toUpperCase()]);
+    if (sess.rowCount === 0) {
+      return res.json({ success: true, data: { status: 'not_found' } });
     }
+    const s = sess.rows[0];
+    let state: 'pending'|'submitted'|'approved' = 'pending';
+    if (s.status === 'submitted') state = s.is_approved ? 'approved' : 'submitted';
 
-    const session = sessionResult.rows[0];
-
-    // Get detailed answers
-      const answersResult = await query(`
-        SELECT esa.question_id, esa.student_answer, esa.is_correct, esa.points_earned,
-               eq.question_text, eq.correct_answer, eq.explanation, eq.points, eq.metadata,
-               es.section_type, es.title as section_title
+    // Calculate per-section correct counts for reading/listening
+    let readingCorrect = 0; let readingTotal = 0;
+    let listeningCorrect = 0; let listeningTotal = 0;
+    try {
+      const counts = await query(`
+        SELECT esec.section_type, COUNT(*) AS total, SUM(CASE WHEN COALESCE(esa.is_correct,false) THEN 1 ELSE 0 END) AS correct
         FROM exam_session_answers esa
-        JOIN exam_questions eq ON esa.question_id = eq.id
-        JOIN exam_sections es ON eq.section_id = es.id
+        JOIN exam_questions eq ON eq.id = esa.question_id
+        JOIN exam_sections esec ON esec.id = eq.section_id
         WHERE esa.session_id = $1
-        ORDER BY es.section_order, eq.question_number
-      `, [sessionId]);
+        GROUP BY esec.section_type
+      `, [s.id]);
+      for (const r of counts.rows) {
+        if (r.section_type === 'reading') { readingTotal = Number(r.total||0); readingCorrect = Number(r.correct||0); }
+        if (r.section_type === 'listening') { listeningTotal = Number(r.total||0); listeningCorrect = Number(r.correct||0); }
+      }
+    } catch {}
 
-    const results = {
-      session: {
-        id: session.id,
-        status: session.status,
-        startedAt: session.started_at,
-        submittedAt: session.submitted_at,
-        totalScore: session.total_score,
-        percentageScore: session.percentage_score,
-        isPassed: session.is_passed,
-        timeSpentSeconds: session.time_spent_seconds
-      },
-      exam: {
-        title: session.exam_title,
-        type: session.exam_type,
-        passingScore: session.passing_score,
-        durationMinutes: session.duration_minutes,
-        audioUrl: session.audio_url
-      },
-      answers: answersResult.rows.map((answer: any) => ({
-        questionId: answer.question_id,
-        questionText: answer.question_text,
-        studentAnswer: JSON.parse(answer.student_answer || 'null'),
-        isCorrect: answer.is_correct,
-        pointsEarned: answer.points_earned,
-        maxPoints: answer.points,
-        correctAnswer: answer.correct_answer,
-        explanation: answer.explanation,
-        sectionType: answer.section_type,
-        sectionTitle: answer.section_title,
-        questionMetadata: (()=>{ try { return typeof answer.metadata === 'string' ? JSON.parse(answer.metadata) : answer.metadata; } catch { return null; } })()
-      }))
+    // Band calculators (IELTS style)
+    const listeningBandFromCorrect = (c: number): number => {
+      if (c >= 39) return 9.0; if (c >= 37) return 8.5; if (c >= 35) return 8.0; if (c >= 32) return 7.5; if (c >= 30) return 7.0;
+      if (c >= 26) return 6.5; if (c >= 23) return 6.0; if (c >= 18) return 5.5; if (c >= 16) return 5.0; if (c >= 13) return 4.5;
+      if (c >= 10) return 4.0; if (c >= 7) return 3.5; if (c >= 5) return 3.0; if (c >= 3) return 2.5; return 2.0;
+    };
+    const readingBandFromCorrect = (c: number, examType?: string): number => {
+      const acad = examType === 'academic';
+      if (acad) {
+        if (c >= 39) return 9.0; if (c >= 37) return 8.5; if (c >= 35) return 8.0; if (c >= 33) return 7.5; if (c >= 30) return 7.0;
+        if (c >= 27) return 6.5; if (c >= 23) return 6.0; if (c >= 19) return 5.5; if (c >= 15) return 5.0; if (c >= 13) return 4.5;
+        if (c >= 10) return 4.0; if (c >= 8) return 3.5; if (c >= 6) return 3.0; if (c >= 4) return 2.5; return 2.0;
+      } else {
+        if (c >= 40) return 9.0; if (c >= 39) return 8.5; if (c >= 37) return 8.0; if (c >= 36) return 7.5; if (c >= 34) return 7.0;
+        if (c >= 32) return 6.5; if (c >= 30) return 6.0; if (c >= 27) return 5.5; if (c >= 23) return 5.0; if (c >= 19) return 4.5;
+        if (c >= 15) return 4.0; if (c >= 12) return 3.5; if (c >= 9) return 3.0; if (c >= 6) return 2.5; return 2.0;
+      }
     };
 
-    res.json({
-      success: true,
-      data: { results }
-    });
+    const readingBand = readingTotal > 0 ? readingBandFromCorrect(readingCorrect, s.exam_type) : undefined;
+    const listeningBand = listeningTotal > 0 ? listeningBandFromCorrect(listeningCorrect) : undefined;
+
+    // Include writing feedback (teacher comments) when the session has been graded/approved
+    let writingFeedback: any[] | undefined = undefined;
+    if (state === 'approved') {
+      const wr = await query(`
+        SELECT eq.question_type, eq.question_text, esa.points_earned, esa.grader_comments
+        FROM exam_session_answers esa
+        JOIN exam_questions eq ON eq.id = esa.question_id
+        JOIN exam_sections esec ON esec.id = eq.section_id
+        WHERE esa.session_id = $1 AND esec.section_type = 'writing'
+        ORDER BY eq.question_type
+      `, [s.id]);
+      writingFeedback = wr.rows.map((r: any) => ({
+        type: r.question_type,
+        questionText: r.question_text,
+        band: r.points_earned,
+        comments: r.grader_comments
+      }));
+    }
+    res.json({ success: true, data: {
+      ticketCode: ticketCode.toUpperCase(),
+      status: state,
+      examTitle: s.exam_title,
+      submittedAt: s.submitted_at,
+      // keep totals for admin/debug, but clients shouldn't show percentage
+      totalScore: s.total_score,
+      percentageScore: s.percentage_score,
+      // new fields for public display
+      examType: s.exam_type,
+      readingCorrect,
+      readingTotal,
+      listeningCorrect,
+      listeningTotal,
+      readingBand,
+      listeningBand,
+      writingFeedback
+    }});
   })
 );
 

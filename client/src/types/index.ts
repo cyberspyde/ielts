@@ -67,7 +67,8 @@ export type QuestionType =
   | 'essay'
   | 'speaking'
   | 'drag_drop'
-  | 'speaking_task';
+  | 'speaking_task'
+  | 'image_labeling';
 
 export interface QuestionOption {
   id: string;

@@ -24,6 +24,8 @@ const ExamResults: React.FC = () => {
     // Expand simple_table aggregated cells for stats
     let totalQuestions = 0;
     let correctQuestions = 0;
+    let readingTotal = 0; let readingCorrect = 0;
+    let listeningTotal = 0; let listeningCorrect = 0;
     answers.forEach((a: any) => {
       const sa = a.studentAnswer;
       if (sa && typeof sa === 'object' && sa.type === 'simple_table') {
@@ -63,23 +65,118 @@ const ExamResults: React.FC = () => {
           });
           sa.graded = graded; // mutate local object for downstream use
         }
-        totalQuestions += (sa.graded?.length || 0);
-        correctQuestions += (sa.graded || []).filter((c: any) => c.isCorrect).length;
+        // Fallback: if any graded entry still contains multi-answer group separated by ';', expand to individual blanks
+        if (Array.isArray(sa.graded)) {
+          const expanded: any[] = [];
+          const norm = (v:any)=> String(v??'').trim().toLowerCase();
+          sa.graded.forEach((g:any) => {
+            if (g && typeof g.correctAnswer === 'string' && g.correctAnswer.includes(';') && !/_b\d+$/.test(g.key)) {
+              const parts = g.correctAnswer.split(';').map((p:string)=>p.trim()).filter(Boolean);
+              if (parts.length > 1) {
+                // Build student tokens attempts
+                let studentTokens: string[] = [];
+                if (typeof g.studentAnswer === 'string') {
+                  const attempts: string[][] = [g.studentAnswer.split(';'), g.studentAnswer.split(','), g.studentAnswer.split(/\s+/)];
+                  for (const t of attempts) { const cleaned = t.map((s:string)=>s.trim()).filter(Boolean); if (cleaned.length === parts.length) { studentTokens = cleaned; break; } }
+                  if (studentTokens.length === 0) {
+                    // Heuristic 1: all parts identical and studentAnswer is that token repeated
+                    const allSame = parts.every((p:string)=>p===parts[0]);
+                    if (allSame) {
+                      const token = parts[0];
+                      if (g.studentAnswer === token.repeat(parts.length)) {
+                        studentTokens = Array.from({length: parts.length}, ()=> token);
+                      }
+                    }
+                  }
+                  if (studentTokens.length === 0) {
+                    // Heuristic 2: concatenate parts equals studentAnswer (ordered) – slice by part lengths
+                    const totalLen = parts.reduce((acc:number,p:string)=>acc+p.length,0);
+                    if (g.studentAnswer.length === totalLen) {
+                      let offset = 0; const slices: string[] = [];
+                      for (const p of parts) { slices.push(g.studentAnswer.slice(offset, offset + p.length)); offset += p.length; }
+                      if (slices.join('') === g.studentAnswer) studentTokens = slices;
+                    }
+                  }
+                } else if (Array.isArray(g.studentAnswer)) {
+                  // Rare case: already array but not flattened; pad/truncate
+                  studentTokens = (g.studentAnswer as any[]).slice(0, parts.length).map(v=>String(v));
+                }
+                const baseNum = (typeof g.questionNumber === 'number') ? g.questionNumber : undefined;
+                parts.forEach((p: string, idx: number) => {
+                  const studentVal = studentTokens[idx] ?? (idx===0 ? g.studentAnswer : undefined);
+                  const variants = p.split('|').map((x:string)=>norm(x));
+                  const rec = norm(studentVal);
+                  let isCorrect = false;
+                  if (g.questionType === 'multiple_choice') {
+                    const got = rec.split('|').filter(Boolean); const uniq=(arr:string[])=>Array.from(new Set(arr)); const eU=uniq(variants); const gU=uniq(got); isCorrect = eU.length===gU.length && eU.every(v=>gU.includes(v));
+                  } else if (g.questionType === 'true_false') {
+                    const map:Record<string,string>={t:'true',f:'false',ng:'not given','notgiven':'not given'}; isCorrect = (map[rec]||rec)===(map[variants[0]]||variants[0]);
+                  } else {
+                    isCorrect = variants.includes(rec);
+                  }
+                  expanded.push({
+                    ...g,
+                    key: `${g.key}_b${idx}`,
+                    correctAnswer: p,
+                    studentAnswer: studentVal,
+                    isCorrect,
+                    questionNumber: baseNum !== undefined ? baseNum + idx : g.questionNumber
+                  });
+                });
+                return; // skip original aggregated entry
+              }
+            }
+            expanded.push(g);
+          });
+          sa.graded = expanded;
+        }
+        const counted = sa.graded?.length || 0;
+        const correct = (sa.graded || []).filter((c: any) => c.isCorrect).length;
+        totalQuestions += counted;
+        correctQuestions += correct;
+        if (a.sectionType === 'reading') { readingTotal += counted; readingCorrect += correct; }
+        if (a.sectionType === 'listening') { listeningTotal += counted; listeningCorrect += correct; }
       } else {
         totalQuestions += 1;
-        if (a.isCorrect) correctQuestions += 1;
+        const isC = !!a.isCorrect;
+        if (isC) correctQuestions += 1;
+        if (a.sectionType === 'reading') { readingTotal += 1; if (isC) readingCorrect += 1; }
+        if (a.sectionType === 'listening') { listeningTotal += 1; if (isC) listeningCorrect += 1; }
       }
     });
-    const overallPercent = typeof data.session?.percentageScore === 'number'
-      ? data.session.percentageScore
-      : (totalQuestions ? (correctQuestions / totalQuestions) * 100 : 0);
+    // IELTS band helpers
+    const listeningBandFromCorrect = (c: number): number => {
+      if (c >= 39) return 9.0; if (c >= 37) return 8.5; if (c >= 35) return 8.0; if (c >= 32) return 7.5; if (c >= 30) return 7.0;
+      if (c >= 26) return 6.5; if (c >= 23) return 6.0; if (c >= 18) return 5.5; if (c >= 16) return 5.0; if (c >= 13) return 4.5;
+      if (c >= 10) return 4.0; if (c >= 7) return 3.5; if (c >= 5) return 3.0; if (c >= 3) return 2.5; return 2.0;
+    };
+    const readingBandFromCorrect = (c: number, examType: string | undefined): number => {
+      const acad = examType === 'academic';
+      if (acad) {
+        if (c >= 39) return 9.0; if (c >= 37) return 8.5; if (c >= 35) return 8.0; if (c >= 33) return 7.5; if (c >= 30) return 7.0;
+        if (c >= 27) return 6.5; if (c >= 23) return 6.0; if (c >= 19) return 5.5; if (c >= 15) return 5.0; if (c >= 13) return 4.5;
+        if (c >= 10) return 4.0; if (c >= 8) return 3.5; if (c >= 6) return 3.0; if (c >= 4) return 2.5; return 2.0;
+      } else {
+        if (c >= 40) return 9.0; if (c >= 39) return 8.5; if (c >= 37) return 8.0; if (c >= 36) return 7.5; if (c >= 34) return 7.0;
+        if (c >= 32) return 6.5; if (c >= 30) return 6.0; if (c >= 27) return 5.5; if (c >= 23) return 5.0; if (c >= 19) return 4.5;
+        if (c >= 15) return 4.0; if (c >= 12) return 3.5; if (c >= 9) return 3.0; if (c >= 6) return 2.5; return 2.0;
+      }
+    };
+    const examType = data.exam?.type || data.session?.examType;
+    const readingBand = readingTotal > 0 ? readingBandFromCorrect(readingCorrect, examType) : undefined;
+    const listeningBand = listeningTotal > 0 ? listeningBandFromCorrect(listeningCorrect) : undefined;
     return {
       examTitle: data.exam?.title,
       completedAt: data.session?.submittedAt,
       durationMinutes: data.exam?.durationMinutes,
       totalQuestions,
       correctAnswers: correctQuestions,
-      percentage: overallPercent,
+      readingTotal,
+      readingCorrect,
+      listeningTotal,
+      listeningCorrect,
+      readingBand,
+      listeningBand,
       answers,
     };
   }, [data]);
@@ -149,74 +246,48 @@ const ExamResults: React.FC = () => {
             </div>
             <div className="flex items-center text-sm text-gray-600">
               <CheckCircle className="h-4 w-4 mr-2" />
-              <span>Correct: {view.correctAnswers} ({Math.round(view.percentage)}%)</span>
+              <span>Correct: {view.correctAnswers} / {view.totalQuestions}</span>
             </div>
           </div>
-          <div className="mt-4">
-            <button onClick={() => setShowDetails(!showDetails)} className="text-sm text-blue-600 hover:text-blue-500">
-              {showDetails ? 'Hide details' : 'Show details'}
-            </button>
+          {(view.listeningTotal || view.readingTotal) && (
+            <div className="mt-3 text-sm text-gray-800 space-y-1">
+              {view.listeningTotal ? (
+                <div>Listening: {view.listeningCorrect}/{view.listeningTotal}{typeof view.listeningBand === 'number' ? ` — Band ${view.listeningBand.toFixed(1)}` : ''}</div>
+              ) : null}
+              {view.readingTotal ? (
+                <div>Reading: {view.readingCorrect}/{view.readingTotal}{typeof view.readingBand === 'number' ? ` — Band ${view.readingBand.toFixed(1)}` : ''}</div>
+              ) : null}
+            </div>
+          )}
+          <div className="mt-4 flex items-center gap-3">
+            <button onClick={() => window.print()} className="text-sm text-blue-600 hover:text-blue-500">Print Session Details</button>
           </div>
         </div>
 
-        {showDetails && (
-          <div className="bg-white rounded-lg shadow-sm border p-6 mb-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-4">Answers</h3>
-            <div className="space-y-3">
-              {view.answers.map((a: any, idx: number) => (
-                <div key={idx} className="p-4 border border-gray-200 rounded">
-                  <div className="flex items-start justify-between">
-                    <div className="font-medium text-gray-900">Q{idx + 1}. {a.questionText}</div>
-                    {a.isCorrect ? <CheckCircle className="h-5 w-5 text-green-600" /> : <XCircle className="h-5 w-5 text-red-600" />}
-                  </div>
-                  <div className="mt-2 text-sm space-y-1">
-                    <div className="text-gray-600">Your answer: <span className="text-gray-900">{renderStudentAnswer(a.studentAnswer)}</span></div>
-                    {(() => {
-                      const sa = a.studentAnswer;
-                      if (sa && typeof sa === 'object' && sa.type === 'simple_table' && Array.isArray(sa.graded)) {
-                        return (
-                          <div className="mt-2">
-                            <div className="text-gray-700 font-medium text-xs mb-1">Simple Table Detail</div>
-                            <div className="overflow-auto">
-                              <table className="min-w-[400px] text-[11px] border border-gray-200">
-                                <thead>
-                                  <tr className="bg-gray-50">
-                                    <th className="px-2 py-1 border">Cell</th>
-                                    <th className="px-2 py-1 border">Type</th>
-                                    <th className="px-2 py-1 border">#</th>
-                                    <th className="px-2 py-1 border">Your Answer</th>
-                                    <th className="px-2 py-1 border">Correct</th>
-                                    <th className="px-2 py-1 border">Pts</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {sa.graded.map((g:any, i:number)=> (
-                                    <tr key={i} className={g.isCorrect ? 'bg-green-50' : 'bg-red-50'}>
-                                      <td className="px-2 py-1 border font-mono">{g.key}</td>
-                                      <td className="px-2 py-1 border">{labelForType(g.questionType)}</td>
-                                      <td className="px-2 py-1 border text-center">{g.questionNumber ?? '—'}</td>
-                                      <td className="px-2 py-1 border">{g.studentAnswer ?? '—'}</td>
-                                      <td className="px-2 py-1 border">{g.correctAnswer ?? '—'}</td>
-                                      <td className="px-2 py-1 border text-center">{g.isCorrect ? g.points : 0}/{g.points}</td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                          </div>
-                          </div>
-                        );
-                      }
-                      return <div className="text-gray-600">Correct answer: <span className="text-gray-900">{a.correctAnswer ?? '—'}</span></div>;
-                    })()}
-                  </div>
-                  {a.explanation && (
-                    <div className="mt-2 p-2 bg-blue-50 rounded text-sm text-blue-800">{a.explanation}</div>
-                  )}
+        {/* Print-only details (no correctness or correct answers on screen) */}
+        <div className="hidden print:block bg-white rounded-lg border p-6 mb-6">
+          <h3 className="text-lg font-semibold text-gray-900 mb-4">Session Details</h3>
+          <div className="space-y-3">
+            {(() => {
+              const items: { key: string; heading: string; a: any }[] = [];
+              let nextNumber = 1;
+              view.answers.forEach((a: any) => {
+                const sa = a.studentAnswer;
+                const explicit = a.questionMetadata?.questionNumber || a.questionNumber;
+                let displayNum: number;
+                if (typeof explicit === 'number' && explicit >= nextNumber) { displayNum = explicit; nextNumber = explicit + 1; }
+                else { displayNum = nextNumber; nextNumber += 1; }
+                items.push({ key: a.questionId, heading: `Q${displayNum}. ${a.questionText}`, a });
+              });
+              return items.map(({ key, heading, a }) => (
+                <div key={key} className="p-3 border border-gray-200 rounded">
+                  <div className="font-medium text-gray-900">{heading}</div>
+                  <div className="mt-1 text-sm text-gray-700">Your answer: <span className="text-gray-900">{renderStudentAnswer(a.studentAnswer)}</span></div>
                 </div>
-              ))}
-            </div>
+              ));
+            })()}
           </div>
-        )}
+        </div>
 
         <div className="flex items-center justify-center gap-3">
           <button onClick={() => navigate('/exams')} className="px-6 py-3 bg-blue-600 text-white rounded hover:bg-blue-700">Take Another Exam</button>

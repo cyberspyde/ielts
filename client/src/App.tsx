@@ -27,8 +27,8 @@ import AdminSessionResults from './pages/admin/AdminSessionResults';
 import { StudentDashboard } from './pages/student/Dashboard';
 import ExamList from './pages/student/ExamList';
 import ExamTaking from './pages/student/ExamTaking';
-import ExamResults from './pages/student/ExamResults';
 import { NotFoundPage } from './pages/NotFoundPage';
+import PublicResultCheck from './pages/student/PublicResultCheck';
 import TopNav from './components/ui/TopNav';
 import ErrorBoundary from './components/ui/ErrorBoundary';
 
@@ -116,11 +116,8 @@ function App() {
                   </ProtectedRoute>
                 } />
                 <Route path="/exam/:examId" element={<ExamTaking />} />
-                <Route path="/results/:sessionId" element={
-                  <ProtectedRoute>
-                    <ExamResults />
-                  </ProtectedRoute>
-                } />
+                {/* Public result check page for ticket codes */}
+                <Route path="/results" element={<PublicResultCheck />} />
                 
                 {/* Default redirects */}
                 <Route path="/" element={<Navigate to="/dashboard" replace />} />

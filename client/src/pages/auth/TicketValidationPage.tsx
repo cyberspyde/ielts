@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { yupResolver } from '@hookform/resolvers/yup';
 import * as yup from 'yup';
-import { Ticket, BookOpen, ArrowRight } from 'lucide-react';
+import { Ticket, BookOpen, ArrowRight, CheckCircle } from 'lucide-react';
 
 import { apiService } from '../../services/api';
 import type { TicketValidationForm } from '../../types';
@@ -97,6 +97,17 @@ export const TicketValidationPage: React.FC = () => {
           <p className="mt-2 text-sm text-gray-600">
             Enter your exam ticket code to access your test
           </p>
+        </div>
+
+        {/* Quick access to results */}
+        <div className="mt-4 flex items-center justify-center">
+          <button
+            type="button"
+            onClick={() => navigate(`/results${(document.getElementById('code') as HTMLInputElement | null)?.value ? `?code=${encodeURIComponent((document.getElementById('code') as HTMLInputElement).value)}` : ''}`)}
+            className="inline-flex items-center gap-2 text-sm text-green-700 border border-green-300 px-3 py-1.5 rounded hover:bg-green-50"
+          >
+            <CheckCircle className="h-4 w-4" /> Check Exam Results
+          </button>
         </div>
 
         {/* Ticket Validation Form */}

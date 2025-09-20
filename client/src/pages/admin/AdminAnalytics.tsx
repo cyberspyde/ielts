@@ -160,7 +160,7 @@ const AdminAnalytics: React.FC = () => {
         <div className="bg-white rounded-lg shadow-sm border p-6">
           <div className="flex items-center">
             <div className="p-2 bg-blue-100 rounded-lg">
-              <Users className="h-6 w-6 text-blue-600" />
+              <Users className="h-6 w-6" color="#2563eb" />
             </div>
             <div className="ml-4">
               <p className="text-sm font-medium text-gray-600">Total Students</p>
@@ -175,7 +175,7 @@ const AdminAnalytics: React.FC = () => {
         <div className="bg-white rounded-lg shadow-sm border p-6">
           <div className="flex items-center">
             <div className="p-2 bg-green-100 rounded-lg">
-              <BookOpen className="h-6 w-6 text-green-600" />
+              <BookOpen className="h-6 w-6" color="#16a34a" />
             </div>
             <div className="ml-4">
               <p className="text-sm font-medium text-gray-600">Total Exams</p>
@@ -190,7 +190,7 @@ const AdminAnalytics: React.FC = () => {
         <div className="bg-white rounded-lg shadow-sm border p-6">
           <div className="flex items-center">
             <div className="p-2 bg-yellow-100 rounded-lg">
-              <Clock className="h-6 w-6 text-yellow-600" />
+              <Clock className="h-6 w-6" color="#ca8a04" />
             </div>
             <div className="ml-4">
               <p className="text-sm font-medium text-gray-600">Exam Sessions</p>

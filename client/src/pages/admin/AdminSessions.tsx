@@ -28,15 +28,17 @@ const formatDuration = (sec: number | null | undefined) => {
 };
 
 const AdminSessions: React.FC = () => {
-  const [filters, setFilters] = useState({ examId: '', status: '', userId: '', search: '' });
+  const [filters, setFilters] = useState({ examId: '', status: 'submitted', userId: '', search: '' });
+  const [todayOnly, setTodayOnly] = useState(true);
   const [page, setPage] = useState(1);
 
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['admin-sessions', filters, page],
     queryFn: async () => {
       const params: any = { page, limit: 25 };
-      if (filters.examId) params.examId = filters.examId;
+      if (todayOnly) params.todayOnly = true;
       if (filters.status) params.status = filters.status;
+      if (filters.examId) params.examId = filters.examId;
       if (filters.userId) params.userId = filters.userId;
       const res = await apiService.get<any>('/admin/sessions', params);
       return res.data;
@@ -77,11 +79,11 @@ const AdminSessions: React.FC = () => {
           <p className="text-gray-600 text-sm">Includes ticket-based anonymous submissions</p>
         </div>
         <button onClick={() => refetch()} className="flex items-center px-3 py-2 text-sm bg-white border border-gray-300 rounded hover:bg-gray-50">
-          <RefreshCcw className={`h-4 w-4 mr-2 ${isFetching ? 'animate-spin' : ''}`} /> Refresh
+          <RefreshCcw className={`h-4 w-4 mr-2 text-gray-600 ${isFetching ? 'animate-spin' : ''}`} /> Refresh
         </button>
       </div>
 
-      <div className="bg-white border rounded-lg p-4 mb-6 grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="bg-white border rounded-lg p-4 mb-6 grid grid-cols-1 md:grid-cols-5 gap-4">
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
           <input
@@ -110,13 +112,16 @@ const AdminSessions: React.FC = () => {
             onChange={e => { setFilters(f => ({ ...f, userId: e.target.value })); setPage(1); }}
             className="px-3 py-2 border rounded text-sm"
         />
+        <label className="inline-flex items-center gap-2 text-sm text-gray-700">
+          <input type="checkbox" checked={todayOnly} onChange={e => { setTodayOnly(e.target.checked); setPage(1); }} /> Today only
+        </label>
       </div>
 
       <div className="bg-white border rounded-lg overflow-hidden">
         <table className="min-w-full text-sm">
           <thead className="bg-gray-50 text-gray-600">
             <tr>
-              <th className="px-3 py-2 text-left font-medium">Session</th>
+              <th className="px-3 py-2 text-left font-medium">When</th>
               <th className="px-3 py-2 text-left font-medium">Exam</th>
               <th className="px-3 py-2 text-left font-medium">User / Ticket</th>
               <th className="px-3 py-2 text-left font-medium">Score</th>
@@ -137,17 +142,23 @@ const AdminSessions: React.FC = () => {
             }).map(session => {
               return (
                 <tr key={session.id} className="border-t hover:bg-gray-50">
-                  <td className="px-3 py-2 font-mono text-xs">{session.id.slice(0,8)}…</td>
+                  <td className="px-3 py-2 text-xs text-gray-600">
+                    {session.submittedAt ? new Date(session.submittedAt).toLocaleString() : new Date(session.createdAt).toLocaleString()}
+                  </td>
                   <td className="px-3 py-2">
                     <div className="font-medium text-gray-900 line-clamp-1" title={session.exam.title}>{session.exam.title}</div>
                     <div className="text-[10px] text-gray-500 uppercase">{session.exam.type}</div>
                   </td>
                   <td className="px-3 py-2">
                     {session.user ? (
-                      <div className="flex items-center gap-1 text-gray-800"><User className="h-3 w-3" /> <span className="truncate max-w-[120px]" title={session.user.email}>{session.user.email}</span></div>
+                      <div className="flex items-center gap-1 text-gray-800"><User className="h-3 w-3" /> <span className="truncate max-w-[160px]" title={session.user.name}>{session.user.name}</span></div>
                     ) : session.ticketCode ? (
-                      <div className="flex items-center gap-1 text-gray-700"><Ticket className="h-3 w-3" /> <span className="font-mono text-xs" title={session.ticketCode}>{session.ticketCode}</span></div>
+                      <div className="flex items-center gap-1 text-gray-700"><Ticket className="h-3 w-3" /> <span className="truncate max-w-[160px]" title={session.ticketCode}>{session.ticketCode}</span></div>
                     ) : <span className="text-gray-400 italic">Unknown</span>}
+                    {/* show ticket assignee if exists */}
+                    {!session.user && session.ticketCode && (data?.sessions || []).length && (
+                      <div className="text-[11px] text-gray-500">{(data?.sessions || []).find(s=>s.id===session.id)?.ticketIssuedToName || ''}</div>
+                    )}
                   </td>
                   <td className="px-3 py-2">
                     {session.percentageScore != null && !isNaN(Number(session.percentageScore)) ? (

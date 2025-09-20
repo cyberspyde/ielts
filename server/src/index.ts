@@ -5,8 +5,6 @@ import express from 'express';
 
 import path from 'path';
 import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { connectDatabase, logger, closeConnections } from './config/database-no-redis';
@@ -24,37 +22,25 @@ export const app = express();
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST']
+    origin: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    credentials: true
   }
 });
 
-// Security middleware (allow cross-origin resource embedding for audio served from API origin)
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' },
-  crossOriginEmbedderPolicy: false
-}));
+// Open CORS for all origins and methods (development only)
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
-  credentials: true
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['*'],
+  exposedHeaders: ['*']
 }));
+// Ensure preflight requests are handled
+app.options('*', cors());
 
-// Rate limiting (can be disabled in dev by setting DISABLE_GLOBAL_RATE_LIMIT=1)
-const disableGlobal = process.env.DISABLE_GLOBAL_RATE_LIMIT === '1' || (process.env.NODE_ENV !== 'production' && process.env.DISABLE_GLOBAL_RATE_LIMIT !== '0');
-if (!disableGlobal) {
-  const limiter = rateLimit({
-    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000'), // 15 minutes
-    max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '1000'), // more generous default
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: {
-      error: 'Too many requests from this IP, please try again later.'
-    }
-  });
-  app.use(limiter);
-} else {
-  logger.info('Global rate limiter disabled for this environment');
-}
+// Rate limiting disabled for local development
+logger.info('Global rate limiter disabled for this environment');
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));

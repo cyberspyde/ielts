@@ -26,6 +26,7 @@ const TopNav: React.FC = () => {
                 <>
                   <Link to="/admin" className="text-gray-700 hover:text-gray-900">Admin</Link>
                   <Link to="/admin/sessions" className="text-gray-700 hover:text-gray-900">Sessions</Link>
+                  <Link to="/admin/tickets" className="text-gray-700 hover:text-gray-900">Tickets</Link>
                 </>
               )}
             </nav>

@@ -337,7 +337,7 @@ const AdminDashboard: React.FC = () => {
                 to="/admin/exams"
                 className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
               >
-                <BookOpen className="h-6 w-6 text-blue-600 mr-3" />
+                <BookOpen className="h-6 w-6 mr-3" color="#2563eb" />
                 <div>
                   <h3 className="text-sm font-medium text-gray-900">Manage Exams</h3>
                   <p className="text-xs text-gray-500">Create and edit exams</p>
@@ -348,7 +348,7 @@ const AdminDashboard: React.FC = () => {
                 to="/admin/students"
                 className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
               >
-                <Users className="h-6 w-6 text-green-600 mr-3" />
+                <Users className="h-6 w-6 mr-3" color="#16a34a" />
                 <div>
                   <h3 className="text-sm font-medium text-gray-900">Manage Students</h3>
                   <p className="text-xs text-gray-500">View student accounts</p>
@@ -359,7 +359,7 @@ const AdminDashboard: React.FC = () => {
                 to="/admin/tickets"
                 className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
               >
-                <Award className="h-6 w-6 text-yellow-600 mr-3" />
+                <Award className="h-6 w-6 mr-3" color="#ca8a04" />
                 <div>
                   <h3 className="text-sm font-medium text-gray-900">Manage Tickets</h3>
                   <p className="text-xs text-gray-500">Generate exam tickets</p>
@@ -370,7 +370,7 @@ const AdminDashboard: React.FC = () => {
                 to="/admin/analytics"
                 className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
               >
-                <BarChart3 className="h-6 w-6 text-purple-600 mr-3" />
+                <BarChart3 className="h-6 w-6 mr-3" color="#9333ea" />
                 <div>
                   <h3 className="text-sm font-medium text-gray-900">Analytics</h3>
                   <p className="text-xs text-gray-500">View detailed reports</p>

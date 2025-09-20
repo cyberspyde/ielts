@@ -897,11 +897,17 @@ const AdminExamEdit: React.FC = () => {
           </div>
         </div>
 
-        {/* Exam-level Listening Audio (centralized) */}
-        <div className="bg-white rounded-lg border p-6 mb-6">
-          <h3 className="text-sm font-medium text-gray-700 mb-3">Exam Listening Audio (single file for entire exam)</h3>
-          <ExamAudioManager exam={exam} apiOrigin={apiOrigin} onUpdate={(payload)=> updateExam.mutate(payload)} />
-        </div>
+        {/* Exam-level Listening Audio (centralized) - show only if at least one Listening section exists */}
+        {(() => {
+          const hasListening = (exam.sections || []).some((s: any) => s.sectionType === 'listening');
+          if (!hasListening) return null;
+          return (
+            <div className="bg-white rounded-lg border p-6 mb-6">
+              <h3 className="text-sm font-medium text-gray-700 mb-3">Exam Listening Audio (single file for entire exam)</h3>
+              <ExamAudioManager exam={exam} apiOrigin={apiOrigin} onUpdate={(payload)=> updateExam.mutate(payload)} />
+            </div>
+          );
+        })()}
 
         {/* Sections & Questions */}
         {exam.sections?.map((section: any) => (
@@ -931,6 +937,90 @@ const AdminExamEdit: React.FC = () => {
                 </div>
               )}
             </div>
+
+            {/* Writing Section: Two-part essay editors (Task 1 and Task 2). Hide normal range UI. */}
+            {section.sectionType === 'writing' && (
+              <div className="mb-6 border rounded bg-gray-50 p-4">
+                <div className="text-sm font-medium text-gray-700 mb-3">Writing Tasks</div>
+                {(() => {
+                  const qs = section.questions || [];
+                  const task1 = qs.find((q:any) => q.questionType === 'writing_task1');
+                  const task2 = qs.find((q:any) => q.questionType === 'essay');
+                  return (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="border rounded bg-white p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="text-sm font-medium text-gray-800">Task 1</div>
+                          {!task1 && (
+                            <button type="button" className="px-2 py-1 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'writing_task1', questionText: 'Writing Task 1', metadata: { variant: 'academic_report', minWords: 150, maxWords: 220, guidance: '' } })}>Create Task 1</button>
+                          )}
+                        </div>
+                        {task1 && (
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap gap-3 items-end">
+                              <label className="text-xs text-gray-700 flex flex-col gap-1">
+                                Variant
+                                <select defaultValue={task1.metadata?.variant || 'academic_report'} onChange={e=> updateQuestion.mutate({ questionId: task1.id, data: { metadata: { ...(task1.metadata||{}), variant: e.target.value } } })} className="rounded border-gray-300">
+                                  <option value="academic_report">Academic Report</option>
+                                  <option value="gt_letter">GT Letter</option>
+                                </select>
+                              </label>
+                              <label className="text-xs text-gray-700 flex flex-col gap-1">
+                                Min Words
+                                <input type="number" defaultValue={task1.metadata?.minWords || 150} onBlur={e=> updateQuestion.mutate({ questionId: task1.id, data: { metadata: { ...(task1.metadata||{}), minWords: Number(e.target.value)||150 } } })} className="rounded border-gray-300 px-2 py-1 w-24" />
+                              </label>
+                              <label className="text-xs text-gray-700 flex flex-col gap-1">
+                                Max Words
+                                <input type="number" defaultValue={task1.metadata?.maxWords || 220} onBlur={e=> updateQuestion.mutate({ questionId: task1.id, data: { metadata: { ...(task1.metadata||{}), maxWords: Number(e.target.value)||220 } } })} className="rounded border-gray-300 px-2 py-1 w-24" />
+                              </label>
+                            </div>
+                            <textarea defaultValue={task1.metadata?.guidance || ''} placeholder="Instructions / prompt" onBlur={e=> updateQuestion.mutate({ questionId: task1.id, data: { metadata: { ...(task1.metadata||{}), guidance: e.target.value } } })} className="w-full rounded border border-gray-300 text-sm p-2" rows={4} />
+                            <div className="flex flex-col gap-2">
+                              <label className="text-xs text-gray-700">Image URL (optional)</label>
+                              <input defaultValue={task1.imageUrl || ''} placeholder="/uploads/images/abc.png or https://..." onBlur={(e)=> updateQuestion.mutate({ questionId: task1.id, data: { imageUrl: e.target.value } })} className="rounded border-gray-300 px-2 py-1" />
+                              <input type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/gif" onChange={async (e)=> { const file = e.target.files?.[0]; if (!file) return; try { const res = await apiService.upload<{ imageUrl: string; absoluteUrl: string }>(`/admin/questions/${task1.id}/image`, file); const payload: any = (res?.data as any) || res; const imageUrl = payload?.imageUrl || payload?.data?.imageUrl || ''; updateQuestion.mutate({ questionId: task1.id, data: { imageUrl } }); toast.success('Image uploaded'); } catch { toast.error('Upload failed'); } }} className="rounded border-gray-300 px-2 py-1 w-full" />
+                              {task1.imageUrl && (
+                                <img src={task1.imageUrl.startsWith('http') ? task1.imageUrl : `${apiOrigin}${task1.imageUrl}`} alt="Task 1" className="max-h-32 rounded border" />
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="border rounded bg-white p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="text-sm font-medium text-gray-800">Task 2</div>
+                          {!task2 && (
+                            <button type="button" className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'essay', questionText: 'Writing Task 2', metadata: { writingPart: 2, guidance: '' } })}>Create Task 2</button>
+                          )}
+                        </div>
+                        {task2 && (
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap gap-3 items-end">
+                              <label className="text-xs text-gray-700 flex flex-col gap-1">
+                                Writing Part
+                                <select defaultValue={String(task2.metadata?.writingPart || 2)} onChange={e=> updateQuestion.mutate({ questionId: task2.id, data: { metadata: { ...(task2.metadata||{}), writingPart: Number(e.target.value) } } })} className="rounded border-gray-300">
+                                  <option value="1">Task 1</option>
+                                  <option value="2">Task 2</option>
+                                </select>
+                              </label>
+                            </div>
+                            <textarea defaultValue={task2.metadata?.guidance || ''} placeholder="Instructions / prompt" onBlur={e=> updateQuestion.mutate({ questionId: task2.id, data: { metadata: { ...(task2.metadata||{}), guidance: e.target.value } } })} className="w-full rounded border border-gray-300 text-sm p-2" rows={6} />
+                            <div className="flex flex-col gap-2">
+                              <label className="text-xs text-gray-700">Image URL (optional)</label>
+                              <input defaultValue={task2.imageUrl || ''} placeholder="/uploads/images/abc.png or https://..." onBlur={(e)=> updateQuestion.mutate({ questionId: task2.id, data: { imageUrl: e.target.value } })} className="rounded border-gray-300 px-2 py-1" />
+                              <input type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/gif" onChange={async (e)=> { const file = e.target.files?.[0]; if (!file) return; try { const res = await apiService.upload<{ imageUrl: string; absoluteUrl: string }>(`/admin/questions/${task2.id}/image`, file); const payload: any = (res?.data as any) || res; const imageUrl = payload?.imageUrl || payload?.data?.imageUrl || ''; updateQuestion.mutate({ questionId: task2.id, data: { imageUrl } }); toast.success('Image uploaded'); } catch { toast.error('Upload failed'); } }} className="rounded border-gray-300 px-2 py-1 w-full" />
+                              {task2.imageUrl && (
+                                <img src={task2.imageUrl.startsWith('http') ? task2.imageUrl : `${apiOrigin}${task2.imageUrl}`} alt="Task 2" className="max-h-32 rounded border" />
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
 
             {/* Simplified Table Editor */}
             {section.sectionType === 'listening' && (
@@ -982,7 +1072,8 @@ const AdminExamEdit: React.FC = () => {
               </div>
             )}
 
-            {/* Quick bulk question creator for this section */}
+            {/* Quick bulk question creator for this section (hidden for Writing sections) */}
+            {section.sectionType !== 'writing' && (
             <div className="mb-6 border rounded bg-gray-50 p-4">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-sm font-medium text-gray-700">Add Question Range</span>
@@ -1032,6 +1123,130 @@ const AdminExamEdit: React.FC = () => {
                 ); })()}
               </div>
               <div className="text-[11px] text-gray-500 mt-2">For drag & drop, Q start becomes group anchor; subsequent numbers become group items.</div>
+            </div>
+            )}
+
+            {/* Image Labeling (map/plan/diagram) */}
+            <div className="mb-6 border rounded bg-gray-50 p-4">
+              <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <span className="text-sm font-medium text-gray-700">Image Labeling (per-question anchors)</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="px-2 py-1 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
+                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_labeling', questionText: 'Label the indicated position', points: 1, metadata: { anchor: { x: 0.5, y: 0.5 } } })}
+                  >+ Add Image Label</button>
+                  <button
+                    type="button"
+                    className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50"
+                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_dnd', questionText: 'Drag the correct label to its position', points: 1, metadata: { anchors: [{ id: 'A', x: 0.5, y: 0.5 }], tokens: ['A'], correctMap: { A: 'A' } } })}
+                  >+ Add Image Drag/Drop</button>
+                </div>
+              </div>
+              {(() => {
+                const imageQs = (section.questions || []).filter((q:any)=> q.questionType === 'image_labeling' || q.questionType === 'image_dnd').sort((a:any,b:any)=> (a.questionNumber||0)-(b.questionNumber||0));
+                if (imageQs.length === 0) return <div className="text-[11px] text-gray-500 italic">No image labeling questions yet.</div>;
+                const sharedUrl = imageQs[0]?.imageUrl || '';
+                return (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
+                      <label className="text-xs text-gray-700 flex flex-col gap-1 md:col-span-3">
+                        Shared Image URL
+                        <input defaultValue={sharedUrl} placeholder="/uploads/images/plan.png or https://..." onBlur={(e)=> {
+                          const url = e.target.value;
+                          imageQs.forEach((q:any)=> updateQuestion.mutate({ questionId: q.id, data: { imageUrl: url } }));
+                        }} className="rounded border-gray-300 px-2 py-1" />
+                      </label>
+                      <label className="text-xs text-gray-700 flex flex-col gap-1 md:col-span-2">
+                        Upload Shared Image
+                        <input type="file" accept="image/png,image/jpeg,image/jpg,image/webp" onChange={async (e)=> {
+                          const file = e.target.files?.[0]; if (!file) return;
+                          try {
+                            const targetId = imageQs[0].id;
+                            const res = await apiService.upload<{ imageUrl: string; absoluteUrl: string }>(`/admin/questions/${targetId}/image`, file);
+                            const payload: any = (res?.data as any) || res; const imageUrl = payload?.imageUrl || payload?.data?.imageUrl || '';
+                            imageQs.forEach((q:any)=> updateQuestion.mutate({ questionId: q.id, data: { imageUrl } }));
+                            toast.success('Image uploaded');
+                          } catch { toast.error('Upload failed'); }
+                        }} className="rounded border-gray-300 px-2 py-1" />
+                      </label>
+                    </div>
+                    {sharedUrl && (
+                      <div className="relative inline-block border rounded overflow-hidden">
+                        <img src={sharedUrl.startsWith('http') ? sharedUrl : `${apiOrigin}${sharedUrl}`} alt="Labeling" className="max-h-72" id={`img-prev-${section.id}`} />
+                        {/* Anchor previews */}
+                        {imageQs.map((q:any)=>{
+                          const ax = q.questionType==='image_labeling' ? (q.metadata?.anchor?.x ?? 0.5) : ((q.metadata?.anchors?.[0]?.x) ?? 0.5);
+                          const ay = q.questionType==='image_labeling' ? (q.metadata?.anchor?.y ?? 0.5) : ((q.metadata?.anchors?.[0]?.y) ?? 0.5);
+                          return (
+                            <button key={`dot-${q.id}`} title={`Set anchor for Q${q.questionNumber||''}`}
+                              className="absolute w-3 h-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-blue-700 bg-blue-500/80 cursor-crosshair"
+                              style={{ left: `${ax*100}%`, top: `${ay*100}%` }}
+                              onClick={(e)=>{
+                                // Open modal overlay to pick coordinates visually
+                                const backdrop = document.createElement('div');
+                                backdrop.style.position='fixed';backdrop.style.inset='0';backdrop.style.background='rgba(30,30,30,0.6)';backdrop.style.zIndex='9999';
+                                const frame = document.createElement('div');
+                                frame.style.position='absolute';frame.style.top='50%';frame.style.left='50%';frame.style.transform='translate(-50%,-50%)';frame.style.background='#fff';frame.style.padding='8px';frame.style.borderRadius='8px';frame.style.boxShadow='0 10px 30px rgba(0,0,0,.3)';
+                                const img = document.createElement('img');
+                                img.src = sharedUrl.startsWith('http') ? sharedUrl : `${apiOrigin}${sharedUrl}`;
+                                img.style.maxHeight='70vh';img.style.maxWidth='80vw';img.style.display='block';
+                                img.style.cursor='crosshair';
+                                const hint = document.createElement('div');
+                                hint.textContent = 'Click on the image to set anchor. Press Esc or click outside to cancel.';
+                                hint.style.fontSize='12px';hint.style.margin='6px 0 4px';hint.style.color='#334155';
+                                frame.appendChild(img);frame.appendChild(hint);backdrop.appendChild(frame);document.body.appendChild(backdrop);
+                                const done = (x:number,y:number)=>{ 
+                                  let meta:any = { ...(q.metadata||{}) };
+                                  if (q.questionType==='image_labeling') meta.anchor = { x, y }; else {
+                                    const first = (meta.anchors && meta.anchors[0]) || { id: 'A' };
+                                    meta.anchors = [{ ...first, x, y }];
+                                    if (!meta.tokens) meta.tokens = [first.id];
+                                    if (!meta.correctMap) meta.correctMap = { [first.id]: first.id };
+                                  }
+                                  updateQuestion.mutate({ questionId: q.id, data: { metadata: meta } }); 
+                                  toast.success(`Anchor set for Q${q.questionNumber||''}`); document.body.removeChild(backdrop); };
+                                const clickHandler=(ev:MouseEvent)=>{ const rect = img.getBoundingClientRect(); const x = Math.min(1, Math.max(0, (ev.clientX - rect.left)/rect.width)); const y = Math.min(1, Math.max(0, (ev.clientY - rect.top)/rect.height)); done(x,y); };
+                                const keyHandler=(ev:KeyboardEvent)=>{ if(ev.key==='Escape'){ document.body.removeChild(backdrop);} };
+                                backdrop.addEventListener('click',(ev)=>{ if(ev.target===backdrop){ document.body.removeChild(backdrop);} });
+                                img.addEventListener('click', clickHandler, { once:true });
+                                window.addEventListener('keydown', keyHandler, { once:true });
+                              }}
+                            />
+                          );
+                        })}
+                      </div>
+                    )}
+                    <div className="space-y-2">
+                      {imageQs.map((q:any, idx:number)=> (
+                        <div key={q.id} className="p-2 rounded border bg-white flex flex-wrap gap-2 items-center">
+                          <div className="text-[11px] text-gray-500 w-12">Q{q.questionNumber||idx+1}</div>
+                          <input defaultValue={q.questionText||''} onBlur={(e)=> updateQuestion.mutate({ questionId: q.id, data: { questionText: e.target.value } })} className="flex-1 rounded border-gray-300 text-sm px-2 py-1" placeholder="Question text" />
+                          <label className="text-xs text-gray-700 flex items-center gap-1">
+                            X
+                            <input type="number" step="0.01" min={0} max={1} defaultValue={(q.questionType==='image_labeling'? q.metadata?.anchor?.x : q.metadata?.anchors?.[0]?.x) ?? 0.5} onBlur={(e)=>{ const x = Math.min(1, Math.max(0, Number(e.target.value)||0)); let meta:any = { ...(q.metadata||{}) }; if (q.questionType==='image_labeling') { meta.anchor = { x, y: meta.anchor?.y ?? 0.5 }; } else { const first = (meta.anchors && meta.anchors[0]) || { id: 'A', y: 0.5 }; meta.anchors = [{ ...first, x }]; } updateQuestion.mutate({ questionId: q.id, data: { metadata: meta } }); }} className="w-20 rounded border-gray-300 px-2 py-1" />
+                          </label>
+                          <label className="text-xs text-gray-700 flex items-center gap-1">
+                            Y
+                            <input type="number" step="0.01" min={0} max={1} defaultValue={(q.questionType==='image_labeling'? q.metadata?.anchor?.y : q.metadata?.anchors?.[0]?.y) ?? 0.5} onBlur={(e)=>{ const y = Math.min(1, Math.max(0, Number(e.target.value)||0)); let meta:any = { ...(q.metadata||{}) }; if (q.questionType==='image_labeling') { meta.anchor = { x: meta.anchor?.x ?? 0.5, y }; } else { const first = (meta.anchors && meta.anchors[0]) || { id: 'A', x: 0.5 }; meta.anchors = [{ ...first, y }]; } updateQuestion.mutate({ questionId: q.id, data: { metadata: meta } }); }} className="w-20 rounded border-gray-300 px-2 py-1" />
+                          </label>
+                          {q.questionType==='image_labeling' ? (
+                            <input defaultValue={q.correctAnswer||''} onBlur={(e)=> updateQuestion.mutate({ questionId: q.id, data: { correctAnswer: e.target.value } })} className="rounded border-gray-300 text-sm px-2 py-1" placeholder="Correct answer" />
+                          ) : (
+                            <div className="flex items-center gap-2 text-xs">
+                              <label className="flex items-center gap-1">Token
+                                <input defaultValue={q.metadata?.anchors?.[0]?.id || 'A'} onBlur={(e)=>{ let meta:any = { ...(q.metadata||{}) }; const first = (meta.anchors && meta.anchors[0]) || { x: 0.5, y: 0.5 }; const id = e.target.value || 'A'; meta.anchors = [{ ...first, id }]; meta.tokens = [id]; meta.correctMap = { [id]: id }; updateQuestion.mutate({ questionId: q.id, data: { metadata: meta } }); }} className="w-20 rounded border-gray-300 px-2 py-1" />
+                              </label>
+                            </div>
+                          )}
+                          <button className="px-2 py-1 text-xs border rounded text-red-600 border-red-300" onClick={()=> deleteQuestion.mutate({ questionId: q.id })}>Delete</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+              <div className="mt-2 text-[11px] text-gray-500">Tip: Click any dot, then click on the image to position the anchor precisely. X/Y are relative (0–1).</div>
             </div>
 
             {/* Import Headings for matching */}
@@ -1492,6 +1707,85 @@ const AdminExamEdit: React.FC = () => {
                                         >Make Group</button>
                                       );
                                     })()}
+                                        {/* Standalone (non-group) local options customization */}
+                                        {!q.metadata?.groupMemberOf && !q.metadata?.groupRangeEnd && (
+                                          <div className="flex items-start gap-1 flex-wrap mt-1">
+                                            {q.metadata?.customOptionsGroup ? (
+                                              <>
+                                                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-700" title="This question uses its own local options">Local opts</span>
+                                                <button
+                                                  type="button"
+                                                  className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
+                                                  onClick={() => toggleCustomOptionsForGroup(section, q, false)}
+                                                >Shared opts</button>
+                                                <button
+                                                  type="button"
+                                                  className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
+                                                  onClick={() => setOpenLocalOptions(prev => ({ ...prev, [q.id]: !prev[q.id] }))}
+                                                >{openLocalOptions[q.id] ? 'Hide' : 'Edit'} Local</button>
+                                              </>
+                                            ) : (
+                                              <button
+                                                type="button"
+                                                className="text-[10px] px-2 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-50"
+                                                onClick={() => toggleCustomOptionsForGroup(section, q, true)}
+                                              >Customize opts</button>
+                                            )}
+                                            {q.metadata?.customOptionsGroup && openLocalOptions[q.id] && (
+                                              <div className="w-full mt-2 bg-white border rounded p-2 text-[11px] space-y-1">
+                                                {(q.options || []).map((opt:any) => {
+                                                  const letter = opt.option_letter || opt.letter;
+                                                  return (
+                                                    <div key={opt.id || letter} className="flex items-center gap-2">
+                                                      <span className="w-5 text-gray-600 font-medium">{letter}</span>
+                                                      <input
+                                                        defaultValue={opt.option_text || opt.text || ''}
+                                                        placeholder={`Option ${letter}`}
+                                                        className="flex-1 border rounded px-2 py-1"
+                                                        onBlur={async (e) => {
+                                                          const value = e.target.value;
+                                                          if ((opt.option_text || opt.text || '') === value) return;
+                                                          await updateOption.mutateAsync({ optionId: opt.id, data: { optionText: value }, questionId: q.id });
+                                                        }}
+                                                      />
+                                                      <button
+                                                        type="button"
+                                                        className="text-[10px] px-1.5 py-0.5 border rounded border-red-300 text-red-600 hover:bg-red-50"
+                                                        title="Remove this option"
+                                                        onClick={async () => {
+                                                          if (!window.confirm(`Remove option ${letter}?`)) return;
+                                                          await deleteOption.mutateAsync({ optionId: opt.id, questionId: q.id });
+                                                          // Clean up correctAnswer if it referenced this letter
+                                                          if (q.correctAnswer) {
+                                                            if (q.metadata?.allowMultiSelect) {
+                                                              const parts = (q.correctAnswer || '').split('|').filter(Boolean);
+                                                              if (parts.includes(letter)) {
+                                                                const next = parts.filter((p:string)=>p!==letter).join('|');
+                                                                await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: next } });
+                                                              }
+                                                            } else if (q.correctAnswer === letter) {
+                                                              await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: '' } });
+                                                            }
+                                                          }
+                                                        }}
+                                                      >Del</button>
+                                                    </div>
+                                                  );
+                                                })}
+                                                <button
+                                                  type="button"
+                                                  className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
+                                                  onClick={async () => {
+                                                    const letters = (q.options || []).map((o:any)=>o.option_letter||o.letter).filter(Boolean);
+                                                    const nextLetter = computeNextLetter(letters);
+                                                    await createOption.mutateAsync({ questionId: q.id, optionText: `Option ${nextLetter}`, optionLetter: nextLetter, optionOrder: (q.options?.length||0)+1 });
+                                                  }}
+                                                >Add Opt</button>
+                                                <div className="text-[10px] text-gray-500">These options apply only to Question {q.questionNumber}.</div>
+                                              </div>
+                                            )}
+                                          </div>
+                                        )}
                                   </div>
                                 </div>
                               ))}
@@ -1879,6 +2173,8 @@ const AdminExamEdit: React.FC = () => {
                     <option value="fill_blank">Fill Blank</option>
                     <option value="matching">Matching</option>
                     <option value="drag_drop">Drag & Drop</option>
+                    <option value="essay">Essay</option>
+                    <option value="writing_task1">Writing Task 1</option>
                     <option value="simple_table">Simple Table</option>
                   </select>
                   <button className="text-xs px-2 py-1 border rounded" onClick={() => {
@@ -1928,6 +2224,67 @@ const AdminExamEdit: React.FC = () => {
                     <input type="number" step="0.5" defaultValue={q.points || 1} onChange={() => setStatus(q.id, 'dirty')} onBlur={(e) => { setStatus(q.id, 'saving'); updateQuestion.mutate({ questionId: q.id, data: { points: Number(e.target.value) } }); }} className="rounded-md border-gray-300" />
                     <input type="number" placeholder="Time (s)" defaultValue={q.timeLimitSeconds || ''} onChange={() => setStatus(q.id, 'dirty')} onBlur={(e) => { setStatus(q.id, 'saving'); updateQuestion.mutate({ questionId: q.id, data: { timeLimitSeconds: Number(e.target.value) } }); }} className="rounded-md border-gray-300" />
                     <input placeholder="Explanation (optional)" defaultValue={q.explanation || ''} onChange={() => setStatus(q.id, 'dirty')} onBlur={(e) => { setStatus(q.id, 'saving'); updateQuestion.mutate({ questionId: q.id, data: { explanation: e.target.value } }); }} className="md:col-span-6 rounded-md border-gray-300" />
+                    {(q.questionType === 'essay') && (
+                      <div className="md:col-span-6 bg-indigo-50 border border-indigo-200 rounded p-3 space-y-2">
+                        <div className="text-xs font-semibold text-indigo-700">Essay Settings</div>
+                        <div className="flex flex-wrap gap-4">
+                          <label className="text-xs text-indigo-800 flex flex-col gap-1">
+                            Writing Part
+                            <select
+                              defaultValue={String(q.metadata?.writingPart || 2)}
+                              onChange={(e)=> { setStatus(q.id,'saving'); updateQuestion.mutate({ questionId: q.id, data: { metadata: { ...(q.metadata||{}), writingPart: Number(e.target.value) } } }); }}
+                              className="border-indigo-300 rounded"
+                            >
+                              <option value="1">Task 1</option>
+                              <option value="2">Task 2</option>
+                            </select>
+                          </label>
+                          <label className="text-xs text-indigo-800 flex flex-col gap-1">
+                            Image URL (optional)
+                            <input
+                              defaultValue={q.imageUrl || ''}
+                              placeholder="/uploads/images/abc.png or https://..."
+                              onBlur={(e)=> { setStatus(q.id,'saving'); updateQuestion.mutate({ questionId: q.id, data: { imageUrl: e.target.value } }); }}
+                              className="border-indigo-300 rounded px-2 py-1 w-72"
+                            />
+                          </label>
+                          <label className="text-xs text-indigo-800 flex flex-col gap-1">
+                            Upload Image
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+                              onChange={async (e)=> {
+                                const file = e.target.files?.[0];
+                                if (!file) return;
+                                try {
+                                  setStatus(q.id, 'saving');
+                                  const res = await apiService.upload<{ imageUrl: string; absoluteUrl: string }>(`/admin/questions/${q.id}/image`, file);
+                                  const payload: any = (res?.data as any) || res;
+                                  const imageUrl = payload?.imageUrl || payload?.data?.imageUrl || '';
+                                  updateQuestion.mutate({ questionId: q.id, data: { imageUrl } });
+                                  toast.success('Image uploaded');
+                                } catch (err) {
+                                  toast.error('Upload failed');
+                                  setStatus(q.id, 'error');
+                                }
+                              }}
+                              className="border-indigo-300 rounded px-2 py-1 w-64"
+                            />
+                          </label>
+                        </div>
+                        {q.imageUrl && (
+                          <div className="flex items-center gap-3">
+                            <img
+                              src={q.imageUrl.startsWith('http') ? q.imageUrl : `${apiOrigin}${q.imageUrl}`}
+                              alt="Essay"
+                              className="max-h-28 rounded border"
+                            />
+                            <a href={q.imageUrl.startsWith('http') ? q.imageUrl : `${apiOrigin}${q.imageUrl}`} target="_blank" rel="noreferrer" className="text-xs text-blue-600 underline">Open image</a>
+                          </div>
+                        )}
+                        <textarea defaultValue={q.metadata?.guidance || ''} placeholder="Guidance / prompt (optional)" onBlur={e=> { setStatus(q.id,'saving'); updateQuestion.mutate({ questionId: q.id, data: { metadata: { ...(q.metadata||{}), guidance: e.target.value } } }); }} className="w-full border border-indigo-300 rounded p-2 text-xs" rows={3} />
+                      </div>
+                    )}
                     {(q.questionType === 'writing_task1') && (
                       <div className="md:col-span-6 bg-blue-50 border border-blue-200 rounded p-3 space-y-2">
                         <div className="text-xs font-semibold text-blue-700">Writing Task 1 Settings</div>

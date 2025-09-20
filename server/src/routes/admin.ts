@@ -33,6 +33,25 @@ const audioFilter: multer.Options['fileFilter'] = (req, file, cb) => {
 };
 const uploadAudio = multer({ storage: audioStorage, fileFilter: audioFilter, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB
 
+// File upload (images) setup
+const imageStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(uploadsRoot, 'images');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g,'_');
+    cb(null, `${Date.now()}_${base}${ext}`);
+  }
+});
+const imageFilter: multer.Options['fileFilter'] = (req, file, cb) => {
+  const allowed = ['image/png','image/jpeg','image/jpg','image/webp','image/gif'];
+  if (allowed.includes(file.mimetype)) cb(null, true); else cb(new AppError('Invalid image file type', 400));
+};
+const uploadImage = multer({ storage: imageStorage, fileFilter: imageFilter, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
+
 // POST /api/admin/sections/:sectionId/audio - upload or replace listening section audio
 // NOTE: Frontend sends the file under the key 'file' (apiService.upload). Accept that here.
 // Secure audio upload (auth first to avoid processing file for unauthenticated users)
@@ -68,6 +87,27 @@ router.post('/exams/:examId/audio', authMiddleware, requireRole(['admin','super_
   const absoluteUrl = `${req.protocol}://${req.get('host')}${publicPath}`;
   await logAdminAction(userId, 'UPLOAD_EXAM_AUDIO', 'exam', examId, { audio: publicPath, absoluteUrl });
   res.status(201).json({ success: true, message: 'Exam audio uploaded', data: { audioUrl: publicPath, absoluteUrl } });
+}));
+
+// POST /api/admin/questions/:questionId/image - upload and attach image to a question (image_url)
+router.post('/questions/:questionId/image', authMiddleware, requireRole(['admin','super_admin']), uploadImage.single('file'), asyncHandler(async (req: Request, res: Response) => {
+  const { questionId } = req.params;
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (!file) throw new AppError('Image file required', 400);
+  // Ensure question exists and get exam id via join for logging
+  const q = await query(`
+    SELECT q.id, q.section_id, s.exam_id
+    FROM exam_questions q
+    JOIN exam_sections s ON q.section_id = s.id
+    WHERE q.id = $1
+  `, [questionId]);
+  if (q.rowCount === 0) throw createNotFoundError('Question');
+  const publicPath = `/uploads/images/${path.basename(file.path)}`;
+  await query('UPDATE exam_questions SET image_url = $1 WHERE id = $2', [publicPath, questionId]);
+  const userId = (req.user && (req.user as any).id) || '00000000-0000-0000-0000-000000000000';
+  const absoluteUrl = `${req.protocol}://${req.get('host')}${publicPath}`;
+  await logAdminAction(userId, 'UPLOAD_QUESTION_IMAGE', 'exam', q.rows[0].exam_id, { questionId, image: publicPath, absoluteUrl });
+  res.status(201).json({ success: true, message: 'Image uploaded', data: { imageUrl: publicPath, absoluteUrl } });
 }));
 
 // All admin routes require authentication and admin role or higher
@@ -177,6 +217,84 @@ router.get('/dashboard',
     });
   })
 );
+
+// PATCH /api/admin/sessions/:sessionId/answers/:questionId/grade - grade a single answer
+router.patch('/sessions/:sessionId/answers/:questionId/grade',
+  body('pointsEarned').isFloat({ min: 0 }).withMessage('pointsEarned required'),
+  body('isCorrect').optional().isBoolean(),
+  body('comments').optional().isString(),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { sessionId, questionId } = req.params;
+    const { pointsEarned, isCorrect, comments } = req.body as { pointsEarned: number; isCorrect?: boolean; comments?: string };
+    const ans = await query('SELECT id FROM exam_session_answers WHERE session_id = $1 AND question_id = $2', [sessionId, questionId]);
+    if (ans.rowCount === 0) throw createNotFoundError('Answer');
+    await query(`UPDATE exam_session_answers SET points_earned = $1, graded_at = CURRENT_TIMESTAMP, graded_by = $2, grader_comments = COALESCE($3, grader_comments), is_correct = COALESCE($4, is_correct) WHERE session_id = $5 AND question_id = $6`, [pointsEarned, req.user!.id, comments || null, (typeof isCorrect === 'boolean' ? isCorrect : null), sessionId, questionId]);
+    res.json({ success: true, message: 'Answer graded' });
+  })
+);
+
+// POST /api/admin/sessions/:sessionId/recalculate - recompute totals after grading
+router.post('/sessions/:sessionId/recalculate', asyncHandler(async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  // Fetch passing score & exam id
+  const passRow = await query(`
+    SELECT e.id as exam_id, e.passing_score
+    FROM exam_sessions es
+    JOIN exams e ON e.id = es.exam_id
+    WHERE es.id = $1
+  `, [sessionId]);
+  if (passRow.rowCount === 0) throw createNotFoundError('Session');
+  const passingScore = parseFloat(passRow.rows[0].passing_score);
+
+  // Fetch all answers with context
+  const ansRows = await query(`
+    SELECT esa.points_earned, eq.points AS max_points, eq.question_type, eq.metadata, esec.section_type
+    FROM exam_session_answers esa
+    JOIN exam_questions eq ON eq.id = esa.question_id
+    JOIN exam_sections esec ON esec.id = eq.section_id
+    WHERE esa.session_id = $1
+  `, [sessionId]);
+
+  let totalScore = 0;
+  let percentageScore = 0;
+
+  // Special handling: Writing band = (Task1 + 2*Task2)/3 rounded to nearest 0.5
+  const writing = ansRows.rows.filter((r:any)=> r.section_type === 'writing');
+  if (writing.length > 0) {
+    let bandTask1 = 0;
+    let bandTask2 = 0;
+    for (const r of writing) {
+      const qType = r.question_type;
+      const pts = parseFloat(r.points_earned || 0);
+      if (qType === 'writing_task1') bandTask1 = Math.max(bandTask1, pts);
+      else if (qType === 'essay') bandTask2 = Math.max(bandTask2, pts);
+    }
+    const raw = (bandTask1 + 2 * bandTask2) / 3;
+    const rounded = Math.round(raw * 2) / 2; // nearest 0.5
+    totalScore = rounded;
+    percentageScore = (rounded / 9) * 100;
+  } else {
+    // Default: sum of earned points vs max points
+    let earned = 0; let max = 0;
+    for (const r of ansRows.rows) {
+      earned += parseFloat(r.points_earned || 0);
+      max += parseFloat(r.max_points || 0);
+    }
+    totalScore = earned;
+    percentageScore = max > 0 ? (earned / max) * 100 : 0;
+  }
+
+  const isPassed = percentageScore >= passingScore;
+  await query(`UPDATE exam_sessions SET total_score = $1, percentage_score = $2, is_passed = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`, [totalScore, percentageScore, isPassed, sessionId]);
+  res.json({ success: true, message: 'Recalculated', data: { totalScore, percentageScore, isPassed } });
+}));
+
+// POST /api/admin/sessions/:sessionId/approve - mark results as approved/publishable
+router.post('/sessions/:sessionId/approve', asyncHandler(async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  await query(`UPDATE exam_sessions SET is_approved = true, approved_at = CURRENT_TIMESTAMP, approved_by = $1 WHERE id = $2`, [req.user!.id, sessionId]);
+  res.json({ success: true, message: 'Results approved' });
+}));
 
 // ==========================
 // Exams Management (Admin)
@@ -340,7 +458,7 @@ router.delete('/sections/:sectionId', asyncHandler(async (req: Request, res: Res
 
 // PUT /api/admin/questions/:questionId - Update a question
 router.put('/questions/:questionId',
-  body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table']),
+  body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table','image_labeling','image_dnd']),
   body('questionText').optional().isString(),
   body('correctAnswer').optional().isString(),
   body('points').optional().isFloat({ min: 0 }),
@@ -374,7 +492,7 @@ router.put('/questions/:questionId',
 
 // POST /api/admin/sections/:sectionId/questions - Create a single question
 router.post('/sections/:sectionId/questions',
-  body('questionType').isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table']).withMessage('Invalid question type'),
+  body('questionType').isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table','image_labeling','image_dnd']).withMessage('Invalid question type'),
   body('questionText').optional().isString(),
   body('correctAnswer').optional().isString(),
   body('points').optional().isFloat({ min: 0 }),
@@ -609,6 +727,12 @@ router.post('/exams/:examId/questions/bulk',
             }
             metadata = { groupMemberOf: dragDropAnchorId };
           }
+        } else if (dbQuestionType === 'essay') {
+          // Auto-assign writing part for convenience when creating ranges: first -> part 1, second -> part 2
+          // If more than 2 created, fallback to part 1 for the rest; admins can adjust later.
+          const idxWithin = num - startNum; // 0-based
+          const part = idxWithin === 0 ? 1 : (idxWithin === 1 ? 2 : 1);
+          metadata = { ...(g.metadata || {}), writingPart: part };
         }
 
         const rQ = await query(`
@@ -953,6 +1077,7 @@ router.get('/tickets',
         t.id, t.ticket_code, t.status, t.valid_from, t.valid_until,
         t.max_uses, t.current_uses, t.issued_to_email, t.issued_to_name,
         t.created_at,
+        t.exam_id,
         e.title as exam_title, e.exam_type,
         u.email as created_by_email
       FROM tickets t
@@ -990,6 +1115,7 @@ router.get('/tickets',
         name: ticket.issued_to_name
       },
       exam: {
+        id: ticket.exam_id,
         title: ticket.exam_title,
         type: ticket.exam_type
       },
@@ -1089,7 +1215,8 @@ router.get('/sessions',
       limit = 20, 
       examId, 
       status,
-      userId
+      userId,
+      todayOnly
     } = req.query;
 
     const offset = (Number(page) - 1) * Number(limit);
@@ -1120,13 +1247,14 @@ router.get('/sessions',
         es.created_at,
         u.email as user_email, u.first_name, u.last_name,
         e.title as exam_title, e.exam_type,
-        t.ticket_code
+        t.ticket_code, t.issued_to_name, t.issued_to_email
       FROM exam_sessions es
       LEFT JOIN users u ON es.user_id = u.id
       JOIN exams e ON es.exam_id = e.id
       LEFT JOIN tickets t ON es.ticket_id = t.id
       ${whereClause}
-      ORDER BY es.created_at DESC
+      ${String(todayOnly) === 'true' ? " AND COALESCE(es.submitted_at, es.created_at) >= date_trunc('day', now()) AND COALESCE(es.submitted_at, es.created_at) < date_trunc('day', now()) + INTERVAL '1 day'" : ''}
+      ORDER BY COALESCE(es.submitted_at, es.created_at) DESC
       LIMIT $${paramCount++} OFFSET $${paramCount++}
     `;
 
@@ -1141,6 +1269,7 @@ router.get('/sessions',
       LEFT JOIN users u ON es.user_id = u.id
       JOIN exams e ON es.exam_id = e.id
       ${whereClause}
+      ${String(todayOnly) === 'true' ? " AND COALESCE(es.submitted_at, es.created_at) >= date_trunc('day', now()) AND COALESCE(es.submitted_at, es.created_at) < date_trunc('day', now()) + INTERVAL '1 day'" : ''}
     `;
     const countResult = await query(countQuery, queryParams.slice(0, -2));
 
@@ -1163,7 +1292,9 @@ router.get('/sessions',
         title: session.exam_title,
         type: session.exam_type
       },
-      ticketCode: session.ticket_code
+      ticketCode: session.ticket_code,
+      ticketIssuedToName: session.issued_to_name,
+      ticketIssuedToEmail: session.issued_to_email
     }));
 
     const totalCount = parseInt(countResult.rows[0].count);
@@ -1233,7 +1364,7 @@ router.get('/sessions/:sessionId/results',
              es.exam_id, es.ticket_id,
              e.title as exam_title, e.exam_type, e.passing_score, e.duration_minutes,
              u.email as user_email, u.first_name, u.last_name,
-             t.ticket_code
+             t.ticket_code, t.issued_to_name
       FROM exam_sessions es
       JOIN exams e ON es.exam_id = e.id
       LEFT JOIN users u ON es.user_id = u.id
@@ -1255,6 +1386,7 @@ router.get('/sessions/:sessionId/results',
     const answersResult = await query(`
       SELECT esa.question_id, esa.student_answer, esa.is_correct, esa.points_earned,
              eq.question_text, eq.correct_answer, eq.explanation, eq.points,
+             eq.metadata AS question_metadata,
              esec.section_type, esec.title as section_title, eq.question_number, eq.question_type
       FROM exam_session_answers esa
       JOIN exam_questions eq ON esa.question_id = eq.id
@@ -1271,6 +1403,7 @@ router.get('/sessions/:sessionId/results',
         questionNumber: row.question_number,
         questionType: row.question_type,
         questionText: row.question_text,
+        questionMetadata: row.question_metadata,
         studentAnswer: parsedStudent,
         isCorrect: row.is_correct,
         pointsEarned: row.points_earned,
@@ -1295,7 +1428,7 @@ router.get('/sessions/:sessionId/results',
             isPassed: session.is_passed,
             timeSpentSeconds: session.time_spent_seconds,
             ticketCode: session.ticket_code,
-            user: session.user_email ? { email: session.user_email, name: `${session.first_name} ${session.last_name}` } : null
+            user: session.user_email ? { email: session.user_email, name: `${session.first_name} ${session.last_name}` } : (session.issued_to_name ? { email: null, name: `${session.issued_to_name} (ticket)` } : null)
         },
         exam: {
           id: session.exam_id,
