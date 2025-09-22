@@ -6,6 +6,167 @@ import { authMiddleware, optionalAuth, requireRole, rateLimitByUser } from '../m
 
 const router = Router();
 
+const BUNDLE_SEQUENCE = [
+  { key: 'bundle_listening_exam_id', step: 'listening' as const },
+  { key: 'bundle_reading_exam_id', step: 'reading' as const },
+  { key: 'bundle_writing_exam_id', step: 'writing' as const },
+];
+
+type BundleStep = typeof BUNDLE_SEQUENCE[number]['step'];
+
+const buildBundleOrder = (examRow: any): Array<{ step: BundleStep; examId: string }> => {
+  if (!examRow || !examRow.is_composite) return [];
+  const order: Array<{ step: BundleStep; examId: string }> = [];
+  for (const entry of BUNDLE_SEQUENCE) {
+    const value = examRow[entry.key];
+    if (value) {
+      order.push({ step: entry.step, examId: value });
+    }
+  }
+  return order;
+};
+
+const DEFAULT_BUNDLE_DURATION: Record<BundleStep, number> = {
+  listening: 30,
+  reading: 60,
+  writing: 60,
+};
+
+const ACTIVE_BUNDLE_STATUSES = new Set(['pending', 'in_progress']);
+const COMPLETED_BUNDLE_STATUSES = new Set(['submitted', 'completed', 'approved']);
+
+const createBundleChildSession = async ({
+  req,
+  parentSessionId,
+  childExamId,
+  step,
+  userId,
+  ticketId,
+}: {
+  req: Request;
+  parentSessionId: string;
+  childExamId: string;
+  step: BundleStep;
+  userId: string | null;
+  ticketId: string | null;
+}) => {
+  const childExamResult = await query(
+    `SELECT id, title, duration_minutes, is_active FROM exams WHERE id = $1`,
+    [childExamId]
+  );
+  if (childExamResult.rowCount === 0) {
+    throw new AppError('Bundled exam not found', 400);
+  }
+  const childExam = childExamResult.rows[0];
+  if (childExam.is_active === false) {
+    throw new AppError('Bundled exam is inactive', 400);
+  }
+
+  const durationMinutes = Number(childExam.duration_minutes || 0) || DEFAULT_BUNDLE_DURATION[step];
+  const expiresAt = new Date(Date.now() + (durationMinutes * 60 * 1000) + (5 * 60 * 1000));
+  const browserInfo = {
+    userAgent: req.get('User-Agent'),
+    ip: req.ip,
+    timestamp: new Date().toISOString(),
+    bundle: {
+      parentSessionId,
+      step,
+    },
+  };
+
+  const childSessionResult = await query(
+    `INSERT INTO exam_sessions (
+        user_id, exam_id, ticket_id, status, started_at, expires_at, browser_info,
+        parent_session_id, bundle_step
+      ) VALUES ($1, $2, $3, 'in_progress', CURRENT_TIMESTAMP, $4, $5, $6, $7)
+      RETURNING id, exam_id, started_at, expires_at, bundle_step`,
+    [
+      userId,
+      childExamId,
+      ticketId,
+      expiresAt,
+      JSON.stringify(browserInfo),
+      parentSessionId,
+      step,
+    ]
+  );
+
+  return childSessionResult.rows[0];
+};
+
+const resolveBundleSession = async ({
+  req,
+  examRow,
+  parentSessionId,
+  userId,
+  ticketId,
+  createIfMissing = true,
+}: {
+  req: Request;
+  examRow: any;
+  parentSessionId: string;
+  userId: string | null;
+  ticketId: string | null;
+  createIfMissing?: boolean;
+}) => {
+  const bundleOrder = buildBundleOrder(examRow);
+  if (bundleOrder.length === 0) {
+    return { childSession: null, step: undefined, completed: true };
+  }
+
+  const childSessionsResult = await query(
+    `SELECT id, exam_id, status, bundle_step, started_at, expires_at
+       FROM exam_sessions
+       WHERE parent_session_id = $1
+       ORDER BY created_at ASC`,
+    [parentSessionId]
+  );
+  const childSessions = childSessionsResult.rows;
+
+  for (const entry of bundleOrder) {
+    const stepSessions = childSessions.filter((row: any) => row.bundle_step === entry.step);
+    const activeSession = stepSessions.find((row: any) => ACTIVE_BUNDLE_STATUSES.has(row.status));
+    if (activeSession) {
+      return { childSession: activeSession, step: entry.step, completed: false };
+    }
+
+    const hasSessions = stepSessions.length > 0;
+    if (!hasSessions) {
+      if (createIfMissing) {
+        const newSession = await createBundleChildSession({
+          req,
+          parentSessionId,
+          childExamId: entry.examId,
+          step: entry.step,
+          userId,
+          ticketId,
+        });
+        return { childSession: newSession, step: entry.step, completed: false };
+      }
+      continue;
+    }
+
+    const allCompleted = stepSessions.every((row: any) => COMPLETED_BUNDLE_STATUSES.has(row.status));
+    if (!allCompleted) {
+      if (createIfMissing) {
+        const newSession = await createBundleChildSession({
+          req,
+          parentSessionId,
+          childExamId: entry.examId,
+          step: entry.step,
+          userId,
+          ticketId,
+        });
+        return { childSession: newSession, step: entry.step, completed: false };
+      }
+      continue;
+    }
+    // Step completed; proceed to next
+  }
+
+  return { childSession: null, step: undefined, completed: true };
+};
+
 // Helper function to check validation errors
 const checkValidationErrors = (req: Request): void => {
   const errors = validationResult(req);
@@ -18,12 +179,18 @@ const checkValidationErrors = (req: Request): void => {
 router.get('/',
   optionalAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { page = 1, limit = 10, type, search } = req.query;
+    const { page = 1, limit = 10, type, search, tag } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
+    const normalizedTag = typeof tag === 'string' ? tag.trim().toLowerCase() : undefined;
 
     let whereClause = 'WHERE e.is_active = true';
     const queryParams = [];
     let paramCount = 1;
+
+    if (normalizedTag) {
+      whereClause += ` AND COALESCE(e.tags, '{}') @> ARRAY[$${paramCount++}]::text[]`;
+      queryParams.push(normalizedTag);
+    }
 
     // Filter by exam type
     if (type && ['academic', 'general_training'].includes(type as string)) {
@@ -39,13 +206,15 @@ router.get('/',
     const examsQuery = `
       SELECT 
         e.id, e.title, e.description, e.exam_type, e.duration_minutes,
-        e.passing_score, e.max_attempts, e.instructions, e.created_at,
+        e.passing_score, e.instructions, e.created_at, e.tags,
+        e.is_composite, e.bundle_listening_exam_id, e.bundle_reading_exam_id, e.bundle_writing_exam_id,
         COUNT(es.id) as section_count
       FROM exams e
       LEFT JOIN exam_sections es ON e.id = es.exam_id
       ${whereClause}
       GROUP BY e.id, e.title, e.description, e.exam_type, e.duration_minutes,
-               e.passing_score, e.max_attempts, e.instructions, e.created_at
+               e.passing_score, e.instructions, e.created_at, e.tags, e.is_composite,
+               e.bundle_listening_exam_id, e.bundle_reading_exam_id, e.bundle_writing_exam_id
       ORDER BY e.created_at DESC
       LIMIT $${paramCount++} OFFSET $${paramCount++}
     `;
@@ -68,9 +237,15 @@ router.get('/',
       description: exam.description,
       examType: exam.exam_type,
       durationMinutes: exam.duration_minutes,
-      passingScore: exam.passing_score,
-      maxAttempts: exam.max_attempts,
+  passingScore: exam.passing_score,
       instructions: exam.instructions,
+      tags: Array.isArray(exam.tags) ? exam.tags : [],
+      isComposite: !!exam.is_composite,
+      bundle: exam.is_composite ? {
+        listeningExamId: exam.bundle_listening_exam_id || null,
+        readingExamId: exam.bundle_reading_exam_id || null,
+        writingExamId: exam.bundle_writing_exam_id || null,
+      } : null,
       sectionCount: parseInt(exam.section_count),
       createdAt: exam.created_at
     }));
@@ -106,7 +281,8 @@ router.get('/:id',
     // Get exam details
     const examResult = await query(`
   SELECT id, title, description, exam_type, duration_minutes,
-     passing_score, max_attempts, instructions, audio_url, is_active, created_at
+     passing_score, instructions, audio_url, is_active, created_at, tags,
+     is_composite, bundle_listening_exam_id, bundle_reading_exam_id, bundle_writing_exam_id
       FROM exams 
       WHERE id = $1 AND is_active = true
     `, [id]);
@@ -116,6 +292,28 @@ router.get('/:id',
     }
 
     const exam = examResult.rows[0];
+
+
+    const bundleOrder = buildBundleOrder(exam);
+    let bundleChildren: Array<{ step: BundleStep; examId: string; title: string | null; examType: string | null; durationMinutes: number | null; tags: string[] }> | null = null;
+    if (bundleOrder.length) {
+      const childIds = bundleOrder.map((entry) => entry.examId);
+      const childRows = await query(
+        `SELECT id, title, exam_type, duration_minutes, tags FROM exams WHERE id = ANY($1::uuid[])`,
+        [childIds]
+      );
+      bundleChildren = bundleOrder.map((entry) => {
+        const child = childRows.rows.find((row: any) => row.id === entry.examId);
+        return {
+          step: entry.step,
+          examId: entry.examId,
+          title: child?.title || null,
+          examType: child?.exam_type || null,
+          durationMinutes: child ? Number(child.duration_minutes || 0) : null,
+          tags: child && Array.isArray(child.tags) ? child.tags : [],
+        };
+      });
+    }
 
     // Get sections
     let sectionsSql = `
@@ -249,8 +447,7 @@ router.get('/:id',
       const attemptsResult = await query(`
         SELECT COUNT(*) as attempt_count,
                MAX(total_score) as best_score,
-               MAX(percentage_score) as best_percentage,
-               MAX(CASE WHEN is_passed = true THEN 1 ELSE 0 END) as has_passed
+               MAX(percentage_score) as best_percentage
         FROM exam_sessions 
         WHERE user_id = $1 AND exam_id = $2 AND status = 'submitted'
       `, [req.user.id, id]);
@@ -261,8 +458,8 @@ router.get('/:id',
           attemptCount: parseInt(attempts.attempt_count),
           bestScore: attempts.best_score,
           bestPercentage: attempts.best_percentage,
-          hasPassed: attempts.has_passed === 1,
-          canAttempt: parseInt(attempts.attempt_count) < exam.max_attempts
+         // Single-attempt policy: only if no submitted attempts
+         canAttempt: parseInt(attempts.attempt_count) === 0
         };
       }
     }
@@ -273,11 +470,19 @@ router.get('/:id',
       description: exam.description,
       examType: exam.exam_type,
       durationMinutes: exam.duration_minutes,
-      passingScore: exam.passing_score,
-      maxAttempts: exam.max_attempts,
+  passingScore: exam.passing_score,
       instructions: exam.instructions,
       audioUrl: exam.audio_url,
       isActive: exam.is_active,
+      isComposite: !!exam.is_composite,
+      bundle: bundleOrder.length ? {
+        listeningExamId: exam.bundle_listening_exam_id || null,
+        readingExamId: exam.bundle_reading_exam_id || null,
+        writingExamId: exam.bundle_writing_exam_id || null,
+        order: bundleOrder,
+        children: bundleChildren,
+      } : null,
+      tags: Array.isArray(exam.tags) ? exam.tags : [],
       createdAt: exam.created_at,
       sections,
       userAttempts
@@ -300,7 +505,7 @@ router.post('/:id/start',
     .withMessage('Invalid ticket code'),
   body('section')
     .optional()
-    .isIn(['reading','listening','writing','speaking'])
+    .isIn(['reading', 'listening', 'writing', 'speaking'])
     .withMessage('Invalid section'),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
@@ -309,11 +514,12 @@ router.post('/:id/start',
     const { ticketCode, section } = req.body;
     const userId = req.user?.id || null;
 
-    // Verify exam exists and is active
     const examResult = await query(`
-      SELECT id, title, duration_minutes, max_attempts, is_active
-      FROM exams 
-      WHERE id = $1
+      SELECT id, title, duration_minutes, is_active,
+             is_composite,
+             bundle_listening_exam_id, bundle_reading_exam_id, bundle_writing_exam_id
+        FROM exams
+       WHERE id = $1
     `, [examId]);
 
     if (examResult.rows.length === 0) {
@@ -326,47 +532,117 @@ router.post('/:id/start',
       throw new AppError('Exam is not currently available', 400);
     }
 
-    // Removed max attempts restriction: students can start unlimited sessions
+    const bundleOrder = buildBundleOrder(exam);
+    if (exam.is_composite && bundleOrder.length === 0) {
+      throw new AppError('Composite exam is missing bundled sections', 400);
+    }
 
-    // Check for existing active session
-    if (userId) {
+  if (exam.is_composite && userId) {
+      const parentResult = await query(`
+        SELECT id, status, started_at, expires_at, ticket_id
+          FROM exam_sessions
+         WHERE exam_id = $1
+           AND user_id = $2
+           AND parent_session_id IS NULL
+           AND status IN ('pending','in_progress')
+           AND expires_at > CURRENT_TIMESTAMP
+        ORDER BY created_at DESC
+        LIMIT 1
+      `, [examId, userId]);
+
+      if (parentResult.rowCount > 0) {
+        const parentSession = parentResult.rows[0];
+        const resolution = await resolveBundleSession({
+          req,
+          examRow: exam,
+          parentSessionId: parentSession.id,
+          userId,
+          ticketId: parentSession.ticket_id,
+        });
+        if (resolution.completed) {
+          throw new AppError('You have already completed this full mock exam.', 400);
+        }
+        if (resolution.childSession) {
+          return res.status(200).json({
+            success: true,
+            message: 'Existing active session found',
+            data: {
+              sessionId: resolution.childSession.id,
+              examId: resolution.childSession.exam_id,
+              resumed: true,
+              startedAt: resolution.childSession.started_at,
+              expiresAt: resolution.childSession.expires_at,
+              bundle: {
+                parentSessionId: parentSession.id,
+                parentExamId: examId,
+                step: resolution.step,
+                order: bundleOrder,
+              },
+            },
+          });
+        }
+      }
+      // If no active parent to resume, block new attempt if any prior submitted child session exists
+      const prevChild = await query(`
+        SELECT 1 FROM exam_sessions
+         WHERE user_id = $1
+           AND parent_session_id IN (
+             SELECT id FROM exam_sessions WHERE exam_id = $2 AND user_id = $1 AND parent_session_id IS NULL
+           )
+           AND status = 'submitted'
+         LIMIT 1
+      `, [userId, examId]);
+      if (prevChild.rowCount > 0) {
+        throw new AppError('You have already completed this full mock exam.', 400);
+      }
+    }
+
+  if (!exam.is_composite && userId) {
       const activeSessionResult = await query(`
-        SELECT id, status, started_at FROM exam_sessions 
-        WHERE user_id = $1 AND exam_id = $2 AND status IN ('pending', 'in_progress')
-          AND expires_at > CURRENT_TIMESTAMP
+        SELECT id, status, started_at
+          FROM exam_sessions
+         WHERE user_id = $1
+           AND exam_id = $2
+           AND status IN ('pending', 'in_progress')
+           AND expires_at > CURRENT_TIMESTAMP
         ORDER BY created_at DESC
         LIMIT 1
       `, [userId, examId]);
 
       if (activeSessionResult.rows.length > 0) {
         const existing = activeSessionResult.rows[0];
-        // If still pending / not started, transition to in_progress & set started_at
         if (existing.status === 'pending' || !existing.started_at) {
           await query(`
             UPDATE exam_sessions
-            SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-                status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END
-            WHERE id = $1
+               SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                   status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END
+             WHERE id = $1
           `, [existing.id]);
           logger.info('Started previously pending session', { userId, examId, sessionId: existing.id });
         } else {
           logger.info('Existing in_progress session reused', { userId, examId, sessionId: existing.id });
         }
         return res.status(200).json({
-            success: true,
-            message: 'Existing active session found',
-            data: { sessionId: existing.id, examId, resumed: true }
+          success: true,
+          message: 'Existing active session found',
+          data: { sessionId: existing.id, examId, resumed: true },
         });
+      }
+      // Enforce single attempt for single-skill exams
+      const previousAttempt = await query(`
+        SELECT 1 FROM exam_sessions WHERE user_id = $1 AND exam_id = $2 AND status = 'submitted' LIMIT 1
+      `, [userId, examId]);
+      if (previousAttempt.rowCount > 0) {
+        throw new AppError('You have already completed this exam.', 400);
       }
     }
 
-    // Validate ticket if provided
-    let ticketId = null;
+    let ticketId: string | null = null;
     if (ticketCode) {
       const ticketResult = await query(`
         SELECT id, exam_id, max_uses, current_uses, status, valid_until
-        FROM tickets 
-        WHERE ticket_code = $1
+          FROM tickets
+         WHERE ticket_code = $1
       `, [ticketCode]);
 
       if (ticketResult.rows.length === 0) {
@@ -393,41 +669,98 @@ router.post('/:id/start',
 
       ticketId = ticket.id;
 
-      // Update ticket usage
       await query(`
-        UPDATE tickets 
-        SET current_uses = current_uses + 1 
-        WHERE id = $1
+        UPDATE tickets
+           SET current_uses = current_uses + 1
+         WHERE id = $1
       `, [ticketId]);
 
-      // Log ticket usage
       await query(`
         INSERT INTO ticket_usage (ticket_id, user_id, ip_address, user_agent)
         VALUES ($1, $2, $3, $4)
       `, [ticketId, userId, req.ip, req.get('User-Agent')]);
     }
 
-    // Create exam session (support section-only)
-  // Section-level duration deprecated; always use exam.duration_minutes
-  const effectiveMinutes = exam.duration_minutes;
+    const fallbackMinutes = exam.is_composite
+      ? bundleOrder.reduce((total, entry) => total + DEFAULT_BUNDLE_DURATION[entry.step], 0)
+      : 60;
+    const effectiveMinutes = Number(exam.duration_minutes) || fallbackMinutes;
     const sessionExpiresAt = new Date(Date.now() + (effectiveMinutes * 60 * 1000) + (5 * 60 * 1000));
+    const baseBrowserInfo = {
+      userAgent: req.get('User-Agent'),
+      ip: req.ip,
+      timestamp: new Date().toISOString(),
+      section: section || null,
+    };
+
+    if (exam.is_composite) {
+      const parentInsert = await query(`
+        INSERT INTO exam_sessions (
+          user_id, exam_id, ticket_id, status, started_at, expires_at, browser_info,
+          parent_session_id, bundle_step
+        ) VALUES ($1, $2, $3, 'in_progress', CURRENT_TIMESTAMP, $4, $5, $6, $7)
+        RETURNING id, started_at, expires_at, ticket_id
+      `, [
+        userId,
+        examId,
+        ticketId,
+        sessionExpiresAt,
+        JSON.stringify({ ...baseBrowserInfo, bundle: { type: 'parent' } }),
+        null,
+        null,
+      ]);
+      const parentSession = parentInsert.rows[0];
+      const resolution = await resolveBundleSession({
+        req,
+        examRow: exam,
+        parentSessionId: parentSession.id,
+        userId,
+        ticketId: parentSession.ticket_id,
+      });
+      if (resolution.completed || !resolution.childSession) {
+        throw new AppError('Failed to initialise full mock exam session', 500);
+      }
+
+      logger.info('Composite exam session created', {
+        userId,
+        parentExamId: examId,
+        parentSessionId: parentSession.id,
+        childSessionId: resolution.childSession.id,
+        step: resolution.step,
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: 'Exam session created successfully',
+        data: {
+          sessionId: resolution.childSession.id,
+          examId: resolution.childSession.exam_id,
+          startedAt: resolution.childSession.started_at,
+          expiresAt: resolution.childSession.expires_at,
+          bundle: {
+            parentSessionId: parentSession.id,
+            parentExamId: examId,
+            step: resolution.step,
+            order: bundleOrder,
+          },
+        },
+      });
+    }
 
     const sessionResult = await query(`
       INSERT INTO exam_sessions (
-        user_id, exam_id, ticket_id, status, started_at, expires_at, browser_info
-      ) VALUES ($1, $2, $3, 'in_progress', CURRENT_TIMESTAMP, $4, $5)
+        user_id, exam_id, ticket_id, status, started_at, expires_at, browser_info,
+        parent_session_id, bundle_step
+      ) VALUES ($1, $2, $3, 'in_progress', CURRENT_TIMESTAMP, $4, $5, $6, $7)
       RETURNING id, started_at, expires_at, created_at
     `, [
       userId,
       examId,
       ticketId,
       sessionExpiresAt,
-      JSON.stringify({
-        userAgent: req.get('User-Agent'),
-        ip: req.ip,
-        timestamp: new Date().toISOString(),
-        section: section || null
-      })
+      JSON.stringify(baseBrowserInfo),
+      null,
+      null,
     ]);
 
     const session = sessionResult.rows[0];
@@ -436,7 +769,7 @@ router.post('/:id/start',
       userId,
       examId,
       sessionId: session.id,
-      ticketCode: ticketCode || 'none'
+      ticketCode: ticketCode || 'none',
     });
 
     res.status(201).json({
@@ -447,11 +780,12 @@ router.post('/:id/start',
         examId,
         startedAt: session.started_at,
         expiresAt: session.expires_at,
-        createdAt: session.created_at
-      }
+        createdAt: session.created_at,
+      },
     });
   })
 );
+
 
 // POST /api/exams/sessions/:sessionId/submit - Submit exam answers
 router.post('/sessions/:sessionId/submit',
@@ -466,6 +800,7 @@ router.post('/sessions/:sessionId/submit',
     if (userId) {
       sessionResult = await query(`
         SELECT es.id, es.exam_id, es.status, es.expires_at, es.started_at, es.user_id, es.ticket_id,
+               es.parent_session_id, es.bundle_step,
                e.title as exam_title, e.passing_score
         FROM exam_sessions es
         JOIN exams e ON es.exam_id = e.id
@@ -475,6 +810,7 @@ router.post('/sessions/:sessionId/submit',
       // Allow only ticket-based sessions without user
       sessionResult = await query(`
         SELECT es.id, es.exam_id, es.status, es.expires_at, es.started_at, es.user_id, es.ticket_id,
+               es.parent_session_id, es.bundle_step,
                e.title as exam_title, e.passing_score
         FROM exam_sessions es
         JOIN exams e ON es.exam_id = e.id
@@ -759,9 +1095,8 @@ router.post('/sessions/:sessionId/submit',
       }
     }
 
-    // Calculate percentage and pass/fail
-    const percentageScore = maxPossibleScore > 0 ? (totalScore / maxPossibleScore) * 100 : 0;
-    const isPassed = percentageScore >= parseFloat(session.passing_score);
+  // Calculate percentage only (pass/fail deprecated)
+  const percentageScore = maxPossibleScore > 0 ? (totalScore / maxPossibleScore) * 100 : 0;
 
     // Calculate time spent
     const startedAt = session.started_at || new Date();
@@ -771,10 +1106,54 @@ router.post('/sessions/:sessionId/submit',
     await query(`
       UPDATE exam_sessions 
       SET status = 'submitted', submitted_at = CURRENT_TIMESTAMP, 
-          total_score = $1, percentage_score = $2, is_passed = $3,
-          time_spent_seconds = $4
-      WHERE id = $5
-    `, [totalScore, percentageScore, isPassed, timeSpentSeconds, sessionId]);
+          total_score = $1, percentage_score = $2, is_passed = NULL,
+          time_spent_seconds = $3
+      WHERE id = $4
+    `, [totalScore, percentageScore, timeSpentSeconds, sessionId]);
+
+    let bundleInfo: any = null;
+    if (session.parent_session_id) {
+      const parentResult = await query(`
+        SELECT id, exam_id, user_id, ticket_id
+          FROM exam_sessions
+         WHERE id = $1
+      `, [session.parent_session_id]);
+      if (parentResult.rowCount > 0) {
+        const parentSession = parentResult.rows[0];
+        const parentExamResult = await query(`
+          SELECT id, is_composite, bundle_listening_exam_id, bundle_reading_exam_id, bundle_writing_exam_id
+            FROM exams
+           WHERE id = $1
+        `, [parentSession.exam_id]);
+        if (parentExamResult.rowCount > 0) {
+          const parentExam = parentExamResult.rows[0];
+          const resolution = await resolveBundleSession({
+            req,
+            examRow: parentExam,
+            parentSessionId: parentSession.id,
+            userId: parentSession.user_id || null,
+            ticketId: parentSession.ticket_id,
+          });
+          if (resolution.completed) {
+            await query(`
+              UPDATE exam_sessions
+                 SET status = 'submitted', submitted_at = COALESCE(submitted_at, CURRENT_TIMESTAMP)
+               WHERE id = $1
+            `, [parentSession.id]);
+            bundleInfo = { completed: true, parentSessionId: parentSession.id };
+          } else if (resolution.childSession && resolution.childSession.id !== sessionId) {
+            bundleInfo = {
+              nextStep: resolution.step,
+              sessionId: resolution.childSession.id,
+              examId: resolution.childSession.exam_id,
+              parentSessionId: parentSession.id,
+              startedAt: resolution.childSession.started_at,
+              expiresAt: resolution.childSession.expires_at,
+            };
+          }
+        }
+      }
+    }
 
     logger.info('Exam submitted', {
       userId: userId || 'anonymous-ticket',
@@ -782,8 +1161,8 @@ router.post('/sessions/:sessionId/submit',
       examId: session.exam_id,
       totalScore,
       percentageScore,
-      isPassed,
-      timeSpentSeconds
+      timeSpentSeconds,
+      bundle: bundleInfo,
     });
 
     res.json({
@@ -793,9 +1172,9 @@ router.post('/sessions/:sessionId/submit',
         sessionId,
         totalScore,
         percentageScore,
-        isPassed,
         timeSpentSeconds,
-        examTitle: session.exam_title
+        examTitle: session.exam_title,
+        bundle: bundleInfo,
       }
     });
   })
@@ -896,11 +1275,15 @@ router.get('/results/:ticketCode',
       }
     };
 
-    const readingBand = readingTotal > 0 ? readingBandFromCorrect(readingCorrect, s.exam_type) : undefined;
-    const listeningBand = listeningTotal > 0 ? listeningBandFromCorrect(listeningCorrect) : undefined;
+  // Cap reading totals at 40 for IELTS scale consistency
+  const cappedReadingTotal = Math.min(readingTotal, 40);
+  const cappedReadingCorrect = Math.min(readingCorrect, cappedReadingTotal);
+  const readingBand = cappedReadingTotal > 0 ? readingBandFromCorrect(cappedReadingCorrect, s.exam_type) : undefined;
+  const listeningBand = listeningTotal > 0 ? listeningBandFromCorrect(listeningCorrect) : undefined;
 
-    // Include writing feedback (teacher comments) when the session has been graded/approved
+    // Include writing/speaking feedback (teacher comments) when the session has been graded/approved
     let writingFeedback: any[] | undefined = undefined;
+    let speakingFeedback: any[] | undefined = undefined;
     if (state === 'approved') {
       const wr = await query(`
         SELECT eq.question_type, eq.question_text, esa.points_earned, esa.grader_comments
@@ -911,6 +1294,21 @@ router.get('/results/:ticketCode',
         ORDER BY eq.question_type
       `, [s.id]);
       writingFeedback = wr.rows.map((r: any) => ({
+        type: r.question_type,
+        questionText: r.question_text,
+        band: r.points_earned,
+        comments: r.grader_comments
+      }));
+
+      const sp = await query(`
+        SELECT eq.question_type, eq.question_text, esa.points_earned, esa.grader_comments
+        FROM exam_session_answers esa
+        JOIN exam_questions eq ON eq.id = esa.question_id
+        JOIN exam_sections esec ON esec.id = eq.section_id
+        WHERE esa.session_id = $1 AND esec.section_type = 'speaking'
+        ORDER BY eq.question_type
+      `, [s.id]);
+      speakingFeedback = sp.rows.map((r: any) => ({
         type: r.question_type,
         questionText: r.question_text,
         band: r.points_earned,
@@ -927,13 +1325,14 @@ router.get('/results/:ticketCode',
       percentageScore: s.percentage_score,
       // new fields for public display
       examType: s.exam_type,
-      readingCorrect,
-      readingTotal,
+  readingCorrect: cappedReadingCorrect,
+  readingTotal: cappedReadingTotal,
       listeningCorrect,
       listeningTotal,
       readingBand,
       listeningBand,
-      writingFeedback
+      writingFeedback,
+      speakingFeedback
     }});
   })
 );
@@ -992,6 +1391,95 @@ router.delete('/sessions/:sessionId',
     }
 
     res.json({ success: true, message: 'Session discarded' });
+  })
+);
+
+// GET /api/exams/sessions/:sessionId/results - Authenticated student's view of their own session results
+router.get('/sessions/:sessionId/results',
+  authMiddleware,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { sessionId } = req.params;
+    const userId = req.user!.id;
+
+    // Fetch session and validate ownership
+    const sess = await query(`
+      SELECT es.id, es.user_id, es.exam_id, es.status, es.submitted_at, es.is_approved,
+             e.title as exam_title, e.exam_type, e.duration_minutes
+        FROM exam_sessions es
+        JOIN exams e ON e.id = es.exam_id
+       WHERE es.id = $1 AND es.user_id = $2
+    `, [sessionId, userId]);
+    if (sess.rowCount === 0) throw createNotFoundError('Exam session');
+    const s = sess.rows[0];
+    if (s.status !== 'submitted') throw new AppError('Session not yet submitted', 400);
+
+    // Answers view (no correct answers or explanations for students)
+    const answersResult = await query(`
+      SELECT eq.id as question_id,
+             esa.student_answer, esa.is_correct, esa.points_earned,
+             eq.question_text, eq.points, eq.metadata as question_metadata,
+             esec.section_type, esec.title as section_title,
+             eq.question_number, eq.question_type
+        FROM exam_questions eq
+        JOIN exam_sections esec ON eq.section_id = esec.id
+        LEFT JOIN exam_session_answers esa ON esa.question_id = eq.id AND esa.session_id = $1
+       WHERE esec.exam_id = $2
+       ORDER BY esec.section_order, eq.question_number
+    `, [sessionId, s.exam_id]);
+
+    const answers = answersResult.rows.map((row: any) => {
+      let parsedStudent: any = null; try { parsedStudent = JSON.parse(row.student_answer || 'null'); } catch { parsedStudent = row.student_answer; }
+      return {
+        questionId: row.question_id,
+        questionNumber: row.question_number,
+        questionType: row.question_type,
+        questionText: row.question_text,
+        questionMetadata: row.question_metadata,
+        studentAnswer: parsedStudent,
+        isCorrect: row.is_correct,
+        pointsEarned: row.points_earned,
+        maxPoints: row.points,
+        sectionType: row.section_type,
+        sectionTitle: row.section_title,
+      };
+    });
+
+    // Optional speaking feedback when approved
+    let speakingFeedback: any[] | undefined = undefined;
+    if (s.is_approved) {
+      const sp = await query(`
+        SELECT eq.question_type, eq.question_text, esa.points_earned, esa.grader_comments
+          FROM exam_session_answers esa
+          JOIN exam_questions eq ON eq.id = esa.question_id
+          JOIN exam_sections esec ON esec.id = eq.section_id
+         WHERE esa.session_id = $1 AND esec.section_type = 'speaking'
+         ORDER BY eq.question_type
+      `, [sessionId]);
+      speakingFeedback = sp.rows.map((r: any) => ({
+        type: r.question_type,
+        questionText: r.question_text,
+        band: r.points_earned,
+        comments: r.grader_comments,
+      }));
+    }
+
+    res.json({ success: true, data: {
+      results: {
+        exam: {
+          title: s.exam_title,
+          type: s.exam_type,
+          durationMinutes: s.duration_minutes,
+        },
+        session: {
+          id: s.id,
+          submittedAt: s.submitted_at,
+          examType: s.exam_type,
+          status: s.status,
+        },
+        answers,
+        speakingFeedback,
+      }
+    }});
   })
 );
 

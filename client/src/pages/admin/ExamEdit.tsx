@@ -704,6 +704,19 @@ const AdminExamEdit: React.FC = () => {
   const [openLocalOptions, setOpenLocalOptions] = useState<Record<string, boolean>>({});
   const [hideSharedOptions, setHideSharedOptions] = useState<Record<string, boolean>>({});
 
+  // Section type navigator (tabs) to reduce page length for full mock exams
+  const [activeSectionType, setActiveSectionType] = useState<string>('');
+  useEffect(() => {
+    if (!exam) return;
+    const types: string[] = Array.from(new Set((exam.sections || []).map((s: any) => s.sectionType))) as string[];
+    if (!types.length) return;
+    const prefOrder = ['listening','reading','writing','speaking'];
+    const sorted = types.sort((a: string, b: string) => (prefOrder.indexOf(a) - prefOrder.indexOf(b)));
+    if (!activeSectionType || !sorted.includes(activeSectionType)) {
+      setActiveSectionType(sorted[0] as string);
+    }
+  }, [exam?.sections]);
+
   const updateQuestion = useMutation({
     mutationFn: async ({ questionId, data }: { questionId: string; data: any }) => apiService.put(`/admin/questions/${questionId}`, data),
     onSuccess: (_res, vars) => { markSavedFor(vars.questionId); queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); },
@@ -852,13 +865,54 @@ const AdminExamEdit: React.FC = () => {
               <input defaultValue={exam.title} onBlur={(e) => updateExam.mutate({ title: e.target.value })} className="w-full rounded-md border-gray-300" />
             </div>
             <div>
-              <label className="block text-sm text-gray-600 mb-1">Duration (minutes)</label>
-              <input type="number" defaultValue={exam.durationMinutes} onBlur={(e) => updateExam.mutate({ durationMinutes: Number(e.target.value) })} className="w-full rounded-md border-gray-300" />
+              <label className="block text-sm text-gray-600 mb-1">Tag</label>
+              {(() => {
+                const current: string = (Array.isArray(exam.tags) && exam.tags[0]) || '';
+                const isPreset = current === 'full-mock' || current === 'one-skill';
+                const selection: 'full-mock' | 'one-skill' | 'custom' = isPreset ? (current as any) : 'custom';
+                const setTagPreset = (tag: 'full-mock' | 'one-skill') => updateExam.mutate({ tags: [tag] });
+                const setCustom = (val: string) => updateExam.mutate({ tags: [val] });
+                return (
+                  <div className="text-sm">
+                    <div className="flex items-center gap-3 mb-2">
+                      <label className="inline-flex items-center gap-2">
+                        <input type="radio" name="tag" value="full-mock" checked={selection==='full-mock'} onChange={(e)=>{ if(e.target.checked) setTagPreset('full-mock'); }} />
+                        <span>Full Mock</span>
+                      </label>
+                      <label className="inline-flex items-center gap-2">
+                        <input type="radio" name="tag" value="one-skill" checked={selection==='one-skill'} onChange={(e)=>{ if(e.target.checked) setTagPreset('one-skill'); }} />
+                        <span>One Skill</span>
+                      </label>
+                      <label className="inline-flex items-center gap-2">
+                        <input
+                          type="radio"
+                          name="tag"
+                          value="custom"
+                          checked={selection==='custom'}
+                          onChange={(e)=>{
+                            if (!e.target.checked) return;
+                            const currentVal = isPreset ? '' : current;
+                            const v = window.prompt('Enter custom tag', currentVal || '') || '';
+                            const tagVal = v.trim();
+                            if (tagVal) setCustom(tagVal);
+                          }}
+                        />
+                        <span>Custom</span>
+                      </label>
+                    </div>
+                    {selection==='custom' && (
+                      <input
+                        className="w-full rounded-md border-gray-300"
+                        placeholder="Enter custom tag (e.g., Peter)"
+                        defaultValue={isPreset ? '' : current}
+                        onBlur={(e)=> { const v = e.target.value.trim(); if (v) setCustom(v); }}
+                      />
+                    )}
+                  </div>
+                );
+              })()}
             </div>
-            <div>
-              <label className="block text-sm text-gray-600 mb-1">Passing Score</label>
-              <input type="number" step="0.5" defaultValue={exam.passingScore} onBlur={(e) => updateExam.mutate({ passingScore: Number(e.target.value) })} className="w-full rounded-md border-gray-300" />
-            </div>
+            {/* Passing Score removed per policy */}
             <div className="md:col-span-3">
               <label className="block text-sm text-gray-600 mb-1">Description</label>
               <textarea defaultValue={exam.description} onBlur={(e) => updateExam.mutate({ description: e.target.value })} className="w-full rounded-md border-gray-300" rows={3} />
@@ -866,41 +920,70 @@ const AdminExamEdit: React.FC = () => {
           </div>
         </div>
 
-        {/* Add Section */}
-        <div className="bg-white rounded-lg border p-6 mb-6">
-          <div className="text-sm font-semibold text-gray-900 mb-3">Add Section</div>
-          <div className="grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">Type</label>
-              <select className="rounded-md border-gray-300" value={newSection.sectionType} onChange={(e)=> setNewSection(s => ({ ...s, sectionType: e.target.value }))}>
-                <option value="listening">Listening</option>
-                <option value="reading">Reading</option>
-                <option value="writing">Writing</option>
-                <option value="speaking">Speaking</option>
-              </select>
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs text-gray-600 mb-1">Title (optional)</label>
-              <input className="rounded-md border-gray-300 w-full" value={newSection.title} placeholder="Auto if blank" onChange={(e)=> setNewSection(s => ({ ...s, title: e.target.value }))} />
-            </div>
-            {/* Removed per-section duration; global exam duration applies */}
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">Max Score</label>
-              <input type="number" step="0.5" className="rounded-md border-gray-300 w-full" value={newSection.maxScore} onChange={(e)=> setNewSection(s => ({ ...s, maxScore: Number(e.target.value)||0 }))} />
-            </div>
-            <div>
-              <button type="button" className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm disabled:opacity-50" disabled={createSection.isPending} onClick={() => {
-                const data = { sectionType: newSection.sectionType, title: newSection.title || newSection.sectionType.charAt(0).toUpperCase()+newSection.sectionType.slice(1), maxScore: newSection.maxScore || 9, sectionOrder: nextSectionOrder() };
-                createSection.mutate(data);
-              }}>{createSection.isPending ? 'Adding...' : 'Add Section'}</button>
+        {/* Add Section (hidden when full-mock) */}
+        {!(Array.isArray(exam.tags) && exam.tags.includes('full-mock')) && (
+          <div className="bg-white rounded-lg border p-6 mb-6">
+            <div className="text-sm font-semibold text-gray-900 mb-3">Add Section</div>
+            <div className="grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">Type</label>
+                <select className="rounded-md border-gray-300" value={newSection.sectionType} onChange={(e)=> setNewSection(s => ({ ...s, sectionType: e.target.value }))}>
+                  <option value="listening">Listening</option>
+                  <option value="reading">Reading</option>
+                  <option value="writing">Writing</option>
+                  <option value="speaking">Speaking</option>
+                </select>
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs text-gray-600 mb-1">Title (optional)</label>
+                <input className="rounded-md border-gray-300 w-full" value={newSection.title} placeholder="Auto if blank" onChange={(e)=> setNewSection(s => ({ ...s, title: e.target.value }))} />
+              </div>
+              {/* Removed per-section duration; global exam duration applies */}
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">Max Score</label>
+                <input type="number" step="0.5" className="rounded-md border-gray-300 w-full" value={newSection.maxScore} onChange={(e)=> setNewSection(s => ({ ...s, maxScore: Number(e.target.value)||0 }))} />
+              </div>
+              <div>
+                <button type="button" className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm disabled:opacity-50" disabled={createSection.isPending} onClick={() => {
+                  const data = { sectionType: newSection.sectionType, title: newSection.title || newSection.sectionType.charAt(0).toUpperCase()+newSection.sectionType.slice(1), maxScore: newSection.maxScore || 9, sectionOrder: nextSectionOrder() };
+                  createSection.mutate(data);
+                }}>{createSection.isPending ? 'Adding...' : 'Add Section'}</button>
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
-        {/* Exam-level Listening Audio (centralized) - show only if at least one Listening section exists */}
+        {/* Section Navigator (tabs) for composite exams */}
+        {(() => {
+          const types: string[] = Array.from(new Set((exam.sections || []).map((s: any) => s.sectionType))) as string[];
+          if (types.length <= 1) return null; // single-skill exams don't need tabs
+          const prefOrder = ['listening','reading','writing','speaking'];
+          const sorted = types.sort((a: string, b: string) => (prefOrder.indexOf(a) - prefOrder.indexOf(b)));
+          const counts: Record<string, number> = {};
+          (exam.sections || []).forEach((s: any) => { counts[s.sectionType] = (counts[s.sectionType] || 0) + 1; });
+          return (
+            <div className="bg-white rounded-lg border p-2 mb-6">
+              <div className="flex gap-2 flex-wrap">
+                {sorted.map((t: string) => (
+                  <button
+                    key={t as string}
+                    type="button"
+                    className={`px-3 py-1.5 text-sm rounded border ${activeSectionType === t ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700 hover:bg-gray-50'}`}
+                    onClick={() => setActiveSectionType(t as string)}
+                  >
+                    {(t as string).charAt(0).toUpperCase() + (t as string).slice(1)}
+                    <span className="ml-1 text-[11px] opacity-80">({counts[t as string] || 0})</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Exam-level Listening Audio (centralized) - show only when Listening tab active and at least one Listening section exists */}
         {(() => {
           const hasListening = (exam.sections || []).some((s: any) => s.sectionType === 'listening');
-          if (!hasListening) return null;
+          if (!hasListening || activeSectionType !== 'listening') return null;
           return (
             <div className="bg-white rounded-lg border p-6 mb-6">
               <h3 className="text-sm font-medium text-gray-700 mb-3">Exam Listening Audio (single file for entire exam)</h3>
@@ -910,7 +993,7 @@ const AdminExamEdit: React.FC = () => {
         })()}
 
         {/* Sections & Questions */}
-        {exam.sections?.map((section: any) => (
+        {exam.sections?.filter((s: any) => !activeSectionType || s.sectionType === activeSectionType).map((section: any) => (
           <div key={section.id} className="bg-white rounded-lg border p-6 mb-6">
             <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
               <div className="md:col-span-2">
@@ -927,7 +1010,7 @@ const AdminExamEdit: React.FC = () => {
                 <input type="number" defaultValue={section.sectionOrder} onBlur={(e) => updateSection.mutate({ sectionId: section.id, data: { sectionOrder: Number(e.target.value) } })} className="w-full rounded-md border-gray-300" />
               </div>
               <div className="flex items-end">
-                <button type="button" className="mt-5 px-3 py-1.5 text-xs rounded-md border border-red-300 text-red-600 hover:bg-red-50" onClick={() => openConfirm({ title: 'Delete Section', tone: 'danger', description: <>Delete section <strong>{section.title}</strong> and all its questions?</>, confirmText: 'Delete', onConfirm: () => deleteSection.mutate({ sectionId: section.id }) })}>Delete Section</button>
+                <button type="button" disabled={Array.isArray(exam.tags) && exam.tags.includes('full-mock')} className={`mt-5 px-3 py-1.5 text-xs rounded-md border ${Array.isArray(exam.tags) && exam.tags.includes('full-mock') ? 'border-gray-200 text-gray-400 cursor-not-allowed' : 'border-red-300 text-red-600 hover:bg-red-50'}`} onClick={() => openConfirm({ title: 'Delete Section', tone: 'danger', description: <>Delete section <strong>{section.title}</strong> and all its questions?</>, confirmText: 'Delete', onConfirm: () => deleteSection.mutate({ sectionId: section.id }) })}>Delete Section</button>
               </div>
               {/* Per-section listening audio UI removed; centralized at exam level */}
               {section.sectionType === 'reading' && (
@@ -1134,12 +1217,12 @@ const AdminExamEdit: React.FC = () => {
                   <button
                     type="button"
                     className="px-2 py-1 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
-                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_labeling', questionText: 'Label the indicated position', points: 1, metadata: { anchor: { x: 0.5, y: 0.5 } } })}
+                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_labeling', questionText: 'Label the indicated position', metadata: { anchor: { x: 0.5, y: 0.5 } } })}
                   >+ Add Image Label</button>
                   <button
                     type="button"
                     className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50"
-                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_dnd', questionText: 'Drag the correct label to its position', points: 1, metadata: { anchors: [{ id: 'A', x: 0.5, y: 0.5 }], tokens: ['A'], correctMap: { A: 'A' } } })}
+                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_dnd', questionText: 'Drag the correct label to its position', metadata: { anchors: [{ id: 'A', x: 0.5, y: 0.5 }], tokens: ['A'], correctMap: { A: 'A' } } })}
                   >+ Add Image Drag/Drop</button>
                 </div>
               </div>
@@ -1182,7 +1265,7 @@ const AdminExamEdit: React.FC = () => {
                             <button key={`dot-${q.id}`} title={`Set anchor for Q${q.questionNumber||''}`}
                               className="absolute w-3 h-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-blue-700 bg-blue-500/80 cursor-crosshair"
                               style={{ left: `${ax*100}%`, top: `${ay*100}%` }}
-                              onClick={(e)=>{
+                              onClick={() => {
                                 // Open modal overlay to pick coordinates visually
                                 const backdrop = document.createElement('div');
                                 backdrop.style.position='fixed';backdrop.style.inset='0';backdrop.style.background='rgba(30,30,30,0.6)';backdrop.style.zIndex='9999';

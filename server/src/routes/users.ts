@@ -364,9 +364,9 @@ router.get('/:id/exam-history',
 
     // Get exam sessions with exam details
     const sessionsResult = await query(`
-      SELECT 
-        es.id, es.status, es.started_at, es.submitted_at, es.total_score,
-        es.percentage_score, es.is_passed, es.time_spent_seconds,
+    SELECT 
+  es.id, es.status, es.started_at, es.submitted_at, es.total_score,
+  es.percentage_score, es.time_spent_seconds,
         e.title as exam_title, e.exam_type, e.duration_minutes
       FROM exam_sessions es
       JOIN exams e ON es.exam_id = e.id
@@ -388,7 +388,7 @@ router.get('/:id/exam-history',
       submittedAt: session.submitted_at,
       totalScore: session.total_score,
       percentageScore: session.percentage_score,
-      isPassed: session.is_passed,
+  // isPassed deprecated
       timeSpentSeconds: session.time_spent_seconds,
       exam: {
         title: session.exam_title,

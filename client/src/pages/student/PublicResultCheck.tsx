@@ -68,6 +68,20 @@ const PublicResultCheck: React.FC = () => {
                     </ul>
                   </div>
                 )}
+                {Array.isArray(result.speakingFeedback) && result.speakingFeedback.length > 0 && (
+                  <div className="mt-3">
+                    <div className="font-medium mb-1">Speaking Feedback</div>
+                    <ul className="space-y-2">
+                      {result.speakingFeedback.map((f:any, idx:number) => (
+                        <li key={idx} className="border rounded p-2">
+                          <div className="text-xs text-gray-600 mb-1">{f.type === 'speaking_task' ? 'Speaking Task' : (f.type || 'Speaking')} — Band: {f.band ?? '—'}</div>
+                          <div className="text-sm text-gray-800 mb-1">{f.questionText}</div>
+                          {f.comments && <div className="text-gray-800 whitespace-pre-wrap">{f.comments}</div>}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
             {result.error && <div className="text-red-600">{result.error}</div>}

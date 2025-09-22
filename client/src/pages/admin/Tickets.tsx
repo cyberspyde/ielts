@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'react-toastify';
@@ -7,10 +7,10 @@ import { apiService } from '../../services/api';
 const AdminTickets: React.FC = () => {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const [filters, setFilters] = useState({ search: '', status: 'all', page: 1, limit: 20 });
-  const [createForm, setCreateForm] = useState({ examId: '', quantity: 1, validUntil: '', maxUses: 1, issuedToEmail: '', issuedToName: '', notes: '' });
+  const [filters] = useState({ search: '', status: 'all', page: 1, limit: 20 });
+  const [createForm, setCreateForm] = useState({ examId: '', validUntil: '', issuedToName: '', notes: '', issuedToNamesText: '' });
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [inlineTickets, setInlineTickets] = useState<any[]>([]);
+  const [inlineTickets] = useState<any[]>([]);
 
   const { data, isLoading } = useQuery({
     queryKey: ['admin-tickets', filters],
@@ -35,15 +35,35 @@ const AdminTickets: React.FC = () => {
   const createMutation = useMutation({
     mutationFn: async () => {
       const payload: any = { ...createForm };
-      if (!payload.issuedToEmail) delete payload.issuedToEmail;
+      const names = (payload.issuedToNamesText || '')
+        .split(/\r?\n/)
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0);
+      delete payload.issuedToNamesText;
+      if (names.length > 0) {
+        payload.issuedToNames = names;
+        // issuedToName is irrelevant when bulk names provided
+        delete payload.issuedToName;
+      }
       if (!payload.issuedToName) delete payload.issuedToName;
       if (!payload.notes) delete payload.notes;
+      // Do not send quantity, issuedToEmail, or maxUses; server will default to 1 ticket when no names provided
+      delete payload.quantity;
+      delete payload.issuedToEmail;
+      delete payload.maxUses;
       const res = await apiService.post('/admin/tickets', payload);
       return res;
     },
-    onSuccess: () => {
+    onSuccess: (res: any) => {
       toast.success('Tickets created');
       queryClient.invalidateQueries({ queryKey: ['admin-tickets'] });
+      try {
+        const created = res?.data?.data?.tickets || [];
+        if (created.length > 0) {
+          sessionStorage.setItem('tickets-print', JSON.stringify(created));
+          navigate('/admin/tickets/print', { state: { tickets: created } });
+        }
+      } catch {}
     },
     onError: (e: any) => toast.error(e.message || 'Failed to create tickets')
   });
@@ -94,24 +114,18 @@ const AdminTickets: React.FC = () => {
               </div>
             </div>
             <div>
-              <label className="block text-xs text-gray-600 mb-1">Quantity</label>
-              <input type="number" min={1} className="w-full rounded-md border-gray-300" placeholder="Quantity" value={createForm.quantity} onChange={(e) => setCreateForm({ ...createForm, quantity: Number(e.target.value) })} />
-            </div>
-            <div>
               <label className="block text-xs text-gray-600 mb-1">Valid Until</label>
               <input type="datetime-local" className="w-full rounded-md border-gray-300" placeholder="Valid Until" value={createForm.validUntil} onChange={(e) => setCreateForm({ ...createForm, validUntil: e.target.value })} />
             </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">Max Uses</label>
-              <input type="number" min={1} className="w-full rounded-md border-gray-300" placeholder="Max Uses" value={createForm.maxUses} onChange={(e) => setCreateForm({ ...createForm, maxUses: Number(e.target.value) })} />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">Issued To Email (optional)</label>
-              <input className="w-full rounded-md border-gray-300" placeholder="Issued To Email (optional)" value={createForm.issuedToEmail} onChange={(e) => setCreateForm({ ...createForm, issuedToEmail: e.target.value })} />
-            </div>
+            {/* Max Uses removed: always 1 use per ticket (server-enforced) */}
             <div>
               <label className="block text-xs text-gray-600 mb-1">Issued To Name (optional)</label>
               <input className="w-full rounded-md border-gray-300" placeholder="Issued To Name (optional)" value={createForm.issuedToName} onChange={(e) => setCreateForm({ ...createForm, issuedToName: e.target.value })} />
+            </div>
+            <div className="md:col-span-3">
+              <label className="block text-xs text-gray-600 mb-1">Bulk Names (one per line, optional)</label>
+              <textarea className="w-full rounded-md border-gray-300 min-h-[96px]" placeholder="e.g.\nAlice Smith\nBob Khan\n..." value={createForm.issuedToNamesText} onChange={(e) => setCreateForm({ ...createForm, issuedToNamesText: e.target.value })} />
+              <div className="text-[11px] text-gray-500 mt-1">If provided, we’ll create one ticket per name and auto-open the print page.</div>
             </div>
             <div className="md:col-span-3">
               <label className="block text-xs text-gray-600 mb-1">Notes (optional)</label>
@@ -127,26 +141,27 @@ const AdminTickets: React.FC = () => {
 
         {/* Tickets List */}
         <div className="bg-white rounded-lg border">
-          <div className="px-4 py-3 border-b flex items-center justify-between">
-            <div className="grid grid-cols-12 text-xs font-medium text-gray-500 flex-1">
+          <div className="px-4 py-3 border-b">
+            <div className="grid grid-cols-12 text-xs font-medium text-gray-500">
               <div className="col-span-1">
                 <input type="checkbox" className="rounded" aria-label="Select all" checked={ticketsList.length>0 && selectedIds.length === ticketsList.length} onChange={toggleSelectAll} />
               </div>
               <div className="col-span-3">Code</div>
               <div className="col-span-3">Exam</div>
-              <div className="col-span-2">Status</div>
+              <div className="col-span-2">Issued To</div>
+              <div className="col-span-1">Status</div>
               <div className="col-span-1">Uses</div>
-              <div className="col-span-2 text-right">Valid</div>
+              <div className="col-span-1 text-right">Valid</div>
             </div>
-            <div className="ml-4">
-              <button
-                className="px-3 py-1.5 text-sm rounded border bg-blue-600 text-white disabled:opacity-50"
-                disabled={selectedIds.length === 0}
-                onClick={openPrintPreview}
-              >
-                Print Selected ({selectedIds.length})
-              </button>
-            </div>
+          </div>
+          <div className="px-4 py-3 flex justify-end">
+            <button
+              className="px-3 py-1.5 text-sm rounded border bg-blue-600 text-white disabled:opacity-50"
+              disabled={selectedIds.length === 0}
+              onClick={openPrintPreview}
+            >
+              Print Selected ({selectedIds.length})
+            </button>
           </div>
           {isLoading ? (
             <div className="p-6 text-center text-gray-500">Loading tickets…</div>
@@ -159,11 +174,12 @@ const AdminTickets: React.FC = () => {
                   </div>
                   <div className="col-span-3 font-mono">{t.code}</div>
                   <div className="col-span-3">{t.exam?.title}</div>
-                  <div className="col-span-2">
+                  <div className="col-span-2 truncate" title={t.issuedTo?.name || t.issuedTo?.email || ''}>{t.issuedTo?.name || t.issuedTo?.email || '—'}</div>
+                  <div className="col-span-1">
                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${t.status === 'active' ? 'bg-green-100 text-green-700' : t.status === 'used' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-700'}`}>{t.status}</span>
                   </div>
                   <div className="col-span-1">{t.currentUses}/{t.maxUses}</div>
-                  <div className="col-span-2 text-right">{new Date(t.validFrom || t.createdAt).toLocaleDateString()} → {t.validUntil ? new Date(t.validUntil).toLocaleDateString() : '—'}</div>
+                  <div className="col-span-1 text-right">{new Date(t.validFrom || t.createdAt).toLocaleDateString()} → {t.validUntil ? new Date(t.validUntil).toLocaleDateString() : '—'}</div>
                 </div>
               ))}
             </div>
@@ -188,7 +204,7 @@ const AdminTickets: React.FC = () => {
                         <div className="code">{t.code || t.ticket_code}</div>
                         <div className="details">
                           <div>Valid: {t.validFrom ? new Date(t.validFrom).toLocaleDateString() : new Date(t.createdAt).toLocaleDateString()} → {t.validUntil ? new Date(t.validUntil).toLocaleDateString() : '—'}</div>
-                          {t.issuedToName ? <div>Issued to: {t.issuedToName}</div> : null}
+                          {t.issuedTo?.name || t.issuedToName ? <div>Issued to: {t.issuedTo?.name || t.issuedToName}</div> : null}
                           <div>Use at: /ticket</div>
                         </div>
                       </div>

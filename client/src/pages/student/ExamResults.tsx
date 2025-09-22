@@ -1,13 +1,12 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Calendar, Clock, BookOpen, CheckCircle, XCircle } from 'lucide-react';
+import { Calendar, Clock, BookOpen, CheckCircle } from 'lucide-react';
 import { apiService } from '../../services/api';
 
 const ExamResults: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
-  const [showDetails, setShowDetails] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ['exam-results', sessionId],
@@ -21,6 +20,7 @@ const ExamResults: React.FC = () => {
   const view = useMemo(() => {
     if (!data) return null;
     const answers = data.answers || [];
+    const speakingFeedback = Array.isArray((data as any).speakingFeedback) ? (data as any).speakingFeedback : [];
     // Expand simple_table aggregated cells for stats
     let totalQuestions = 0;
     let correctQuestions = 0;
@@ -163,21 +163,25 @@ const ExamResults: React.FC = () => {
       }
     };
     const examType = data.exam?.type || data.session?.examType;
-    const readingBand = readingTotal > 0 ? readingBandFromCorrect(readingCorrect, examType) : undefined;
-    const listeningBand = listeningTotal > 0 ? listeningBandFromCorrect(listeningCorrect) : undefined;
+  // Cap reading totals at 40 for IELTS scale consistency
+  const cappedReadingTotal = Math.min(readingTotal, 40);
+  const cappedReadingCorrect = Math.min(readingCorrect, cappedReadingTotal);
+  const readingBand = cappedReadingTotal > 0 ? readingBandFromCorrect(cappedReadingCorrect, examType) : undefined;
+  const listeningBand = listeningTotal > 0 ? listeningBandFromCorrect(listeningCorrect) : undefined;
     return {
       examTitle: data.exam?.title,
       completedAt: data.session?.submittedAt,
       durationMinutes: data.exam?.durationMinutes,
       totalQuestions,
       correctAnswers: correctQuestions,
-      readingTotal,
-      readingCorrect,
+  readingTotal: cappedReadingTotal,
+  readingCorrect: cappedReadingCorrect,
       listeningTotal,
       listeningCorrect,
       readingBand,
       listeningBand,
       answers,
+      speakingFeedback,
     };
   }, [data]);
 
@@ -196,15 +200,7 @@ const ExamResults: React.FC = () => {
     return String(ans);
   };
 
-  const labelForType = (t: string) => {
-    switch (t) {
-      case 'fill_blank': return 'Fill Blank';
-      case 'multiple_choice': return 'MCQ';
-      case 'true_false': return 'T/F';
-      case 'short_answer': return 'Short Ans';
-      default: return t || '—';
-    }
-  };
+  // no-op helpers removed
 
   if (isLoading) {
     return (
@@ -264,6 +260,21 @@ const ExamResults: React.FC = () => {
           </div>
         </div>
 
+        {Array.isArray(view.speakingFeedback) && view.speakingFeedback.length > 0 && (
+          <div className="bg-white rounded-lg shadow-sm border p-6 mb-6">
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">Speaking Feedback</h3>
+            <ul className="space-y-2">
+              {view.speakingFeedback.map((f:any, idx:number) => (
+                <li key={idx} className="border rounded p-3">
+                  <div className="text-xs text-gray-600 mb-1">{f.type === 'speaking_task' ? 'Speaking Task' : (f.type || 'Speaking')} — Band: {f.band ?? '—'}</div>
+                  <div className="text-sm text-gray-800 mb-1">{f.questionText}</div>
+                  {f.comments && <div className="text-gray-800 whitespace-pre-wrap">{f.comments}</div>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {/* Print-only details (no correctness or correct answers on screen) */}
         <div className="hidden print:block bg-white rounded-lg border p-6 mb-6">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">Session Details</h3>
@@ -272,7 +283,6 @@ const ExamResults: React.FC = () => {
               const items: { key: string; heading: string; a: any }[] = [];
               let nextNumber = 1;
               view.answers.forEach((a: any) => {
-                const sa = a.studentAnswer;
                 const explicit = a.questionMetadata?.questionNumber || a.questionNumber;
                 let displayNum: number;
                 if (typeof explicit === 'number' && explicit >= nextNumber) { displayNum = explicit; nextNumber = explicit + 1; }

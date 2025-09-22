@@ -1,5 +1,5 @@
 import React from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Loader2, XCircle, Ticket, User, Calendar, Clock, BookOpen, CheckCircle } from 'lucide-react';
 import { apiService } from '../../services/api';
@@ -14,7 +14,7 @@ interface AdminSessionResultsData {
 
 const AdminSessionResults: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
-  const navigate = useNavigate();
+  // const navigate = useNavigate();
   const queryClient = useQueryClient();
 
   const { data, isLoading, error } = useQuery({
@@ -61,13 +61,7 @@ const AdminSessionResults: React.FC = () => {
       queryClient.invalidateQueries({ queryKey: ['admin-sessions'] });
     }
   });
-  const deleteSession = useMutation({
-    mutationFn: async ({ id, force }: { id: string; force?: boolean }) => apiService.delete(`/admin/sessions/${id}${force ? '?force=true' : ''}`),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['admin-sessions'] });
-      navigate('/admin/sessions');
-    }
-  });
+  // Delete removed per requirements (no destructive delete from results view)
 
   // Confirm dialog state
   const [dialog, setDialog] = React.useState<{ mode: 'stop' | 'delete'; open: boolean }>(() => ({ mode: 'stop', open: false }));
@@ -77,9 +71,6 @@ const AdminSessionResults: React.FC = () => {
     if (!data?.session || !sessionId) return;
     if (dialog.mode === 'stop') {
       stopSession.mutate(sessionId, { onSuccess: closeDialog });
-    } else {
-      const isSubmitted = data.session.status === 'submitted';
-      deleteSession.mutate({ id: sessionId, force: isSubmitted }, { onSuccess: closeDialog });
     }
   };
 
@@ -290,7 +281,10 @@ const AdminSessionResults: React.FC = () => {
     return { total, correct };
   };
   const { total: listeningTotal, correct: listeningCorrect } = computeSectionCounts('listening');
-  const { total: readingTotal, correct: readingCorrect } = computeSectionCounts('reading');
+  let { total: readingTotal, correct: readingCorrect } = computeSectionCounts('reading');
+  // Cap reading totals at 40
+  readingTotal = Math.min(readingTotal, 40);
+  readingCorrect = Math.min(readingCorrect, readingTotal);
   const overallTotal = (() => {
     let t = 0; (answers || []).forEach((a:any)=>{ const sa=a.studentAnswer; if (sa && typeof sa==='object' && sa.type==='simple_table') { const graded:any[]=Array.isArray(sa.graded)?sa.graded:[]; t+=graded.length; } else if (a.questionType==='fill_blank' && Array.isArray(sa)) { t += sa.length; } else { t+=1; } }); return t; })();
   const listeningBand = listeningTotal ? listeningBandFromCorrect(listeningCorrect) : null;
@@ -347,9 +341,17 @@ const AdminSessionResults: React.FC = () => {
             {canStop && (
               <button onClick={() => openDialog('stop')} className="px-3 py-1.5 text-xs border rounded text-amber-700 border-amber-300 hover:bg-amber-50">Stop</button>
             )}
-            <button onClick={() => openDialog('delete')} className="px-3 py-1.5 text-xs border rounded text-red-700 border-red-300 hover:bg-red-50">Remove</button>
-            <button onClick={() => recalc.mutate()} disabled={recalc.isPending} className="px-3 py-1.5 text-xs border rounded text-blue-700 border-blue-300 hover:bg-blue-50 disabled:opacity-50">{recalc.isPending ? 'Recalculating…' : 'Recalculate'}</button>
-            <button onClick={() => approve.mutate()} disabled={approve.isPending} className="px-3 py-1.5 text-xs border rounded text-green-700 border-green-300 hover:bg-green-50 disabled:opacity-50">{approve.isPending ? 'Approving…' : 'Approve'}</button>
+            {(() => {
+              // Only show Recalculate/Approve for sessions with writing/speaking items
+              const hasManual = (answers || []).some((a:any)=> ['writing_task1','essay','speaking','speaking_task'].includes(a.questionType));
+              if (!hasManual) return null;
+              return (
+                <>
+                  <button onClick={() => recalc.mutate()} disabled={recalc.isPending} className="px-3 py-1.5 text-xs border rounded text-blue-700 border-blue-300 hover:bg-blue-50 disabled:opacity-50">{recalc.isPending ? 'Recalculating…' : 'Recalculate'}</button>
+                  <button onClick={() => approve.mutate()} disabled={approve.isPending} className="px-3 py-1.5 text-xs border rounded text-green-700 border-green-300 hover:bg-green-50 disabled:opacity-50">{approve.isPending ? 'Approving…' : 'Approve'}</button>
+                </>
+              );
+            })()}
           </div>
           <div className="text-sm text-gray-500">Session ID</div>
           <div className="font-mono text-xs bg-gray-100 px-2 py-1 rounded">{session.id}</div>
@@ -368,9 +370,12 @@ const AdminSessionResults: React.FC = () => {
           <div className="text-xs text-gray-500">Duration: {exam.durationMinutes}m</div>
         </div>
         <div className="bg-white border rounded-lg p-4">
-          <div className="text-xs text-gray-500 mb-1">Status</div>
-          <div className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${session.isPassed ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-700'}`}>{session.isPassed ? 'PASSED' : 'NOT PASSED'}</div>
-          {session.ticketCode && <div className="mt-2 flex items-center text-xs text-gray-600"><Ticket className="h-3 w-3 mr-1" /> {session.ticketCode}</div>}
+          <div className="text-xs text-gray-500 mb-1">Ticket</div>
+          {session.ticketCode ? (
+            <div className="mt-0.5 flex items-center text-xs text-gray-600"><Ticket className="h-3 w-3 mr-1" /> {session.ticketCode}</div>
+          ) : (
+            <div className="text-sm italic text-gray-500">No ticket</div>
+          )}
         </div>
         <div className="bg-white border rounded-lg p-4">
           <div className="text-xs text-gray-500 mb-1">User</div>
@@ -568,6 +573,23 @@ const AdminSessionResults: React.FC = () => {
                           </form>
                         </div>
                       )}
+                      {/* Grading controls for speaking */}
+                      {(['speaking','speaking_task'].includes(a.questionType)) && (
+                        <div className="mt-3 p-3 bg-purple-50 border border-purple-200 rounded">
+                          <div className="text-xs font-semibold text-purple-800 mb-2">Grade Speaking</div>
+                          <form onSubmit={(e)=>{ e.preventDefault(); const form = e.currentTarget as HTMLFormElement; const fd = new FormData(form); const pts = parseFloat(String(fd.get('points')||'0'))||0; const comments = String(fd.get('comments')||''); gradeAnswer.mutate({ questionId: a.questionId, pointsEarned: pts, comments }, { onSuccess: ()=> recalc.mutate() }); }} className="flex flex-wrap items-end gap-2">
+                            <label className="text-xs text-purple-800 flex flex-col gap-1">
+                              Band (0-9, .5 increments)
+                              <input name="points" type="number" step="0.5" min={0} max={9} defaultValue={a.pointsEarned || 0} className="px-2 py-1 border border-purple-300 rounded w-24" />
+                            </label>
+                            <label className="text-xs text-purple-800 flex flex-col gap-1 flex-1 min-w-[220px]">
+                              Comments
+                              <input name="comments" type="text" defaultValue={''} className="px-2 py-1 border border-purple-300 rounded" />
+                            </label>
+                            <button type="submit" className="px-3 py-1.5 text-xs border border-purple-400 text-purple-800 rounded hover:bg-purple-100">Save Grade</button>
+                          </form>
+                        </div>
+                      )}
                     </div>
                     {a.explanation && (
                       <div className="mt-2 p-2 bg-blue-50 rounded text-sm text-blue-800">{a.explanation}</div>
@@ -591,7 +613,7 @@ const AdminSessionResults: React.FC = () => {
         confirmText={dialog.mode === 'stop' ? 'Stop Session' : 'Delete'}
         onCancel={closeDialog}
         onConfirm={confirmDialog}
-        loading={stopSession.isPending || deleteSession.isPending}
+        loading={stopSession.isPending}
       />
     </div>
   );

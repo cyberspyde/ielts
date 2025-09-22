@@ -326,59 +326,6 @@ const AdminDashboard: React.FC = () => {
           </div>
         </div>
 
-        {/* Quick Actions */}
-        <div className="mt-8 bg-white rounded-lg shadow">
-          <div className="px-6 py-4 border-b border-gray-200">
-            <h2 className="text-lg font-medium text-gray-900">Quick Actions</h2>
-          </div>
-          <div className="p-6">
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-              <Link
-                to="/admin/exams"
-                className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
-              >
-                <BookOpen className="h-6 w-6 mr-3" color="#2563eb" />
-                <div>
-                  <h3 className="text-sm font-medium text-gray-900">Manage Exams</h3>
-                  <p className="text-xs text-gray-500">Create and edit exams</p>
-                </div>
-              </Link>
-              
-              <Link
-                to="/admin/students"
-                className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
-              >
-                <Users className="h-6 w-6 mr-3" color="#16a34a" />
-                <div>
-                  <h3 className="text-sm font-medium text-gray-900">Manage Students</h3>
-                  <p className="text-xs text-gray-500">View student accounts</p>
-                </div>
-              </Link>
-              
-              <Link
-                to="/admin/tickets"
-                className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
-              >
-                <Award className="h-6 w-6 mr-3" color="#ca8a04" />
-                <div>
-                  <h3 className="text-sm font-medium text-gray-900">Manage Tickets</h3>
-                  <p className="text-xs text-gray-500">Generate exam tickets</p>
-                </div>
-              </Link>
-              
-              <Link
-                to="/admin/analytics"
-                className="flex items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-200"
-              >
-                <BarChart3 className="h-6 w-6 mr-3" color="#9333ea" />
-                <div>
-                  <h3 className="text-sm font-medium text-gray-900">Analytics</h3>
-                  <p className="text-xs text-gray-500">View detailed reports</p>
-                </div>
-              </Link>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   );

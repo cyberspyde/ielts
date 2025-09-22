@@ -12,7 +12,6 @@ interface AdminSession {
   submittedAt: string | null;
   totalScore: number | null;
   percentageScore: number | null;
-  isPassed: boolean | null;
   timeSpentSeconds: number | null;
   createdAt: string;
   ticketCode?: string | null;
@@ -157,7 +156,7 @@ const AdminSessions: React.FC = () => {
                     ) : <span className="text-gray-400 italic">Unknown</span>}
                     {/* show ticket assignee if exists */}
                     {!session.user && session.ticketCode && (data?.sessions || []).length && (
-                      <div className="text-[11px] text-gray-500">{(data?.sessions || []).find(s=>s.id===session.id)?.ticketIssuedToName || ''}</div>
+                      <div className="text-[11px] text-gray-500">{(data?.sessions || []).find((s: AdminSession)=>s.id===session.id)?.ticketIssuedToName || ''}</div>
                     )}
                   </td>
                   <td className="px-3 py-2">

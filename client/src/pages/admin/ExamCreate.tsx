@@ -10,10 +10,12 @@ type ExamPayload = {
   title: string;
   description?: string;
   examType: 'academic' | 'general_training';
+  // durationMinutes removed from UI/control; server derives based on sections
   durationMinutes: number;
+  // passingScore removed per requirements; keep in type for backward compatibility but do not render/edit
   passingScore?: number;
-  maxAttempts?: number;
   instructions?: string;
+  tags?: string[];
 };
 
 type SectionDraft = {
@@ -47,17 +49,25 @@ const AdminExamCreate: React.FC = () => {
     description: '',
     examType: 'academic',
     durationMinutes: 180,
-    passingScore: 6.5,
-    maxAttempts: 3,
     instructions: ''
   });
 
+  // Exam mode: Full Mock vs Single Skill
+  type ExamMode = 'full_mock' | 'single_skill';
+  const [mode, setMode] = useState<ExamMode>('full_mock');
+  const [singleSkill, setSingleSkill] = useState<'listening' | 'reading' | 'writing' | 'speaking'>('reading');
+  type ExamTag = 'full-mock' | 'one-skill' | 'custom';
+  const [selectedTag, setSelectedTag] = useState<ExamTag>('full-mock');
+  const [customTagText, setCustomTagText] = useState<string>('');
+
   // Step 2: sections preset (toggleable)
-  const [sections, setSections] = useState<SectionDraft[]>([
-    { sectionType: 'reading', title: 'Reading', maxScore: 9, sectionOrder: 1, defaultGroups: [] },
-    { sectionType: 'listening', title: 'Listening', maxScore: 9, sectionOrder: 2, defaultGroups: [] },
+  const defaultFullMock: SectionDraft[] = [
+    { sectionType: 'listening', title: 'Listening', maxScore: 9, sectionOrder: 1, defaultGroups: [] },
+    { sectionType: 'reading', title: 'Reading', maxScore: 9, sectionOrder: 2, defaultGroups: [] },
     { sectionType: 'writing', title: 'Writing', maxScore: 9, sectionOrder: 3, defaultGroups: [] },
-  ]);
+  ];
+  const makeSingleSkill = (skill: SectionDraft['sectionType']): SectionDraft[] => ([{ sectionType: skill, title: skill.charAt(0).toUpperCase() + skill.slice(1), maxScore: 9, sectionOrder: 1, defaultGroups: [] }]);
+  const [sections, setSections] = useState<SectionDraft[]>(defaultFullMock);
 
   // Per-section default groups are configured inline in each section
 
@@ -65,7 +75,17 @@ const AdminExamCreate: React.FC = () => {
   const createExamMutation = useMutation({
     mutationFn: async () => {
       // 1) Create exam
-      const examRes = await apiService.post<{ examId: string }>('/admin/exams', meta);
+      let tagToSend: string;
+      if (selectedTag === 'custom') {
+        const t = (customTagText || '').trim();
+        if (!t) {
+          throw new Error('Please enter a custom tag');
+        }
+        tagToSend = t;
+      } else {
+        tagToSend = selectedTag || (mode === 'full_mock' ? 'full-mock' : 'one-skill');
+      }
+      const examRes = await apiService.post<{ examId: string }>('/admin/exams', { ...meta, tags: [tagToSend] });
       if (!examRes.success || !examRes.data) throw new Error(examRes.message || 'Failed to create exam');
       const examId = (examRes.data as any).examId as string;
 
@@ -131,6 +151,55 @@ const AdminExamCreate: React.FC = () => {
           <div className="bg-white border border-gray-200 rounded-lg p-6">
             <h2 className="text-lg font-semibold text-gray-900 mb-4">Exam Details</h2>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="md:col-span-2">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Mode</label>
+                <div className="flex items-center gap-3">
+                  <label className="inline-flex items-center gap-2">
+                    <input type="radio" name="mode" value="full_mock" checked={mode==='full_mock'} onChange={()=>{ setMode('full_mock'); setSections(defaultFullMock); setSelectedTag('full-mock'); }} />
+                    <span>Full Mock (Listening + Reading + Writing)</span>
+                  </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input type="radio" name="mode" value="single_skill" checked={mode==='single_skill'} onChange={()=>{ setMode('single_skill'); setSections(makeSingleSkill(singleSkill)); setSelectedTag('one-skill'); }} />
+                    <span>Single Skill</span>
+                  </label>
+                  {mode==='single_skill' && (
+                    <select className="ml-2 rounded-md border-gray-300" value={singleSkill} onChange={(e)=>{ const skill = e.target.value as any; setSingleSkill(skill); setSections(makeSingleSkill(skill)); }}>
+                      <option value="listening">Listening</option>
+                      <option value="reading">Reading</option>
+                      <option value="writing">Writing</option>
+                      <option value="speaking">Speaking</option>
+                    </select>
+                  )}
+                </div>
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Tag</label>
+                <div className="flex items-center gap-4">
+                  <label className="inline-flex items-center gap-2">
+                    <input type="radio" name="tag" value="full-mock" checked={selectedTag==='full-mock'} onChange={()=> setSelectedTag('full-mock')} />
+                    <span>Full Mock</span>
+                  </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input type="radio" name="tag" value="one-skill" checked={selectedTag==='one-skill'} onChange={()=> setSelectedTag('one-skill')} />
+                    <span>One Skill</span>
+                  </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input type="radio" name="tag" value="custom" checked={selectedTag==='custom'} onChange={()=> setSelectedTag('custom')} />
+                    <span>Custom</span>
+                  </label>
+                </div>
+                {selectedTag==='custom' && (
+                  <div className="mt-2">
+                    <input
+                      className="w-full rounded-md border-gray-300"
+                      placeholder="Enter custom tag (e.g., Peter)"
+                      value={customTagText}
+                      onChange={(e)=> setCustomTagText(e.target.value)}
+                    />
+                    <div className="text-[11px] text-gray-500 mt-1">This tag will be saved and searchable later.</div>
+                  </div>
+                )}
+              </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Title</label>
                 <input className="w-full rounded-md border-gray-300 focus:ring-blue-500 focus:border-blue-500" value={meta.title} onChange={(e) => setMeta({ ...meta, title: e.target.value })} required />
@@ -142,18 +211,7 @@ const AdminExamCreate: React.FC = () => {
                   <option value="general_training">General Training</option>
                 </select>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Duration (minutes)</label>
-                <input type="number" min={1} className="w-full rounded-md border-gray-300 focus:ring-blue-500 focus:border-blue-500" value={meta.durationMinutes} onChange={(e) => setMeta({ ...meta, durationMinutes: Number(e.target.value) })} />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Passing Score</label>
-                <input type="number" step="0.5" className="w-full rounded-md border-gray-300 focus:ring-blue-500 focus:border-blue-500" value={meta.passingScore} onChange={(e) => setMeta({ ...meta, passingScore: Number(e.target.value) })} />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Max Attempts</label>
-                <input type="number" min={1} className="w-full rounded-md border-gray-300 focus:ring-blue-500 focus:border-blue-500" value={meta.maxAttempts} onChange={(e) => setMeta({ ...meta, maxAttempts: Number(e.target.value) })} />
-              </div>
+              {/* Duration & Passing Score are controlled server-side; inputs removed per requirements */}
               <div className="md:col-span-2">
                 <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
                 <textarea className="w-full rounded-md border-gray-300 focus:ring-blue-500 focus:border-blue-500" rows={3} value={meta.description} onChange={(e) => setMeta({ ...meta, description: e.target.value })}></textarea>
@@ -171,8 +229,8 @@ const AdminExamCreate: React.FC = () => {
             <div className="space-y-4">
               {sections.map((s, idx) => (
                 <div key={idx} className="grid grid-cols-1 md:grid-cols-7 gap-4">
-                  <button type="button" onClick={() => setSections(prev => prev.filter((_, i) => i !== idx))} className="px-2 py-1 text-xs text-red-600 border border-red-200 rounded hover:bg-red-50">Remove</button>
-                  <select className="rounded-md border-gray-300" value={s.sectionType} onChange={(e) => {
+                  <button type="button" disabled={mode==='full_mock' || selectedTag==='full-mock'} onClick={() => setSections(prev => prev.filter((_, i) => i !== idx))} className={`px-2 py-1 text-xs border rounded ${mode==='full_mock' || selectedTag==='full-mock' ? 'text-gray-400 border-gray-200 cursor-not-allowed' : 'text-red-600 border-red-200 hover:bg-red-50'}`}>Remove</button>
+                  <select className="rounded-md border-gray-300" disabled={mode==='full_mock' || selectedTag==='full-mock'} value={s.sectionType} onChange={(e) => {
                     const next = [...sections];
                     const newType = e.target.value as any;
                     next[idx] = { ...s, sectionType: newType };
@@ -308,7 +366,7 @@ const AdminExamCreate: React.FC = () => {
                 </div>
               ))}
               <div>
-                <button type="button" onClick={() => setSections(prev => [...prev, { sectionType: 'reading', title: 'New Section', maxScore: 9, sectionOrder: prev.length + 1, defaultGroups: [] }])} className="px-3 py-1.5 text-sm text-blue-600 border border-blue-200 rounded hover:bg-blue-50">Add Section</button>
+                <button type="button" disabled={mode==='full_mock' || selectedTag==='full-mock'} onClick={() => setSections(prev => [...prev, { sectionType: 'reading', title: 'New Section', maxScore: 9, sectionOrder: prev.length + 1, defaultGroups: [] }])} className={`px-3 py-1.5 text-sm border rounded ${mode==='full_mock' || selectedTag==='full-mock' ? 'text-gray-400 border-gray-200 cursor-not-allowed' : 'text-blue-600 border-blue-200 hover:bg-blue-50'}`}>Add Section</button>
               </div>
             </div>
           </div>

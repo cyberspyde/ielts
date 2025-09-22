@@ -1,0 +1,263 @@
+// GET /api/admin/analytics - Get analytics data
+router.get('/analytics',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { startDate, endDate, examId } = req.query as { startDate?: string; endDate?: string; examId?: string };
+
+    const toIsoDate = (value: Date): string => value.toISOString().split('T')[0];
+    const normalizeDate = (value?: string): string | undefined => {
+      if (!value) return undefined;
+      const trimmed = value.trim();
+      return trimmed.length ? trimmed : undefined;
+    };
+
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const resolvedStartDate = normalizeDate(startDate) ?? toIsoDate(thirtyDaysAgo);
+    const resolvedEndDate = normalizeDate(endDate) ?? toIsoDate(now);
+
+    const sessionFilters: string[] = ["es.status = 'submitted'"];
+    const queryParams: string[] = [];
+    let paramIndex = 1;
+
+    if (examId && examId.trim().length) {
+      sessionFilters.push(`es.exam_id = $${paramIndex}`);
+      queryParams.push(examId.trim());
+      paramIndex += 1;
+    }
+
+    if (resolvedStartDate) {
+      sessionFilters.push(`DATE(es.created_at) >= $${paramIndex}`);
+      queryParams.push(resolvedStartDate);
+      paramIndex += 1;
+    }
+
+    if (resolvedEndDate) {
+      sessionFilters.push(`DATE(es.created_at) <= $${paramIndex}`);
+      queryParams.push(resolvedEndDate);
+      paramIndex += 1;
+    }
+
+    const sessionWhereClause = `WHERE ${sessionFilters.join(' AND ')}`;
+    const extendSessionWhere = (extra?: string): string => extra ? `${sessionWhereClause} AND ${extra}` : sessionWhereClause;
+
+    const [
+      totalStudentsResult,
+      totalExamsResult,
+      sessionSummaryResult,
+      sectionPerformanceResult,
+      topExamsResult,
+      topTicketPerformersResult,
+      questionStatsResult,
+      scoreDistributionResult
+    ] = await Promise.all([
+      query(`SELECT COUNT(*)::int as total_students FROM users WHERE role = 'student'`),
+      query(`SELECT COUNT(*)::int as total_exams FROM exams`),
+      query(`
+        SELECT
+          COUNT(*)::int as total_sessions,
+          COUNT(*) FILTER (WHERE es.percentage_score IS NOT NULL)::int as scored_sessions,
+          AVG(es.percentage_score)::numeric as average_score,
+          SUM(CASE WHEN es.is_passed IS TRUE THEN 1 ELSE 0 END)::int as passed_sessions
+        FROM exam_sessions es
+        ${sessionWhereClause}
+      `, [...queryParams]),
+      query(`
+        SELECT
+          LOWER(sec.section_type::text) as section_type,
+          COUNT(DISTINCT es.id)::int as sessions,
+          SUM(COALESCE(esa.points_earned, 0))::numeric as total_points_earned,
+          SUM(COALESCE(eq.points, 0))::numeric as total_points_available,
+          AVG(CASE WHEN esa.is_correct IS TRUE THEN 1 WHEN esa.is_correct IS FALSE THEN 0 ELSE NULL END) as accuracy
+        FROM exam_session_answers esa
+        JOIN exam_sessions es ON esa.session_id = es.id
+        JOIN exam_questions eq ON esa.question_id = eq.id
+        JOIN exam_sections sec ON eq.section_id = sec.id
+        ${sessionWhereClause}
+        GROUP BY sec.section_type
+      `, [...queryParams]),
+      query(`
+        SELECT
+          e.id,
+          e.title,
+          COUNT(*)::int as total_attempts,
+          AVG(es.percentage_score)::numeric as average_score,
+          SUM(CASE WHEN es.is_passed IS TRUE THEN 1 ELSE 0 END)::int as passed_attempts
+        FROM exam_sessions es
+        JOIN exams e ON es.exam_id = e.id
+        ${sessionWhereClause}
+        GROUP BY e.id, e.title
+        ORDER BY total_attempts DESC
+        LIMIT 5
+      `, [...queryParams]),
+      query(`
+        SELECT
+          COALESCE(
+            NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
+            NULLIF(t.issued_to_name, ''),
+            'Ticket User'
+          ) as performer_name,
+          MAX(t.ticket_code) as ticket_code,
+          AVG(es.percentage_score)::numeric as average_score,
+          COUNT(*)::int as attempts
+        FROM exam_sessions es
+        LEFT JOIN users u ON es.user_id = u.id
+        LEFT JOIN tickets t ON es.ticket_id = t.id
+        ${extendSessionWhere('es.ticket_id IS NOT NULL')}
+        GROUP BY 1
+        ORDER BY average_score DESC, attempts DESC
+        LIMIT 5
+      `, [...queryParams]),
+      query(`
+        SELECT
+          eq.id as question_id,
+          eq.question_text,
+          LOWER(sec.section_type::text) as section_type,
+          e.title as exam_title,
+          COUNT(*)::int as attempts,
+          AVG(CASE WHEN esa.is_correct IS TRUE THEN 1 WHEN esa.is_correct IS FALSE THEN 0 ELSE NULL END) as accuracy
+        FROM exam_session_answers esa
+        JOIN exam_sessions es ON esa.session_id = es.id
+        JOIN exam_questions eq ON esa.question_id = eq.id
+        JOIN exam_sections sec ON eq.section_id = sec.id
+        JOIN exams e ON sec.exam_id = e.id
+        ${extendSessionWhere('esa.is_correct IS NOT NULL')}
+        GROUP BY eq.id, eq.question_text, sec.section_type, e.title
+      `, [...queryParams]),
+      query(`
+        SELECT
+          CASE
+            WHEN es.percentage_score >= 80 THEN '80-100'
+            WHEN es.percentage_score >= 60 THEN '60-79'
+            WHEN es.percentage_score >= 40 THEN '40-59'
+            WHEN es.percentage_score >= 20 THEN '20-39'
+            ELSE '0-19'
+          END as range,
+          COUNT(*)::int as count
+        FROM exam_sessions es
+        ${extendSessionWhere('es.percentage_score IS NOT NULL')}
+        GROUP BY 1
+        ORDER BY 1
+      `, [...queryParams])
+    ]);
+
+    const toNumber = (value: unknown, fallback = 0): number => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const roundToOneDecimal = (value: number): number => Math.round(value * 10) / 10;
+
+    const totalStudents = toNumber(totalStudentsResult.rows[0]?.total_students);
+    const totalExams = toNumber(totalExamsResult.rows[0]?.total_exams);
+
+    const sessionSummaryRow = sessionSummaryResult.rows[0] ?? {
+      total_sessions: 0,
+      scored_sessions: 0,
+      average_score: null,
+      passed_sessions: 0
+    };
+    const totalSessions = toNumber(sessionSummaryRow.total_sessions);
+    const scoredSessions = toNumber(sessionSummaryRow.scored_sessions);
+    const averageScoreRaw = sessionSummaryRow.average_score === null ? null : Number(sessionSummaryRow.average_score);
+    const averageScore = averageScoreRaw === null ? 0 : roundToOneDecimal(averageScoreRaw);
+    const passedSessions = toNumber(sessionSummaryRow.passed_sessions);
+    const passRate = totalSessions > 0 ? roundToOneDecimal((passedSessions / totalSessions) * 100) : 0;
+
+    const sectionPerformance = sectionPerformanceResult.rows.map((row: any) => {
+      const totalPointsAvailable = toNumber(row.total_points_available);
+      const totalPointsEarned = toNumber(row.total_points_earned);
+      const accuracyRatio = row.accuracy === null ? null : Number(row.accuracy);
+      const scorePercent = totalPointsAvailable > 0 ? (totalPointsEarned / totalPointsAvailable) * 100 : null;
+      return {
+        section: row.section_type,
+        sessions: toNumber(row.sessions),
+        accuracyPercent: accuracyRatio === null ? null : roundToOneDecimal(accuracyRatio * 100),
+        averageScorePercent: scorePercent === null ? null : roundToOneDecimal(scorePercent)
+      };
+    });
+
+    const topExams = topExamsResult.rows.map((row: any) => {
+      const attempts = toNumber(row.total_attempts);
+      const passedAttempts = toNumber(row.passed_attempts);
+      const examAverageRaw = row.average_score === null ? null : Number(row.average_score);
+      const examAverage = examAverageRaw === null ? 0 : roundToOneDecimal(examAverageRaw);
+      const examPassRate = attempts > 0 ? roundToOneDecimal((passedAttempts / attempts) * 100) : 0;
+      return {
+        examId: row.id,
+        examTitle: row.title,
+        totalAttempts: attempts,
+        averageScore: examAverage,
+        passRate: examPassRate
+      };
+    });
+
+    const topTicketPerformers = topTicketPerformersResult.rows.map((row: any) => {
+      const performerAverageRaw = row.average_score === null ? null : Number(row.average_score);
+      return {
+        name: row.performer_name,
+        ticketCode: row.ticket_code,
+        averageScore: performerAverageRaw === null ? 0 : roundToOneDecimal(performerAverageRaw),
+        attempts: toNumber(row.attempts)
+      };
+    });
+
+    const questionStats = questionStatsResult.rows
+      .map((row: any) => {
+        const accuracyRatio = row.accuracy === null ? null : Number(row.accuracy);
+        return {
+          questionId: row.question_id,
+          questionText: row.question_text,
+          examTitle: row.exam_title,
+          section: row.section_type,
+          attempts: toNumber(row.attempts),
+          accuracyPercent: accuracyRatio === null ? null : roundToOneDecimal(accuracyRatio * 100)
+        };
+      })
+      .filter((item: any) => item.accuracyPercent !== null && item.attempts > 0);
+
+    const questionStatsWithThreshold = questionStats.filter((item: any) => item.attempts >= 3);
+    const hardestQuestions = [...questionStatsWithThreshold]
+      .sort((a, b) => (a.accuracyPercent ?? 101) - (b.accuracyPercent ?? 101))
+      .slice(0, 5);
+    const easiestQuestions = [...questionStatsWithThreshold]
+      .sort((a, b) => (b.accuracyPercent ?? -1) - (a.accuracyPercent ?? -1))
+      .slice(0, 5);
+
+    const scoreDistribution = scoreDistributionResult.rows.map((row: any) => ({
+      range: row.range,
+      count: toNumber(row.count)
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        dateRange: {
+          startDate: resolvedStartDate,
+          endDate: resolvedEndDate
+        },
+        filters: {
+          examId: examId ? examId.trim() : null
+        },
+        totals: {
+          students: totalStudents,
+          exams: totalExams,
+          sessions: totalSessions,
+          scoredSessions
+        },
+        averages: {
+          score: averageScore,
+          passRate
+        },
+        scoreDistribution,
+        sectionPerformance,
+        topExams,
+        topTicketPerformers,
+        questionDifficulty: {
+          hardest: hardestQuestions,
+          easiest: easiestQuestions
+        }
+      }
+    });
+  })
+);

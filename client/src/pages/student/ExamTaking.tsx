@@ -2046,8 +2046,9 @@ const ExamTaking: React.FC = () => {
                             <div className="relative">
                               <img src={src} alt="Labeling" className="max-h-[80vh] w-full" style={{ objectFit: 'contain', display: 'block' }} />
                               {labelQs.map((q:any) => {
-                                const ax = q.metadata?.anchor?.x ?? 0.5;
-                                const ay = q.metadata?.anchor?.y ?? 0.5;
+                                let meta: any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch {} }
+                                const ax = meta?.anchor?.x ?? 0.5;
+                                const ay = meta?.anchor?.y ?? 0.5;
                                 const val = (answers[q.id]?.answer as string) || '';
                                 const placeLeft = ax > 0.85; // avoid overflowing right edge
                                 return (
@@ -2083,11 +2084,12 @@ const ExamTaking: React.FC = () => {
                       const apiFull = (import.meta.env.VITE_API_URL || 'http://localhost:7000/api');
                       const apiOrigin = apiFull.replace(/\/?api\/?$/, '');
                       const src = sharedUrl.startsWith('http') ? sharedUrl : `${apiOrigin}${sharedUrl}`;
-                      // Token bank: use anchors' ids or tokens[0]
-                      const tokens: { id: string }[] = dndQs.map((q:any)=> ({ id: (q.metadata?.anchors?.[0]?.id) || (Array.isArray(q.metadata?.tokens)&&q.metadata.tokens[0]) || String(q.questionNumber||'') }));
-                      const getPlaced = (q:any) => {
-                        try { const a = (answers[q.id]?.answer as string)||''; const j = JSON.parse(a||'{}'); return j?.placements?.[(q.metadata?.anchors?.[0]?.id)||'A']; } catch { return undefined; }
-                      };
+                      // Token bank: prefer first token in metadata.tokens, fallback to anchor id or questionNumber
+                      const tokens: { id: string }[] = dndQs.map((q:any)=> {
+                        let meta: any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch {} }
+                        const token = Array.isArray(meta?.tokens) && meta.tokens.length > 0 ? meta.tokens[0] : (meta?.anchors?.[0]?.id) || String(q.questionNumber||'');
+                        return { id: String(token) };
+                      });
                       return (
                         <div className="mb-4">
                           <div className="text-sm font-medium mb-1">Drag the labels onto the image</div>
@@ -2097,9 +2099,11 @@ const ExamTaking: React.FC = () => {
                               <img src={src} alt="Drag/Drop" className="max-h-[80vh] w-full select-none" style={{ objectFit: 'contain', display: 'block' }} draggable={false} />
                               {/* Anchors (drop targets) */}
                               {dndQs.map((q:any)=>{
-                              const aid = (q.metadata?.anchors?.[0]?.id)||'A';
-                              const ax = q.metadata?.anchors?.[0]?.x ?? 0.5; const ay = q.metadata?.anchors?.[0]?.y ?? 0.5;
-                              const placed = getPlaced(q);
+                              let meta: any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch {} }
+                              const anchor = Array.isArray(meta?.anchors) && meta.anchors.length > 0 ? meta.anchors[0] : { id: 'A', x: 0.5, y: 0.5 };
+                              const aid = String(anchor.id || 'A');
+                              const ax = typeof anchor.x === 'number' ? anchor.x : 0.5; const ay = typeof anchor.y === 'number' ? anchor.y : 0.5;
+                              let placed: string | undefined = undefined; try { const a = (answers[q.id]?.answer as string)||''; const j = JSON.parse(a||'{}'); placed = j?.placements?.[aid]; } catch {}
                               return (
                                   <div key={`dnd-anch-${q.id}`} className="absolute -translate-x-1/2 -translate-y-1/2"
                                   style={{ left: `${ax*100}%`, top: `${ay*100}%` }}
@@ -2231,8 +2235,9 @@ const ExamTaking: React.FC = () => {
                                 <div className="relative inline-block border rounded overflow-hidden">
                                   <img src={src} alt="Labeling" className="max-h-96" />
                                   {labelQs.map((q:any) => {
-                                    const ax = q.metadata?.anchor?.x ?? 0.5;
-                                    const ay = q.metadata?.anchor?.y ?? 0.5;
+                                    let meta: any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch {} }
+                                    const ax = meta?.anchor?.x ?? 0.5;
+                                    const ay = meta?.anchor?.y ?? 0.5;
                                     const val = (answers[q.id]?.answer as string) || '';
                                     return (
                                       <div key={`anch-${q.id}`} className="absolute -translate-x-1/2 -translate-y-1/2" style={{ left: `${ax*100}%`, top: `${ay*100}%` }}>
@@ -3017,17 +3022,37 @@ const ExamTaking: React.FC = () => {
                             <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Select {q.metadata.selectCount || 2} answers.</div>
                           </div>
                         ) : (
-                          <select
-                            className={'w-full rounded px-3 py-2 text-sm ' + inputBase}
-                            value={(answers[q.id]?.answer as string) || ''}
-                            onChange={(e) => handleAnswerChange(q.id, e.target.value)}>
-                            <option value="">Select an answer</option>
+                          <div className="space-y-1">
                             {(q.options || []).map((option: any, index: number) => {
-                              const value = option.letter || option.text || option;
-                              const label = option.letter ? `${option.letter}. ${option.text}` : option.text || option;
-                              return <option key={index} value={value}>{label}</option>;
+                              const rawValue = option.value ?? option.letter ?? option.option_letter ?? option.text ?? option;
+                              const value = typeof rawValue === 'string' ? rawValue : String(rawValue ?? '');
+                              const optionLetter = (option.letter || option.option_letter || '').toString().trim();
+                              const indicator = optionLetter ? optionLetter.toUpperCase() : (index < 26 ? String.fromCharCode(65 + index) : String(index + 1));
+                              const baseText = option.text || option.option_text || (typeof option === 'string' ? option : '');
+                              const label = baseText || value;
+                              const currentRaw = answers[q.id]?.answer;
+                              const current = typeof currentRaw === 'string' ? currentRaw : '';
+                              const isSelected = current === value;
+                              return (
+                                <div
+                                  key={option.id || `${q.id}_${index}`}
+                                  className={`flex items-center gap-3 text-sm px-3 py-2 border rounded cursor-pointer select-none transition-colors ${isSelected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50 active:bg-gray-100')}`}
+                                  onClick={() => handleAnswerChange(q.id, value)}
+                                  role="radio"
+                                  aria-checked={isSelected}
+                                  tabIndex={0}
+                                  onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); (e.currentTarget as HTMLElement).click(); } }}
+                                >
+                                  <span className={`mt-0.5 inline-flex w-6 h-6 border rounded-full items-center justify-center text-[11px] font-semibold ${isSelected ? (darkMode ? 'bg-blue-500 border-blue-500 text-white' : 'bg-blue-500 border-blue-500 text-white') : (darkMode ? 'border-gray-500 text-gray-300' : 'border-gray-400 text-gray-700')}`}>
+                                    {indicator}
+                                  </span>
+                                  <span className="flex-1 text-left">
+                                    {label}
+                                  </span>
+                                </div>
+                              );
                             })}
-                          </select>
+                          </div>
                         )}
                       </div>
                     )}

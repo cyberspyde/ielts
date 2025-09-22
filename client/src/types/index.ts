@@ -23,7 +23,6 @@ export interface Exam {
   examType: 'academic' | 'general_training';
   durationMinutes: number; // in minutes
   passingScore?: number;
-  maxAttempts?: number;
   audioUrl?: string; // central listening audio for entire exam
   sections?: ExamSection[];
   isActive?: boolean;
@@ -68,7 +67,8 @@ export type QuestionType =
   | 'speaking'
   | 'drag_drop'
   | 'speaking_task'
-  | 'image_labeling';
+  | 'image_labeling'
+  | 'image_dnd';
 
 export interface QuestionOption {
   id: string;

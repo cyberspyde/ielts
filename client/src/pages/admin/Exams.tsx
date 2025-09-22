@@ -12,10 +12,11 @@ type ExamListItem = {
   examType: 'academic' | 'general_training';
   durationMinutes: number;
   passingScore: number;
-  maxAttempts: number;
   instructions?: string;
   sectionCount: number;
   createdAt: string;
+  tags?: string[];
+  isComposite?: boolean;
 };
 
 type ExamsListResponse = {
@@ -34,13 +35,15 @@ const AdminExams: React.FC = () => {
   const [limit, setLimit] = useState(10);
   const [search, setSearch] = useState('');
   const [type, setType] = useState<'all' | 'academic' | 'general_training'>('all');
+  const [tag, setTag] = useState('');
 
   const params = useMemo(() => {
     const p: Record<string, any> = { page, limit };
     if (search.trim()) p.search = search.trim();
     if (type !== 'all') p.type = type;
+    if (tag.trim()) p.tag = tag.trim();
     return p;
-  }, [page, limit, search, type]);
+  }, [page, limit, search, type, tag]);
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery<ExamsListResponse, Error>({
     queryKey: ['admin-exams', params],
@@ -97,7 +100,7 @@ const AdminExams: React.FC = () => {
 
         {/* Filters */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6">
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
             <div className="md:col-span-2">
               <label className="block text-sm font-medium text-gray-700 mb-1">Search</label>
               <input
@@ -118,6 +121,15 @@ const AdminExams: React.FC = () => {
                 <option value="academic">Academic</option>
                 <option value="general_training">General Training</option>
               </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Tag</label>
+              <input
+                value={tag}
+                onChange={(e) => { setPage(1); setTag(e.target.value); }}
+                placeholder="e.g. full-mock, one-skill, peter"
+                className="w-full rounded-md border-gray-300 focus:border-blue-500 focus:ring-blue-500"
+              />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Per page</label>
@@ -173,6 +185,15 @@ const AdminExams: React.FC = () => {
                   <div className="col-span-5">
                     <div className="font-medium text-gray-900">{exam.title}</div>
                     <div className="text-sm text-gray-500 line-clamp-1">{exam.description}</div>
+                    {exam.tags && exam.tags.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {exam.tags.map((t, idx) => (
+                          <span key={`${exam.id}-tag-${idx}`} className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 text-gray-700 border border-gray-200">
+                            {t}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="col-span-2">
                     <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-50 text-blue-700">

@@ -10,6 +10,109 @@ import { authMiddleware, requireRole, requireAdmin, requireSuperAdmin, rateLimit
 
 const router = Router();
 
+
+const serializeCorrectAnswer = (value: any): string | null => {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 0 && Array.isArray(value[0])) {
+      const groups = value.map((group: any) => {
+        const arr = Array.isArray(group) ? group : [group];
+        return arr
+          .map((entry) => (entry === undefined || entry === null ? '' : String(entry).trim()))
+          .filter(Boolean)
+          .join('|');
+      }).filter(Boolean);
+      const joined = groups.join(';');
+      return joined.length ? joined : null;
+    }
+    const joined = value
+      .map((entry) => (entry === undefined || entry === null ? '' : String(entry).trim()))
+      .filter(Boolean)
+      .join('|');
+    return joined.length ? joined : null;
+  }
+  return String(value);
+};
+
+
+const DEFAULT_SECTION_DURATIONS: Record<string, number> = {
+  listening: 30,
+  reading: 60,
+  writing: 60,
+  speaking: 15,
+};
+
+const normalizeTags = (tags?: any): string[] => {
+  if (!tags) return [];
+  const source = Array.isArray(tags)
+    ? tags
+    : typeof tags === 'string'
+      ? tags.split(',')
+      : [];
+  const normalized = source
+    .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+    .filter(Boolean);
+  return Array.from(new Set(normalized));
+};
+
+const recalculateExamDuration = async (examId: string): Promise<void> => {
+  try {
+    const examRow = await query(
+      `SELECT is_composite, bundle_listening_exam_id, bundle_reading_exam_id, bundle_writing_exam_id
+       FROM exams WHERE id = $1`,
+      [examId]
+    );
+    if (examRow.rowCount === 0) return;
+    const examData = examRow.rows[0];
+
+    let total = 0;
+
+    if (examData.is_composite) {
+      const childIds = [
+        examData.bundle_listening_exam_id,
+        examData.bundle_reading_exam_id,
+        examData.bundle_writing_exam_id,
+      ].filter(Boolean);
+      if (childIds.length > 0) {
+        const childDurations = await query(
+          `SELECT id, duration_minutes FROM exams WHERE id = ANY($1::uuid[])`,
+          [childIds]
+        );
+        for (const row of childDurations.rows) {
+          total += Number(row.duration_minutes || 0);
+        }
+      }
+    }
+
+    if (!examData.is_composite || total === 0) {
+      const sections = await query(
+        `SELECT DISTINCT section_type FROM exam_sections WHERE exam_id = $1`,
+        [examId]
+      );
+      const seen = new Set<string>();
+      total = 0;
+      for (const row of sections.rows) {
+        const type = String(row.section_type || '').toLowerCase();
+        if (seen.has(type)) continue;
+        seen.add(type);
+        total += DEFAULT_SECTION_DURATIONS[type] || 0;
+      }
+    }
+
+    if (total === 0) {
+      total = DEFAULT_SECTION_DURATIONS.listening + DEFAULT_SECTION_DURATIONS.reading + DEFAULT_SECTION_DURATIONS.writing;
+    }
+
+    await query('UPDATE exams SET duration_minutes = $1 WHERE id = $2', [total, examId]);
+  } catch (error) {
+    logger.warn('Failed to recalculate exam duration', { examId, error: (error as any)?.message });
+  }
+};
+
 // File upload (audio) setup
 const uploadsRoot = process.env.UPLOADS_DIR || path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsRoot)) {
@@ -236,15 +339,9 @@ router.patch('/sessions/:sessionId/answers/:questionId/grade',
 // POST /api/admin/sessions/:sessionId/recalculate - recompute totals after grading
 router.post('/sessions/:sessionId/recalculate', asyncHandler(async (req: Request, res: Response) => {
   const { sessionId } = req.params;
-  // Fetch passing score & exam id
-  const passRow = await query(`
-    SELECT e.id as exam_id, e.passing_score
-    FROM exam_sessions es
-    JOIN exams e ON e.id = es.exam_id
-    WHERE es.id = $1
-  `, [sessionId]);
+  // Validate session exists
+  const passRow = await query(`SELECT id FROM exam_sessions WHERE id = $1`, [sessionId]);
   if (passRow.rowCount === 0) throw createNotFoundError('Session');
-  const passingScore = parseFloat(passRow.rows[0].passing_score);
 
   // Fetch all answers with context
   const ansRows = await query(`
@@ -284,9 +381,8 @@ router.post('/sessions/:sessionId/recalculate', asyncHandler(async (req: Request
     percentageScore = max > 0 ? (earned / max) * 100 : 0;
   }
 
-  const isPassed = percentageScore >= passingScore;
-  await query(`UPDATE exam_sessions SET total_score = $1, percentage_score = $2, is_passed = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`, [totalScore, percentageScore, isPassed, sessionId]);
-  res.json({ success: true, message: 'Recalculated', data: { totalScore, percentageScore, isPassed } });
+  await query(`UPDATE exam_sessions SET total_score = $1, percentage_score = $2, is_passed = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $3`, [totalScore, percentageScore, sessionId]);
+  res.json({ success: true, message: 'Recalculated', data: { totalScore, percentageScore } });
 }));
 
 // POST /api/admin/sessions/:sessionId/approve - mark results as approved/publishable
@@ -305,71 +401,143 @@ router.post('/exams',
   body('title').trim().isLength({ min: 3, max: 255 }).withMessage('Title is required'),
   body('description').optional().isString(),
   body('examType').isIn(['academic', 'general_training']).withMessage('Invalid exam type'),
-  body('durationMinutes').isInt({ min: 1 }).withMessage('Duration is required'),
   body('audioUrl').optional().isString(),
-  body('passingScore').optional().isFloat({ min: 0, max: 9.0 }).withMessage('Passing score must be 0-9.0'),
-  body('maxAttempts').optional().isInt({ min: 1, max: 10 }).withMessage('Max attempts must be 1-10'),
   body('instructions').optional().isString(),
+  body('tags').optional(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
 
-  const { title, description, examType, durationMinutes, passingScore = 0, maxAttempts = 1, instructions, audioUrl } = req.body;
+const { title, description, examType, instructions, audioUrl } = req.body;
+const tags = normalizeTags((req.body as any).tags);
+const bundle = (req.body as any).bundle || {};
+const listeningExamId = bundle.listeningExamId || bundle.listening || null;
+const readingExamId = bundle.readingExamId || bundle.reading || null;
+const writingExamId = bundle.writingExamId || bundle.writing || null;
+const childExamIds = [listeningExamId, readingExamId, writingExamId].filter(Boolean);
+if (childExamIds.length) {
+  const childCheck = await query('SELECT id FROM exams WHERE id = ANY($1::uuid[])', [childExamIds]);
+  if (childCheck.rowCount !== childExamIds.length) {
+    throw new AppError('One or more bundled exams were not found', 400);
+  }
+}
+const defaultDuration = DEFAULT_SECTION_DURATIONS.listening + DEFAULT_SECTION_DURATIONS.reading + DEFAULT_SECTION_DURATIONS.writing;
 
-    const result = await query(`
-      INSERT INTO exams (title, description, exam_type, duration_minutes, passing_score, max_attempts, instructions, audio_url, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING id, created_at
-    `, [title, description || null, examType, durationMinutes, passingScore, maxAttempts, instructions || null, audioUrl || null, req.user!.id]);
+const result = await query(`
+  INSERT INTO exams (
+    title, description, exam_type, duration_minutes,
+    passing_score, instructions, audio_url,
+    created_by, tags, is_composite,
+    bundle_listening_exam_id, bundle_reading_exam_id, bundle_writing_exam_id
+  )
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+  RETURNING id, created_at
+`, [
+  title,
+  description || null,
+  examType,
+  defaultDuration,
+  0,
+  instructions || null,
+  audioUrl || null,
+  req.user!.id,
+  tags.length ? tags : null,
+  childExamIds.length > 0,
+  listeningExamId,
+  readingExamId,
+  writingExamId,
+]);
 
-    const exam = result.rows[0];
+const exam = result.rows[0];
 
-    await logAdminAction(req.user!.id, 'CREATE_EXAM', 'exam', exam.id, { title, examType });
+await recalculateExamDuration(exam.id);
+await logAdminAction(req.user!.id, 'CREATE_EXAM', 'exam', exam.id, {
+  title,
+  examType,
+  tags,
+  bundle: childExamIds.length > 0 ? { listeningExamId, readingExamId, writingExamId } : undefined,
+});
 
-    res.status(201).json({
-      success: true,
-      message: 'Exam created successfully',
-      data: { examId: exam.id }
-    });
+res.status(201).json({
+  success: true,
+  message: 'Exam created successfully',
+  data: { examId: exam.id }
+});
   })
 );
+
 
 // PUT /api/admin/exams/:examId - Update exam meta
 router.put('/exams/:examId',
   body('title').optional().trim().isLength({ min: 3, max: 255 }),
   body('description').optional().isString(),
   body('examType').optional().isIn(['academic', 'general_training']),
-  body('durationMinutes').optional().isInt({ min: 1 }),
   body('audioUrl').optional().isString(),
-  body('passingScore').optional().isFloat({ min: 0, max: 9.0 }),
-  body('maxAttempts').optional().isInt({ min: 1, max: 10 }),
   body('instructions').optional().isString(),
+  body('tags').optional(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
 
     const { examId } = req.params;
+    const payload = req.body as Record<string, unknown>;
 
     const fields: string[] = [];
     const values: any[] = [];
     let p = 1;
     const map: Record<string, string> = {
-      title: 'title', description: 'description', examType: 'exam_type',
-      durationMinutes: 'duration_minutes', passingScore: 'passing_score',
-      maxAttempts: 'max_attempts', instructions: 'instructions', audioUrl: 'audio_url'
+      title: 'title',
+      description: 'description',
+      examType: 'exam_type',
+      instructions: 'instructions',
+      audioUrl: 'audio_url'
     };
     for (const key of Object.keys(map)) {
-      const val = (req.body as any)[key];
-      if (val !== undefined) { fields.push(`${map[key]} = $${p++}`); values.push(val); }
+      const incoming = (payload as any)[key];
+      if (incoming === undefined) continue;
+      fields.push(`${map[key]} = $${p++}`);
+      values.push(incoming);
     }
-    if (fields.length === 0) {
+if ((payload as any).tags !== undefined) {
+  const tags = normalizeTags((payload as any).tags);
+  fields.push(`tags = $${p++}`);
+  values.push(tags.length ? tags : null);
+}
+if ((payload as any).bundle !== undefined) {
+  const bundle = (payload as any).bundle || {};
+  const listeningExamId = bundle.listeningExamId || bundle.listening || null;
+  const readingExamId = bundle.readingExamId || bundle.reading || null;
+  const writingExamId = bundle.writingExamId || bundle.writing || null;
+  const childExamIds = [listeningExamId, readingExamId, writingExamId].filter(Boolean);
+  if (childExamIds.includes(examId)) {
+    throw new AppError('Composite exam cannot reference itself as a child exam', 400);
+  }
+  if (childExamIds.length) {
+    const childCheck = await query('SELECT id FROM exams WHERE id = ANY($1::uuid[])', [childExamIds]);
+    if (childCheck.rowCount !== childExamIds.length) {
+      throw new AppError('One or more bundled exams were not found', 400);
+    }
+  }
+  fields.push(`is_composite = $${p++}`);
+  values.push(childExamIds.length > 0);
+  fields.push(`bundle_listening_exam_id = $${p++}`);
+  values.push(listeningExamId);
+  fields.push(`bundle_reading_exam_id = $${p++}`);
+  values.push(readingExamId);
+  fields.push(`bundle_writing_exam_id = $${p++}`);
+  values.push(writingExamId);
+}
+if (fields.length === 0) {
+
       res.json({ success: true, message: 'No changes' });
       return;
     }
     values.push(examId);
     await query(`UPDATE exams SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${p}`, values);
+    await recalculateExamDuration(examId);
     await logAdminAction(req.user!.id, 'UPDATE_EXAM', 'exam', examId, fields);
     res.json({ success: true, message: 'Exam updated' });
   })
 );
+
 
 // DELETE /api/admin/exams/:examId - Delete exam and dependent data
 router.delete('/exams/:examId', asyncHandler(async (req: Request, res: Response) => {
@@ -427,6 +595,7 @@ router.put('/exams/:examId/sections/:sectionId',
     values.push(sectionId, examId);
     await query(`UPDATE exam_sections SET ${fields.join(', ')} WHERE id = $${p++} AND exam_id = $${p}`, values);
     await logAdminAction(req.user!.id, 'UPDATE_SECTION', 'exam', examId, { sectionId, fields });
+    await recalculateExamDuration(examId);
     res.json({ success: true, message: 'Section updated' });
   })
 );
@@ -453,6 +622,7 @@ router.delete('/sections/:sectionId', asyncHandler(async (req: Request, res: Res
     throw e;
   }
   await logAdminAction(req.user!.id, 'DELETE_SECTION', 'exam', sec.rows[0].exam_id, { sectionId });
+  await recalculateExamDuration(sec.rows[0].exam_id);
   res.json({ success: true, message: 'Section deleted' });
 }));
 
@@ -460,7 +630,8 @@ router.delete('/sections/:sectionId', asyncHandler(async (req: Request, res: Res
 router.put('/questions/:questionId',
   body('questionType').optional().isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table','image_labeling','image_dnd']),
   body('questionText').optional().isString(),
-  body('correctAnswer').optional().isString(),
+  body('correctAnswer').optional(),
+  body('correctAnswers').optional().isArray(),
   body('points').optional().isFloat({ min: 0 }),
   body('timeLimitSeconds').optional().isInt({ min: 0 }),
   body('explanation').optional().isString(),
@@ -470,19 +641,39 @@ router.put('/questions/:questionId',
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
     const { questionId } = req.params;
+    const payload = req.body as Record<string, unknown>;
+    if (payload && (payload as any).correctAnswers !== undefined && (payload as any).correctAnswer === undefined) {
+      (payload as any).correctAnswer = (payload as any).correctAnswers;
+    }
     const fields: string[] = [];
     const values: any[] = [];
     let p = 1;
     const map: Record<string, string> = {
-      questionType: 'question_type', questionText: 'question_text', points: 'points',
-      timeLimitSeconds: 'time_limit_seconds', explanation: 'explanation', correctAnswer: 'correct_answer',
-      audioUrl: 'audio_url', imageUrl: 'image_url', metadata: 'metadata'
+      questionType: 'question_type',
+      questionText: 'question_text',
+      points: 'points',
+      timeLimitSeconds: 'time_limit_seconds',
+      explanation: 'explanation',
+      correctAnswer: 'correct_answer',
+      audioUrl: 'audio_url',
+      imageUrl: 'image_url',
+      metadata: 'metadata'
     };
     for (const key of Object.keys(map)) {
-      const val = (req.body as any)[key];
-      if (val !== undefined) { fields.push(`${map[key]} = $${p++}`); values.push(key === 'metadata' ? JSON.stringify(val) : val); }
+      if ((payload as any)[key] === undefined) continue;
+      let value = (payload as any)[key];
+      if (key === 'metadata') {
+        value = JSON.stringify(value);
+      } else if (key === 'correctAnswer') {
+        value = serializeCorrectAnswer(value);
+      }
+      fields.push(`${map[key]} = $${p++}`);
+      values.push(value);
     }
-    if (fields.length === 0) { res.json({ success: true, message: 'No changes' }); return; }
+    if (fields.length === 0) {
+      res.json({ success: true, message: 'No changes' });
+      return;
+    }
     values.push(questionId);
     await query(`UPDATE exam_questions SET ${fields.join(', ')}, created_at = created_at WHERE id = $${p}`, values);
     await logAdminAction(req.user!.id, 'UPDATE_QUESTION', 'question', questionId, fields);
@@ -494,29 +685,37 @@ router.put('/questions/:questionId',
 router.post('/sections/:sectionId/questions',
   body('questionType').isIn(['multiple_choice','true_false','fill_blank','matching','essay','speaking_task','drag_drop','short_answer','writing_task1','table_fill_blank','table_drag_drop','simple_table','image_labeling','image_dnd']).withMessage('Invalid question type'),
   body('questionText').optional().isString(),
-  body('correctAnswer').optional().isString(),
+  body('correctAnswer').optional(),
+  body('correctAnswers').optional().isArray(),
   body('points').optional().isFloat({ min: 0 }),
   body('questionNumber').optional().isInt({ min: 1 }),
   body('metadata').optional(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
     const { sectionId } = req.params;
-    const { questionType, questionText = '', correctAnswer, points = 1, questionNumber, metadata } = req.body;
+    const payload = req.body as any;
+    const questionType = payload.questionType;
+    const questionText = typeof payload.questionText === 'string' ? payload.questionText : '';
+    const pointValue = payload.points !== undefined ? Number(payload.points) : 1;
+    const questionNumber = payload.questionNumber;
+    const metadata = payload.metadata;
+    const rawCorrect = payload.correctAnswers !== undefined ? payload.correctAnswers : payload.correctAnswer;
+    const serializedCorrect = serializeCorrectAnswer(rawCorrect);
     // Auto-normalize table_fill_blank and simple_table: ensure metadata structure
     let normMetadata = metadata;
     if (questionType === 'table_fill_blank' || questionType === 'table_drag_drop') {
       const baseTable = (metadata && (metadata as any).table) || (metadata && (metadata as any).tableBlock);
       const rows = baseTable?.rows || [[" "]];
-      normMetadata = { ...(metadata||{}), table: { rows, sizes: baseTable?.sizes || [] } };
-      if (questionType.startsWith('table_') && (req.body.points === undefined || req.body.points === null)) {
-        (req.body as any).points = 0; // container not directly scored
+      normMetadata = { ...(metadata || {}), table: { rows, sizes: baseTable?.sizes || [] } };
+      if (payload.points === undefined || payload.points === null) {
+        payload.points = 0;
       }
     } else if (questionType === 'simple_table') {
       const baseTable = (metadata && (metadata as any).simpleTable);
       const rows = baseTable?.rows || [[{ type: 'text', content: '' }]];
-      normMetadata = { ...(metadata||{}), simpleTable: { rows } };
-      if (req.body.points === undefined || req.body.points === null) {
-        (req.body as any).points = 0; // container not directly scored
+      normMetadata = { ...(metadata || {}), simpleTable: { rows } };
+      if (payload.points === undefined || payload.points === null) {
+        payload.points = 0;
       }
     }
     // Verify section
@@ -528,19 +727,20 @@ router.post('/sections/:sectionId/questions',
       qNum = Number(r.rows[0].next) || 1;
     }
     let newId: string | null = null;
+    const points = Number.isFinite(Number(payload.points)) ? Number(payload.points) : pointValue;
     // Retry a few times if duplicate question_number due to race conditions
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         const rQ = await query(`
           INSERT INTO exam_questions (section_id, question_type, question_text, question_number, points, correct_answer, metadata)
           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-        `, [sectionId, questionType, questionText, qNum, points, correctAnswer || null, normMetadata ? JSON.stringify(normMetadata) : null]);
-        newId = rQ.rows[0].id; break;
+        `, [sectionId, questionType, questionText, qNum, points, serializedCorrect, normMetadata ? JSON.stringify(normMetadata) : null]);
+        newId = rQ.rows[0].id;
+        break;
       } catch (e: any) {
         if (e?.code === '23505' && /uq_exam_questions_section_question/i.test(e?.constraint || '')) {
-          // Increment and retry
-            qNum = (qNum || 0) + 1;
-            continue;
+          qNum = (qNum || 0) + 1;
+          continue;
         }
         throw e;
       }
@@ -655,6 +855,7 @@ router.post('/exams/:examId/sections',
     }
 
     await logAdminAction(req.user!.id, 'CREATE_SECTIONS', 'exam', examId, { count: sections.length });
+    await recalculateExamDuration(examId);
 
     res.status(201).json({ success: true, message: 'Sections created', data: { sections: created } });
   })
@@ -670,6 +871,7 @@ router.post('/exams/:examId/questions/bulk',
   body('groups.*.points').optional().isFloat({ min: 0 }).withMessage('Points must be >= 0'),
   body('groups.*.options').optional().isArray().withMessage('Options must be an array when provided'),
   body('groups.*.correctAnswers').optional().isArray().withMessage('correctAnswers must be an array when provided'),
+  body('groups.*.correctAnswer').optional(),
   body('groups.*.questionTexts').optional().isArray().withMessage('questionTexts must be an array when provided'),
   body('groups.*.fillMissing').optional().isBoolean(),
   asyncHandler(async (req: Request, res: Response) => {
@@ -753,11 +955,16 @@ router.post('/exams/:examId/questions/bulk',
         }
 
         // If provided, set correct answer per question by index within group
-        if (Array.isArray(g.correctAnswers)) {
-          const idx = num - startNum; // zero-based within group
-          if (g.correctAnswers[idx] !== undefined) {
-            await query(`UPDATE exam_questions SET correct_answer = $1 WHERE id = $2`, [String(g.correctAnswers[idx]), questionId]);
-          }
+        const groupIndex = num - startNum; // zero-based within group
+        let rawCorrect: any = undefined;
+        if (Array.isArray(g.correctAnswers) && g.correctAnswers[groupIndex] !== undefined) {
+          rawCorrect = g.correctAnswers[groupIndex];
+        } else if (g.correctAnswer !== undefined) {
+          rawCorrect = g.correctAnswer;
+        }
+        const serializedCorrect = serializeCorrectAnswer(rawCorrect);
+        if (serializedCorrect !== null) {
+          await query(`UPDATE exam_questions SET correct_answer = $1 WHERE id = $2`, [serializedCorrect, questionId]);
         }
 
         // Create options if supplied or auto-create for matching
@@ -899,9 +1106,15 @@ router.post('/tickets',
   body('examId')
     .isUUID()
     .withMessage('Valid exam ID is required'),
+  // Either quantity OR issuedToNames[] (per-name creation) can be provided
   body('quantity')
+    .optional()
     .isInt({ min: 1, max: 100 })
     .withMessage('Quantity must be between 1 and 100'),
+  body('issuedToNames')
+    .optional()
+    .isArray({ min: 1, max: 100 })
+    .withMessage('issuedToNames must be an array of 1-100 names'),
   body('validFrom')
     .optional()
     .isISO8601()
@@ -909,10 +1122,7 @@ router.post('/tickets',
   body('validUntil')
     .isISO8601()
     .withMessage('Valid until date is required'),
-  body('maxUses')
-    .optional()
-    .isInt({ min: 1, max: 10 })
-    .withMessage('Max uses must be between 1 and 10'),
+  // maxUses removed: system enforces single-use tickets (max_uses = 1)
   body('issuedToEmail')
     .optional()
     .isEmail()
@@ -932,12 +1142,12 @@ router.post('/tickets',
 
     const {
       examId,
-      quantity,
+      quantity: quantityRaw,
       validFrom,
       validUntil,
-      maxUses = 1,
       issuedToEmail,
       issuedToName,
+      issuedToNames,
       notes
     } = req.body;
 
@@ -961,6 +1171,15 @@ router.post('/tickets',
       throw new AppError('Valid until date must be in the future', 400);
     }
 
+    // Normalize bulk names list (trim empty)
+    const namesList: string[] = Array.isArray(issuedToNames)
+      ? (issuedToNames as any[]).map((n:any)=> String(n||'').trim()).filter((s)=> s.length>0)
+      : [];
+    // Determine quantity
+    let quantity = 0;
+    if (namesList.length > 0) quantity = Math.min(namesList.length, 100);
+    else quantity = Math.min(Number(quantityRaw || 1), 100);
+
     // Generate tickets
     const tickets = [];
     const ticketPrefix = process.env.TICKET_PREFIX || 'IELTS';
@@ -982,11 +1201,11 @@ router.post('/tickets',
         ticketCode,
         examId,
         issuedToEmail,
-        issuedToName,
+        namesList.length > 0 ? namesList[i] : issuedToName,
         'active',
         validFromDate,
         validUntilDate,
-        maxUses,
+        1,
         notes,
         req.user!.id
       ]);
@@ -1010,7 +1229,8 @@ router.post('/tickets',
         validFrom: validFromDate,
         validUntil: validUntilDate,
         issuedToEmail,
-        issuedToName
+        issuedToName,
+        issuedToNames: namesList
       }
     );
 
@@ -1247,7 +1467,7 @@ router.get('/sessions',
     const sessionsQuery = `
       SELECT 
         es.id, es.status, es.started_at, es.submitted_at, es.expires_at,
-        es.total_score, es.percentage_score, es.is_passed, es.time_spent_seconds,
+        es.total_score, es.percentage_score, es.time_spent_seconds,
         es.created_at,
         u.email as user_email, u.first_name, u.last_name,
         e.title as exam_title, e.exam_type,
@@ -1283,7 +1503,6 @@ router.get('/sessions',
       expiresAt: session.expires_at,
       totalScore: session.total_score,
       percentageScore: session.percentage_score,
-      isPassed: session.is_passed,
       timeSpentSeconds: session.time_spent_seconds,
       createdAt: session.created_at,
       user: session.user_email ? {
@@ -1362,9 +1581,9 @@ router.get('/sessions/:sessionId/results',
     // Fetch session with exam and optional user/ticket info
     const sessionResult = await query(`
       SELECT es.id, es.status, es.started_at, es.submitted_at, es.total_score,
-             es.percentage_score, es.is_passed, es.time_spent_seconds,
-             es.exam_id, es.ticket_id,
-             e.title as exam_title, e.exam_type, e.passing_score, e.duration_minutes,
+        es.percentage_score, es.time_spent_seconds,
+        es.exam_id, es.ticket_id,
+        e.title as exam_title, e.exam_type, e.duration_minutes,
              u.email as user_email, u.first_name, u.last_name,
              t.ticket_code, t.issued_to_name
       FROM exam_sessions es
@@ -1429,7 +1648,7 @@ router.get('/sessions/:sessionId/results',
             submittedAt: session.submitted_at,
             totalScore: session.total_score,
             percentageScore: session.percentage_score,
-            isPassed: session.is_passed,
+            // isPassed deprecated
             timeSpentSeconds: session.time_spent_seconds,
             ticketCode: session.ticket_code,
             user: session.user_email ? { email: session.user_email, name: `${session.first_name} ${session.last_name}` } : (session.issued_to_name ? { email: null, name: `${session.issued_to_name} (ticket)` } : null)
@@ -1438,7 +1657,7 @@ router.get('/sessions/:sessionId/results',
           id: session.exam_id,
           title: session.exam_title,
           type: session.exam_type,
-          passingScore: session.passing_score,
+          // passingScore deprecated
           durationMinutes: session.duration_minutes
         },
         answers
@@ -1476,7 +1695,7 @@ router.get('/analytics',
     const [
       sessionsByDay,
       scoreDistribution,
-      passRates,
+      performanceByExam,
       averageScores
     ] = await Promise.all([
       // Sessions by day
@@ -1509,21 +1728,17 @@ router.get('/analytics',
         ORDER BY score_range
       `, queryParams),
 
-      // Pass rates by exam
+      // Performance by exam (average percentage over period)
       query(`
         SELECT 
           e.title as exam_title,
           COUNT(*) as total_attempts,
-          COUNT(CASE WHEN es.is_passed = true THEN 1 END) as passed,
-          ROUND(
-            (COUNT(CASE WHEN es.is_passed = true THEN 1 END) * 100.0 / COUNT(*))::numeric, 
-            2
-          ) as pass_rate
+          ROUND(AVG(es.percentage_score)::numeric, 2) as avg_percentage
         FROM exam_sessions es
         JOIN exams e ON es.exam_id = e.id
-        WHERE es.status = 'submitted' AND ${dateCondition} ${examCondition}
+        WHERE es.status = 'submitted' AND es.percentage_score IS NOT NULL AND ${dateCondition} ${examCondition}
         GROUP BY e.id, e.title
-        ORDER BY pass_rate DESC
+        ORDER BY avg_percentage DESC
       `, queryParams),
 
       // Average scores over time
@@ -1544,7 +1759,7 @@ router.get('/analytics',
       period,
       sessionsByDay: sessionsByDay.rows,
       scoreDistribution: scoreDistribution.rows,
-      passRates: passRates.rows,
+      performanceByExam: performanceByExam.rows,
       averageScores: averageScores.rows.map((row: any) => ({
         ...row,
         avg_score: parseFloat(row.avg_score || 0).toFixed(2)
