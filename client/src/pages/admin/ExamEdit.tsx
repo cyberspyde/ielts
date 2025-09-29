@@ -1,4 +1,18 @@
 import React, { useEffect, useState } from 'react';
+import { computeSharedMcqBlocks, findBlockForQuestion, makeBlockKey, questionNumberOf, type SharedMcqBlock } from '../../utils/sharedOptions';
+
+const buildLettersFromQuestions = (questions: any[]): string[] => {
+  const letters: string[] = [];
+  questions.forEach((q: any) => {
+    (q.options || []).forEach((o: any) => {
+      const letter = (o.option_letter || o.letter) as string | undefined;
+      if (letter && !letters.includes(letter)) {
+        letters.push(letter);
+      }
+    });
+  });
+  return letters;
+};
 
 // --- Simple Table Editor extracted to prevent hook order violations ---
 const SimpleTableEditor: React.FC<{ question: any; updateQuestion: any; deleteQuestion: any; }> = ({ question: tq, updateQuestion, deleteQuestion }) => {
@@ -263,7 +277,6 @@ const SimpleTableEditor: React.FC<{ question: any; updateQuestion: any; deleteQu
                                 <option value="fill_blank">Fill Blank</option>
                                 <option value="multiple_choice">Multiple Choice</option>
                                 <option value="true_false">True/False</option>
-                                <option value="short_answer">Short Answer</option>
                               </select>
                               <input
                                 type="number"
@@ -706,6 +719,11 @@ const AdminExamEdit: React.FC = () => {
 
   // Section type navigator (tabs) to reduce page length for full mock exams
   const [activeSectionType, setActiveSectionType] = useState<string>('');
+  // Part grouping for full-mock exams: listening has 4 parts, reading has 3 passages.
+  const [activePartByType, setActivePartByType] = useState<Record<string, number>>({});
+  const FULL_MOCK = Array.isArray(exam?.tags) && exam.tags.includes('full-mock');
+  const LISTENING_PARTS = [1,2,3,4];
+  const READING_PARTS = [1,2,3];
   useEffect(() => {
     if (!exam) return;
     const types: string[] = Array.from(new Set((exam.sections || []).map((s: any) => s.sectionType))) as string[];
@@ -715,6 +733,10 @@ const AdminExamEdit: React.FC = () => {
     if (!activeSectionType || !sorted.includes(activeSectionType)) {
       setActiveSectionType(sorted[0] as string);
     }
+    // Initialize active part per type if not set
+    sorted.forEach(t => {
+      setActivePartByType(prev => prev[t] ? prev : { ...prev, [t]: 1 });
+    });
   }, [exam?.sections]);
 
   const updateQuestion = useMutation({
@@ -728,6 +750,21 @@ const AdminExamEdit: React.FC = () => {
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-exam', examId] }); toast.success('Question added'); },
     onError: (e: any) => toast.error(e.message || 'Failed to add question')
   });
+
+  // Helper to produce part metadata for current active part when creating questions in a full-mock listening/reading section
+  const basePartMeta = (section: any): any | undefined => {
+    if (!FULL_MOCK) return undefined;
+    if (!section) return undefined;
+    if (section.sectionType === 'listening') return { listeningPart: activePartByType['listening'] || 1 };
+    if (section.sectionType === 'reading') return { readingPart: activePartByType['reading'] || 1 };
+    return undefined;
+  };
+  // Merge helper: attach current part meta (if any) to provided metadata object
+  const withPartMeta = (section: any, meta?: any) => {
+    const part = basePartMeta(section);
+    if (part) return { ...(meta||{}), ...part };
+    return meta;
+  };
 
   const deleteQuestion = useMutation({
     mutationFn: async ({ questionId }: { questionId: string }) => apiService.delete(`/admin/questions/${questionId}`),
@@ -752,24 +789,63 @@ const AdminExamEdit: React.FC = () => {
   });
 
   // Dynamic shared MCQ options per section (letters list)
-  const [sharedOptionLetters, setSharedOptionLetters] = useState<Record<string, string[]>>({});
+  const [sharedOptionLetters, setSharedOptionLetters] = useState<Record<string, Record<string, string[]>>>({});
   // Per-section audio logic removed (centralized exam audio)
 
-  // Initialize letters from first MCQ question options if not already set
+  const resolveSharedLetters = (section: any, block: SharedMcqBlock): string[] => {
+    const sectionLetters = sharedOptionLetters[section.id] || {};
+    const key = makeBlockKey(section.id, block);
+    const existing = sectionLetters[key];
+    if (existing && existing.length) {
+      return existing;
+    }
+    return buildLettersFromQuestions(block.questions);
+  };
+
+  // Initialize letters for sections that use shared options
   useEffect(() => {
     if (!exam) return;
-    const next: Record<string, string[]> = { ...sharedOptionLetters };
-    let changed = false;
-    exam.sections?.forEach((section: any) => {
-      if (!next[section.id]) {
-        const firstMcq = (section.questions || []).find((q: any) => q.questionType === 'multiple_choice');
-        if (firstMcq) {
-          const letters = (firstMcq.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean);
-          if (letters.length) { next[section.id] = letters; changed = true; }
+    setSharedOptionLetters((prev) => {
+      const next: Record<string, Record<string, string[]>> = {};
+      let changed = false;
+      const sectionIds = new Set((exam.sections || []).map((s: any) => s.id));
+
+      Object.entries(prev).forEach(([sectionId, blocks]) => {
+        if (sectionIds.has(sectionId)) {
+          next[sectionId] = { ...blocks };
+        } else {
+          changed = true;
         }
-      }
+      });
+
+      exam.sections?.forEach((section: any) => {
+        const blocks = computeSharedMcqBlocks(section);
+        const sectionKey = section.id;
+        const existingBlocks = next[sectionKey] ? { ...next[sectionKey] } : {};
+        const validKeys = new Set(blocks.map((block) => makeBlockKey(sectionKey, block)));
+
+        Object.keys(existingBlocks).forEach((blockKey) => {
+          if (!validKeys.has(blockKey)) {
+            delete existingBlocks[blockKey];
+            changed = true;
+          }
+        });
+
+        blocks.forEach((block) => {
+          const key = makeBlockKey(sectionKey, block);
+          const currentLetters = existingBlocks[key] || [];
+          const letters = buildLettersFromQuestions(block.questions);
+          if (!existingBlocks[key] || currentLetters.join('|') !== letters.join('|')) {
+            existingBlocks[key] = letters;
+            changed = true;
+          }
+        });
+
+        next[sectionKey] = existingBlocks;
+      });
+
+      return changed ? next : prev;
     });
-    if (changed) setSharedOptionLetters(next);
   }, [exam]);
 
   const computeNextLetter = (used: string[]): string => {
@@ -786,7 +862,9 @@ const AdminExamEdit: React.FC = () => {
   const toggleCustomOptionsForGroup = async (section: any, anchor: any, enable: boolean) => {
     const members = mcqGroupMembers(section, anchor.id);
     // Determine shared baseline options (letters + text) from first non-custom MCQ or anchor itself
-    const baselineQ = section.questions.find((q:any)=> q.questionType==='multiple_choice' && !q.metadata?.customOptionsGroup) || anchor;
+    const block = findBlockForQuestion(section, anchor.id);
+    const blockBaseline = block?.questions?.find((q:any)=> !q.metadata?.customOptionsGroup) || block?.questions?.[0];
+    const baselineQ = blockBaseline || section.questions.find((q:any)=> q.questionType==='multiple_choice' && !q.metadata?.customOptionsGroup) || anchor;
     const baselineOptions = (baselineQ?.options || []).map((o:any)=>({ letter: o.option_letter || o.letter, text: o.option_text || o.text || '' })).filter((o:any)=>o.letter);
     for (const m of members) {
       const meta = { ...(m.metadata || {}) };
@@ -807,35 +885,64 @@ const AdminExamEdit: React.FC = () => {
     }
   };
 
-  const addSharedOption = async (section: any) => {
-    const current = sharedOptionLetters[section.id] || (['A','B','C','D'].slice(0, (section.questions?.[0]?.options || []).length) || []);
-    const nextLetter = computeNextLetter(current);
-    // Create this option for every MCQ question in section
-    const mcqs = section.questions.filter((q: any) => q.questionType === 'multiple_choice');
-    for (const q of mcqs) {
-      await createOption.mutateAsync({ questionId: q.id, optionText: '', optionLetter: nextLetter, optionOrder: (q.options?.length || 0) + 1 });
+  const addSharedOption = async (section: any, block: SharedMcqBlock) => {
+    const sharedMcqs = block.questions;
+    if (!sharedMcqs.length) {
+      toast.error('No questions in this section are using shared options. Switch a question back to "Shared opts" first.');
+      return;
     }
-    setSharedOptionLetters(prev => ({ ...prev, [section.id]: [...current, nextLetter] }));
+    const key = makeBlockKey(section.id, block);
+    const current = resolveSharedLetters(section, block);
+    const existingLetters = Array.from(new Set([...(current || []).filter(Boolean), ...buildLettersFromQuestions(sharedMcqs)]));
+    const nextLetter = computeNextLetter(existingLetters);
+    for (const q of sharedMcqs) {
+      const alreadyExists = (q.options || []).some((o: any) => (o.option_letter || o.letter) === nextLetter);
+      if (!alreadyExists) {
+        await createOption.mutateAsync({ questionId: q.id, optionText: '', optionLetter: nextLetter, optionOrder: (q.options?.length || 0) + 1 });
+      }
+    }
+    const nextLetters = [...existingLetters];
+    if (!nextLetters.includes(nextLetter)) {
+      nextLetters.push(nextLetter);
+    }
+    setSharedOptionLetters((prev) => {
+      const sectionMap = { ...(prev[section.id] || {}) };
+      sectionMap[key] = nextLetters;
+      return { ...prev, [section.id]: sectionMap };
+    });
   };
 
-  const removeSharedOption = async (section: any, letter: string) => {
+  const removeSharedOption = async (section: any, block: SharedMcqBlock, letter: string) => {
     openConfirm({
       title: 'Remove Shared Option',
-      description: <>Remove option <strong>{letter}</strong> from all MCQ questions in this section? This action cannot be undone.</>,
+      description: <>Remove option <strong>{letter}</strong> from this shared MCQ group? This action cannot be undone.</>,
       tone: 'warning',
       confirmText: 'Remove',
       onConfirm: async () => {
-        const mcqs = section.questions.filter((q: any) => q.questionType === 'multiple_choice');
+        const mcqs = block.questions;
         for (const q of mcqs) {
           const opt = (q.options || []).find((o: any) => (o.option_letter || o.letter) === letter);
           if (opt) {
             await deleteOption.mutateAsync({ optionId: opt.id, questionId: q.id });
           }
-          if ((q.correctAnswer || '') === letter) {
-            await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: '' } });
+          if (q.correctAnswer) {
+            if (q.metadata?.allowMultiSelect || String(q.correctAnswer).includes('|')) {
+              const parts = String(q.correctAnswer).split('|').filter(Boolean);
+              if (parts.includes(letter)) {
+                const next = parts.filter((p: string) => p !== letter).join('|');
+                await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: next } });
+              }
+            } else if (String(q.correctAnswer) === letter) {
+              await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: '' } });
+            }
           }
         }
-        setSharedOptionLetters(prev => ({ ...prev, [section.id]: (prev[section.id] || []).filter(l => l !== letter) }));
+        const key = makeBlockKey(section.id, block);
+        setSharedOptionLetters((prev) => {
+          const sectionMap = { ...(prev[section.id] || {}) };
+          sectionMap[key] = (sectionMap[key] || []).filter((l) => l !== letter);
+          return { ...prev, [section.id]: sectionMap };
+        });
       }
     });
   };
@@ -976,6 +1083,24 @@ const AdminExamEdit: React.FC = () => {
                   </button>
                 ))}
               </div>
+              {/* Part tabs for full-mock listening/reading */}
+              {FULL_MOCK && ['listening','reading'].includes(activeSectionType) && (
+                <div className="mt-4 flex gap-2 flex-wrap border-t pt-3">
+                  { (activeSectionType === 'listening' ? LISTENING_PARTS : READING_PARTS).map(p => {
+                      const label = activeSectionType === 'listening' ? `Part ${p}` : `Passage ${p}`;
+                      return (
+                        <button
+                          key={`part-${activeSectionType}-${p}`}
+                          type="button"
+                          className={`px-3 py-1 text-xs rounded border ${ (activePartByType[activeSectionType]||1) === p ? 'bg-indigo-600 text-white border-indigo-600' : 'border-gray-300 text-gray-700 hover:bg-gray-50'}`}
+                          onClick={() => setActivePartByType(prev => ({ ...prev, [activeSectionType]: p }))}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                </div>
+              )}
             </div>
           );
         })()}
@@ -993,7 +1118,15 @@ const AdminExamEdit: React.FC = () => {
         })()}
 
         {/* Sections & Questions */}
-        {exam.sections?.filter((s: any) => !activeSectionType || s.sectionType === activeSectionType).map((section: any) => (
+        {exam.sections?.filter((s: any) => !activeSectionType || s.sectionType === activeSectionType).map((section: any) => {
+          // Part filtering: only apply to listening/reading in full-mock; questions carry metadata listeningPart/readingPart.
+          const activePart = activePartByType[section.sectionType];
+          const partKey = section.sectionType === 'listening' ? 'listeningPart' : (section.sectionType === 'reading' ? 'readingPart' : null);
+          const filterByPart = FULL_MOCK && partKey && activePart;
+          const originalQuestions = section.questions || [];
+          const questions = filterByPart ? originalQuestions.filter((q:any)=> (q.metadata?.[partKey] || 1) === activePart) : originalQuestions;
+          const sectionWithFiltered = { ...section, questions };
+          return (
           <div key={section.id} className="bg-white rounded-lg border p-6 mb-6">
             <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
               <div className="md:col-span-2">
@@ -1035,7 +1168,7 @@ const AdminExamEdit: React.FC = () => {
                         <div className="flex items-center justify-between mb-2">
                           <div className="text-sm font-medium text-gray-800">Task 1</div>
                           {!task1 && (
-                            <button type="button" className="px-2 py-1 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'writing_task1', questionText: 'Writing Task 1', metadata: { variant: 'academic_report', minWords: 150, maxWords: 220, guidance: '' } })}>Create Task 1</button>
+                            <button type="button" className="px-2 py-1 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'writing_task1', questionText: 'Writing Task 1', metadata: withPartMeta(section, { variant: 'academic_report', minWords: 150, maxWords: 220, guidance: '' }) })}>Create Task 1</button>
                           )}
                         </div>
                         {task1 && (
@@ -1073,7 +1206,7 @@ const AdminExamEdit: React.FC = () => {
                         <div className="flex items-center justify-between mb-2">
                           <div className="text-sm font-medium text-gray-800">Task 2</div>
                           {!task2 && (
-                            <button type="button" className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'essay', questionText: 'Writing Task 2', metadata: { writingPart: 2, guidance: '' } })}>Create Task 2</button>
+                            <button type="button" className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'essay', questionText: 'Writing Task 2', metadata: withPartMeta(section, { writingPart: 2, guidance: '' }) })}>Create Task 2</button>
                           )}
                         </div>
                         {task2 && (
@@ -1119,7 +1252,7 @@ const AdminExamEdit: React.FC = () => {
                         sectionId: section.id, 
                         questionType: 'simple_table', 
                         questionText: 'Table Instructions', 
-                        metadata: { 
+                        metadata: withPartMeta(section, { 
                           simpleTable: { 
                             rows: [
                               [
@@ -1128,19 +1261,19 @@ const AdminExamEdit: React.FC = () => {
                               ]
                             ]
                           } 
-                        } 
+                        }) 
                       })}
                     >+ Simple Table</button>
                   </div>
                 </div>
                 {(() => {
-                  const simpleTableQuestions = (section.questions || []).filter((q:any)=> q.questionType === 'simple_table');
+                  const simpleTableQuestions = (sectionWithFiltered.questions || []).filter((q:any)=> q.questionType === 'simple_table');
                   return simpleTableQuestions.map((tq:any)=> (
                     <SimpleTableEditor key={tq.id} question={tq} updateQuestion={updateQuestion} deleteQuestion={deleteQuestion} />
                   ));
                 })()}
                 {(() => { 
-                  const count = (section.questions || []).filter((q:any)=> q.questionType==='simple_table').length; 
+                  const count = (sectionWithFiltered.questions || []).filter((q:any)=> q.questionType==='simple_table').length; 
                   return count===0 ? (
                     <div className="text-[11px] text-gray-500 italic">No simplified tables yet.</div>
                   ) : null; 
@@ -1170,7 +1303,6 @@ const AdminExamEdit: React.FC = () => {
                         <option value="multiple_choice">Multiple Choice</option>
                         <option value="true_false">True/False/NG</option>
                         <option value="fill_blank">Fill Blank</option>
-                        <option value="short_answer">Short Answer</option>
                         <option value="drag_drop">Drag & Drop</option>
                         <option value="matching">Heading Matching</option>
                         <option value="essay">Essay</option>
@@ -1194,7 +1326,14 @@ const AdminExamEdit: React.FC = () => {
                       <button type="button" className="px-3 py-2 text-xs rounded-md bg-blue-600 text-white disabled:opacity-50" disabled={bulkCreateQuestions.isPending} onClick={() => {
                         const start = Number(rd.start)||0; const end = Number(rd.end)||0; const points = Number(rd.points)||1;
                         if (!start || !end || end < start) { toast.error('Invalid range'); return; }
-                        bulkCreateQuestions.mutate({ sectionId: section.id, groups: [{ questionType: rd.questionType, start, end, points, fillMissing: rd.fillMissing }] });
+                        // Include part metadata for listening/reading when full-mock so created questions attach to current part/passsage
+                        let meta: any = undefined;
+                        if (FULL_MOCK && ['listening','reading'].includes(section.sectionType)) {
+                          const partKey = section.sectionType === 'listening' ? 'listeningPart' : 'readingPart';
+                          const activePart = activePartByType[section.sectionType] || 1;
+                          meta = { [partKey]: activePart };
+                        }
+                        bulkCreateQuestions.mutate({ sectionId: section.id, groups: [{ questionType: rd.questionType, start, end, points, fillMissing: rd.fillMissing, metadata: meta }] });
                       }}>{bulkCreateQuestions.isPending ? 'Adding...' : 'Add Range'}</button>
                       <button type="button" className="px-3 py-2 text-xs rounded-md border" onClick={() => setRangeDraft(section.id, { start: '', end: '' })}>Reset</button>
                       <label className="flex items-center gap-1 text-xs text-gray-600">
@@ -1217,17 +1356,17 @@ const AdminExamEdit: React.FC = () => {
                   <button
                     type="button"
                     className="px-2 py-1 text-xs rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
-                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_labeling', questionText: 'Label the indicated position', metadata: { anchor: { x: 0.5, y: 0.5 } } })}
+                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_labeling', questionText: 'Label the indicated position', metadata: withPartMeta(section, { anchor: { x: 0.5, y: 0.5 } }) })}
                   >+ Add Image Label</button>
                   <button
                     type="button"
                     className="px-2 py-1 text-xs rounded border border-green-300 text-green-700 hover:bg-green-50"
-                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_dnd', questionText: 'Drag the correct label to its position', metadata: { anchors: [{ id: 'A', x: 0.5, y: 0.5 }], tokens: ['A'], correctMap: { A: 'A' } } })}
+                    onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'image_dnd', questionText: 'Drag the correct label to its position', metadata: withPartMeta(section, { anchors: [{ id: 'A', x: 0.5, y: 0.5 }], tokens: ['A'], correctMap: { A: 'A' } }) })}
                   >+ Add Image Drag/Drop</button>
                 </div>
               </div>
               {(() => {
-                const imageQs = (section.questions || []).filter((q:any)=> q.questionType === 'image_labeling' || q.questionType === 'image_dnd').sort((a:any,b:any)=> (a.questionNumber||0)-(b.questionNumber||0));
+                const imageQs = (sectionWithFiltered.questions || []).filter((q:any)=> q.questionType === 'image_labeling' || q.questionType === 'image_dnd').sort((a:any,b:any)=> (a.questionNumber||0)-(b.questionNumber||0));
                 if (imageQs.length === 0) return <div className="text-[11px] text-gray-500 italic">No image labeling questions yet.</div>;
                 const sharedUrl = imageQs[0]?.imageUrl || '';
                 return (
@@ -1337,7 +1476,7 @@ const AdminExamEdit: React.FC = () => {
 
             {/* Dynamic grouped blocks sorted by lowest question number per type */}
             {(() => {
-              const qs = section.questions || [];
+              const qs = sectionWithFiltered.questions || [];
               const types: string[] = Array.from(new Set(qs.map((q: any) => q.questionType))) as string[];
               const getNum = (q: any) => q.questionNumber || q.order || 999999;
               const typeMeta = types
@@ -1380,7 +1519,7 @@ const AdminExamEdit: React.FC = () => {
                             const options = [ ...(section.headingBank?.options || []), { letter: '', text: '' } ];
                             updateSection.mutate({ sectionId: section.id, data: { headingBank: { options } } });
                           }}>Add Heading</button>
-                          <button className="px-3 py-2 text-sm border rounded bg-blue-50 border-blue-300 text-blue-700" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'matching' })}>+ Add Paragraph</button>
+                          <button className="px-3 py-2 text-sm border rounded bg-blue-50 border-blue-300 text-blue-700" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'matching', metadata: withPartMeta(section) })}>+ Add Paragraph</button>
                           <button className="px-3 py-2 text-sm border rounded bg-green-50 border-green-300 text-green-700" onClick={async () => {
                             const passage = section.passageText || '';
                             // Detect explicit markers first: [[P1]] [[paragraph2]] etc.
@@ -1411,7 +1550,7 @@ const AdminExamEdit: React.FC = () => {
                             if (toCreate.length > 10 && !window.confirm(`Create ${toCreate.length} paragraph questions?`)) return;
                             for (const p of toCreate) {
                               const snippet = p.text.slice(0, 110).replace(/\s+/g,' ').trim();
-                              await createQuestion.mutateAsync({ sectionId: section.id, questionType: 'matching', metadata: { paragraphIndex: p.idx }, questionText: snippet ? `Paragraph ${p.idx}: ${snippet}` : `Paragraph ${p.idx}` });
+                              await createQuestion.mutateAsync({ sectionId: section.id, questionType: 'matching', metadata: withPartMeta(section, { paragraphIndex: p.idx }), questionText: snippet ? `Paragraph ${p.idx}: ${snippet}` : `Paragraph ${p.idx}` });
                             }
                           }}>Generate from Passage</button>
                         </div>
@@ -1447,7 +1586,7 @@ const AdminExamEdit: React.FC = () => {
                             </div>
                           </div>
                           <div className="md:col-span-9 space-y-2">
-                            {section.questions.filter((q: any) => q.questionType === 'matching').sort((a: any,b: any) => getNum(a)-getNum(b)).map((q: any, idx: number) => (
+                            {sectionWithFiltered.questions.filter((q: any) => q.questionType === 'matching').sort((a: any,b: any) => getNum(a)-getNum(b)).map((q: any, idx: number) => (
                               <div
                                 key={`dnd-${q.id}`}
                                 className={`flex items-center gap-3 p-2 rounded border transition-colors ${dragOverQuestionId === q.id ? 'border-blue-400 bg-blue-50' : 'border-gray-200'}`}
@@ -1489,7 +1628,7 @@ const AdminExamEdit: React.FC = () => {
                                 </div>
                               </div>
                             ))}
-                            {section.questions.filter((q: any)=>q.questionType==='matching').length === 0 && (
+                            {sectionWithFiltered.questions.filter((q: any)=>q.questionType==='matching').length === 0 && (
                               <div className="text-xs text-gray-500 italic">No paragraph questions yet. Click "+ Add Paragraph" to create them manually.</div>
                             )}
                           </div>
@@ -1499,6 +1638,31 @@ const AdminExamEdit: React.FC = () => {
                   );
                 }
                 if (tm.type === 'multiple_choice') {
+                  const sharedBlocks = computeSharedMcqBlocks(sectionWithFiltered);
+                  const questionBlockMap = new Map<string, SharedMcqBlock>();
+                  sharedBlocks.forEach((block) => {
+                    block.questions.forEach((q: any) => {
+                      questionBlockMap.set(q.id, block);
+                    });
+                  });
+                  const baseSharedQuestion = sharedBlocks[0]?.questions?.[0] || section.questions.find((q: any) => q.questionType === 'multiple_choice');
+                  const sharedLettersByBlock = new Map<string, string[]>();
+                  const sharedTextByBlock = new Map<string, Map<string, string>>();
+                  sharedBlocks.forEach((block) => {
+                    const key = makeBlockKey(section.id, block);
+                    const letters = resolveSharedLetters(section, block);
+                    sharedLettersByBlock.set(key, letters);
+                    const textMap = new Map<string, string>();
+                    block.questions.forEach((q: any) => {
+                      (q.options || []).forEach((o: any) => {
+                        const letter = (o.option_letter || o.letter) as string;
+                        if (letter && !textMap.has(letter)) {
+                          textMap.set(letter, o.option_text || o.text || '');
+                        }
+                      });
+                    });
+                    sharedTextByBlock.set(key, textMap);
+                  });
                   return (
                     <div key={`block-${tm.type}`} className="mb-4 border rounded">
                       <div className="px-3 py-2 border-b bg-gray-50 text-sm font-medium text-gray-700 flex items-center justify-between">
@@ -1513,6 +1677,7 @@ const AdminExamEdit: React.FC = () => {
                             <input type="checkbox" className="rounded border-gray-300" checked={!!showAdvanced[section.id]} onChange={(e) => setShowAdvanced(prev => ({ ...prev, [section.id]: e.target.checked }))} />
                             Show advanced list
                           </label>
+                          {/* Global dropdown seeding removed; now per-question/group controls */}
                         </div>
                       </div>
                       <div className="p-3">
@@ -1533,6 +1698,7 @@ const AdminExamEdit: React.FC = () => {
                             />
                             Enable multi-select for this block
                           </label>
+                          {/* Removed block-wide dropdown toggle */}
                           {(() => { const q0 = section.questions.find((q:any)=>q.questionType==='multiple_choice'); const allow = q0?.metadata?.allowMultiSelect; return allow ? (
                             <label className="flex items-center gap-1">
                               Select count:
@@ -1566,231 +1732,355 @@ const AdminExamEdit: React.FC = () => {
                           {!hideSharedOptions[section.id] && (
                           <div className="md:col-span-4">
                             <div className="text-xs text-gray-600 mb-1">Shared options</div>
-                            <div className="space-y-2">
-                              {(sharedOptionLetters[section.id] || (() => { const first = section.questions.find((q: any) => q.questionType==='multiple_choice'); return (first?.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean); })()).map((letter: string, idx: number) => (
-                                <div key={`mc-${letter}`} className="flex items-center gap-2 group">
-                                  <span className="w-6 text-sm text-gray-600">{letter}</span>
-                                  <input className="flex-1 rounded-md border-gray-300 text-sm" placeholder={`Option ${letter}`} defaultValue={(() => { const firstQ = section.questions.find((q: any) => q.questionType==='multiple_choice'); const opt = firstQ?.options?.find((o: any) => (o.option_letter||o.letter)===letter); return opt?.option_text || opt?.text || ''; })()} onBlur={(e) => {
-                                    const value = e.target.value;
-                                    // Only update MCQs that are NOT in a custom options group
-                                    const mcQs = section.questions.filter((q: any) => q.questionType === 'multiple_choice' && !q.metadata?.customOptionsGroup);
-                                    mcQs.forEach(async (q: any) => {
-                                      const existing = (q.options || []).find((o: any) => (o.option_letter || o.letter) === letter);
-                                      if (existing) {
-                                        if (value !== (existing.option_text || existing.text)) {
-                                          await updateOption.mutateAsync({ optionId: existing.id, data: { optionText: value }, questionId: q.id });
-                                        }
-                                      } else {
-                                        await createOption.mutateAsync({ questionId: q.id, optionText: value, optionLetter: letter, optionOrder: idx + 1 });
-                                      }
-                                    });
-                                  }} />
-                                  <button type="button" onClick={() => removeSharedOption(section, letter)} className="opacity-0 group-hover:opacity-100 text-xs px-2 py-1 border rounded text-red-600 border-red-300 hover:bg-red-50">Del</button>
+                            <div className="space-y-3">
+                              {sharedBlocks.length === 0 ? (
+                                <div className="text-[11px] text-gray-500 bg-gray-100 border border-dashed border-gray-300 rounded px-2 py-1.5">
+                                  No questions are currently using shared options. Switch a question back to <strong>Shared opts</strong> to manage shared banks here.
                                 </div>
-                              ))}
-                              <button type="button" onClick={() => addSharedOption(section)} className="px-2 py-1 text-xs border rounded text-blue-600 border-blue-300 hover:bg-blue-50">Add option</button>
+                              ) : (
+                                sharedBlocks.map((block) => {
+                                  const key = makeBlockKey(section.id, block);
+                                  const letters = sharedLettersByBlock.get(key) || [];
+                                  const sharedTextMap = sharedTextByBlock.get(key) || new Map<string, string>();
+                                  const displayStart = block.start || questionNumberOf(block.questions[0]) || 0;
+                                  const displayEnd = block.end || questionNumberOf(block.questions[block.questions.length - 1]) || displayStart;
+                                  const rangeLabel = displayStart && displayEnd
+                                    ? (displayStart === displayEnd ? `Q${displayStart}` : `Q${displayStart}–${displayEnd}`)
+                                    : `${block.questions.length} question${block.questions.length > 1 ? 's' : ''}`;
+                                  return (
+                                    <div key={key} className="border border-gray-200 rounded p-2 bg-white space-y-2">
+                                      <div className="flex items-center justify-between">
+                                        <span className="text-[11px] font-medium text-gray-600">{rangeLabel}</span>
+                                        <span className="text-[10px] text-gray-400">{block.questions.length} question{block.questions.length > 1 ? 's' : ''}</span>
+                                      </div>
+                                      {letters.length === 0 ? (
+                                        <div className="text-[11px] text-gray-500 bg-gray-100 border border-dashed border-gray-300 rounded px-2 py-1.5">
+                                          No shared options yet. Add one below.
+                                        </div>
+                                      ) : (
+                                        letters.map((letter, idx) => (
+                                          <div key={`${key}-${letter}`} className="flex items-center gap-2 group">
+                                            <span className="w-6 text-sm text-gray-600">{letter}</span>
+                                            <input
+                                              className="flex-1 rounded-md border-gray-300 text-sm"
+                                              placeholder={`Option ${letter}`}
+                                              defaultValue={sharedTextMap.get(letter) || ''}
+                                              onBlur={(e) => {
+                                                const value = e.target.value;
+                                                block.questions.forEach(async (q: any) => {
+                                                  const existing = (q.options || []).find((o: any) => (o.option_letter || o.letter) === letter);
+                                                  if (existing) {
+                                                    if (value !== (existing.option_text || existing.text)) {
+                                                      await updateOption.mutateAsync({ optionId: existing.id, data: { optionText: value }, questionId: q.id });
+                                                    }
+                                                  } else {
+                                                    await createOption.mutateAsync({ questionId: q.id, optionText: value, optionLetter: letter, optionOrder: idx + 1 });
+                                                  }
+                                                });
+                                              }}
+                                            />
+                                            <button
+                                              type="button"
+                                              onClick={() => removeSharedOption(section, block, letter)}
+                                              className="opacity-0 group-hover:opacity-100 text-xs px-2 py-1 border rounded text-red-600 border-red-300 hover:bg-red-50"
+                                            >Del</button>
+                                          </div>
+                                        ))
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() => addSharedOption(section, block)}
+                                        disabled={!block.questions.length}
+                                        className={`px-2 py-1 text-xs border rounded ${block.questions.length ? 'text-blue-600 border-blue-300 hover:bg-blue-50' : 'text-gray-400 border-gray-200 cursor-not-allowed bg-gray-100'}`}
+                                      >Add option</button>
+                                    </div>
+                                  );
+                                })
+                              )}
                             </div>
                           </div>
                           )}
                           <div className={`md:col-span-8 ${hideSharedOptions[section.id] ? 'md:col-span-12' : ''}`}>
                             <div className="text-xs text-gray-600 mb-1">Questions and correct answers</div>
                             <div className="space-y-2">
-                              {section.questions.filter((q: any) => q.questionType === 'multiple_choice').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
-                                <div key={`mc-row-${q.id}`} className="flex items-center gap-2">
-                                  <div className="w-10 text-xs text-gray-500">Q{q.questionNumber || q.order || i + 1}</div>
-                                  <input defaultValue={q.questionText || ''} placeholder="Question text" onBlur={(e) => updateQuestion.mutate({ questionId: q.id, data: { questionText: e.target.value } })} className="flex-1 rounded-md border-gray-300 text-sm" />
-                                  {/* Hide selector buttons for group member questions; only anchors choose answers */}
-                                  {!q.metadata?.groupMemberOf && (
-                                    <div className="flex items-center gap-1">
-                                      {(() => {
-                                        const letters = q.metadata?.customOptionsGroup
-                                          ? (q.options || []).map((o: any)=>o.option_letter || o.letter).filter(Boolean)
-                                          : (sharedOptionLetters[section.id] || (() => { const first = section.questions.find((qq: any)=>qq.questionType==='multiple_choice' && !qq.metadata?.customOptionsGroup); return (first?.options || []).map((o: any)=> o.option_letter || o.letter).filter(Boolean); })());
-                                        const groupSize = q.metadata?.groupRangeEnd ? (q.metadata.groupRangeEnd - (q.questionNumber || 0) + 1) : 1;
-                                        const explicitMulti = !!q.metadata?.allowMultiSelect; // block toggle
-                                        // Auto-enable multi-select for group anchors when group size > 1
-                                        const treatMulti = explicitMulti || (groupSize > 1 && !!q.metadata?.groupRangeEnd);
-                                        const maxSel = explicitMulti ? (Number(q.metadata?.selectCount) || 2) : (treatMulti ? groupSize : 1);
-                                        return letters.map((letter: string) => {
-                                          if (treatMulti) {
-                                            const current = (q.correctAnswer || '').split('|').filter(Boolean);
-                                            const selected = current.includes(letter);
+                              {sectionWithFiltered.questions
+                                .filter((q: any) => q.questionType === 'multiple_choice')
+                                .sort((a: any, b: any) => getNum(a) - getNum(b))
+                                .map((q: any, i: number) => {
+                                  const isGroupAnchor = !!q.metadata?.groupRangeEnd;
+                                  const groupMembers = isGroupAnchor ? section.questions.filter((m: any) => m.metadata?.groupMemberOf === q.id) : [];
+                                  const applyToGroup = (fn: (target: any) => void | Promise<void>) => {
+                                    if (isGroupAnchor) {
+                                      fn(q);
+                                      groupMembers.forEach(fn);
+                                    } else {
+                                      fn(q);
+                                    }
+                                  };
+                                  const toggleDropdown = (checked: boolean) => {
+                                    applyToGroup((target) => {
+                                      const meta = { ...(target.metadata || {}) } as any;
+                                      if (checked) {
+                                        meta.displayMode = 'dropdown';
+                                        meta.display_mode = 'dropdown';
+                                        meta.renderMode = 'dropdown';
+                                        meta.dropdown = true;
+                                      } else {
+                                        delete meta.displayMode;
+                                        delete meta.display_mode;
+                                        delete meta.renderMode;
+                                        delete meta.dropdown;
+                                      }
+                                      target.metadata = meta;
+                                      updateQuestion.mutate({ questionId: target.id, data: { metadata: meta } });
+                                    });
+                                  };
+                                  const dropdownEnabled = q.metadata?.displayMode === 'dropdown'
+                                    || q.metadata?.display_mode === 'dropdown'
+                                    || q.metadata?.renderMode === 'dropdown'
+                                    || q.metadata?.dropdown === true;
+                                  return (
+                                    <div key={`mc-row-${q.id}`} className="flex items-center gap-2">
+                                      <div className="w-10 text-xs text-gray-500">Q{q.questionNumber || q.order || i + 1}</div>
+                                      <input
+                                        defaultValue={q.questionText || ''}
+                                        placeholder="Question text"
+                                        onBlur={(e) => updateQuestion.mutate({ questionId: q.id, data: { questionText: e.target.value } })}
+                                        className="flex-1 rounded-md border-gray-300 text-sm"
+                                      />
+                                      {!q.metadata?.groupMemberOf && (
+                                        <div className="flex items-center gap-1">
+                                          {(() => {
+                                            const block = questionBlockMap.get(q.id);
+                                            const sharedLetters = block ? (sharedLettersByBlock.get(makeBlockKey(section.id, block)) || resolveSharedLetters(section, block)) : [];
+                                            const letters = q.metadata?.customOptionsGroup
+                                              ? (q.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean)
+                                              : (sharedLetters.length ? sharedLetters : (() => {
+                                                const first = baseSharedQuestion;
+                                                return (first?.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean);
+                                              })());
+                                            const groupSize = q.metadata?.groupRangeEnd ? (q.metadata.groupRangeEnd - (q.questionNumber || 0) + 1) : 1;
+                                            const explicitMulti = !!q.metadata?.allowMultiSelect;
+                                            const treatMulti = explicitMulti || (groupSize > 1 && !!q.metadata?.groupRangeEnd);
+                                            const maxSel = explicitMulti ? (Number(q.metadata?.selectCount) || 2) : (treatMulti ? groupSize : 1);
+                                            return letters.map((letter: string) => {
+                                              if (treatMulti) {
+                                                const current = (q.correctAnswer || '').split('|').filter(Boolean);
+                                                const selected = current.includes(letter);
+                                                return (
+                                                  <button
+                                                    key={`${q.id}-${letter}`}
+                                                    onClick={async () => {
+                                                      let next = [...current];
+                                                      if (selected) {
+                                                        next = next.filter((l) => l !== letter);
+                                                      } else if (next.length < maxSel) {
+                                                        next.push(letter);
+                                                      } else {
+                                                        next[next.length - 1] = letter;
+                                                      }
+                                                      const answer = next.join('|');
+                                                      await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: answer } });
+                                                      if (q.metadata?.groupRangeEnd) {
+                                                        section.questions
+                                                          .filter((m: any) => m.metadata?.groupMemberOf === q.id)
+                                                          .forEach((m: any) => {
+                                                            updateQuestion.mutate({ questionId: m.id, data: { correctAnswer: answer } });
+                                                          });
+                                                      }
+                                                    }}
+                                                    className={`px-2 py-1 rounded border text-xs ${selected ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700'}`}
+                                                  >{letter}</button>
+                                                );
+                                              }
+                                              return (
+                                                <button
+                                                  key={`${q.id}-${letter}`}
+                                                  onClick={async () => {
+                                                    const answer = letter;
+                                                    await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: answer } });
+                                                    if (q.metadata?.groupRangeEnd) {
+                                                      section.questions
+                                                        .filter((m: any) => m.metadata?.groupMemberOf === q.id)
+                                                        .forEach((m: any) => {
+                                                          updateQuestion.mutate({ questionId: m.id, data: { correctAnswer: answer } });
+                                                        });
+                                                    }
+                                                  }}
+                                                  className={`px-2 py-1 rounded border text-xs ${(q.correctAnswer || '') === letter ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700'}`}
+                                                >{letter}</button>
+                                              );
+                                            });
+                                          })()}
+                                        </div>
+                                      )}
+                                      <div className="flex flex-col items-start gap-1 ml-1">
+                                        <label
+                                          className={`flex items-center gap-1 text-[10px] ${q.metadata?.allowMultiSelect ? 'opacity-40 cursor-not-allowed' : ''}`}
+                                          title={q.metadata?.allowMultiSelect ? 'Disable multi-select to use dropdown mode' : 'Render this question as dropdown'}
+                                        >
+                                          <input
+                                            type="checkbox"
+                                            disabled={!!q.metadata?.allowMultiSelect}
+                                            className="rounded border-gray-300"
+                                            checked={dropdownEnabled}
+                                            onChange={(e) => toggleDropdown(e.target.checked)}
+                                          />
+                                          DD
+                                        </label>
+                                      </div>
+                                      <div className="flex flex-col items-start gap-1 ml-2">
+                                        {(() => {
+                                          const meta = q.metadata || {};
+                                          if (meta.groupMemberOf) {
+                                            const anchor = section.questions.find((qq: any) => qq.id === meta.groupMemberOf);
+                                            const anchorNum = anchor?.questionNumber || '?';
                                             return (
-                                              <button
-                                                key={`${q.id}-${letter}`}
-                                                onClick={async () => {
-                                                  let next = [...current];
-                                                  if (selected) {
-                                                    next = next.filter(l => l !== letter);
-                                                  } else if (next.length < maxSel) {
-                                                    next.push(letter);
-                                                  } else {
-                                                    next[next.length - 1] = letter; // replace last
-                                                  }
-                                                  const answer = next.join('|');
-                                                  await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: answer } });
-                                                  if (q.metadata?.groupRangeEnd) {
-                                                    section.questions.filter((m:any)=> m.metadata?.groupMemberOf === q.id).forEach((m:any) => {
-                                                      updateQuestion.mutate({ questionId: m.id, data: { correctAnswer: answer } });
-                                                    });
-                                                  }
-                                                }}
-                                                className={`px-2 py-1 rounded border text-xs ${ selected ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700'}`}
-                                              >{letter}</button>
+                                              <span
+                                                className="text-[10px] px-2 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-700"
+                                                title={`Member of group starting at Q${anchorNum}`}
+                                              >Member of Q{anchorNum}</span>
                                             );
                                           }
-                                          // single-select
+                                          if (meta.groupRangeEnd) {
+                                            return (
+                                              <div className="flex items-center gap-1 flex-wrap">
+                                                <span className="text-[10px] px-2 py-0.5 rounded bg-purple-600 text-white" title="Group anchor">Group Q{q.questionNumber}–{meta.groupRangeEnd}</span>
+                                                {meta.customOptionsGroup ? (
+                                                  <>
+                                                    <span className="text-[10px] px-2 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-700" title="Group has custom options">Local opts</span>
+                                                    <button
+                                                      type="button"
+                                                      className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
+                                                      onClick={() => toggleCustomOptionsForGroup(section, q, false)}
+                                                    >Shared opts</button>
+                                                    <button
+                                                      type="button"
+                                                      className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
+                                                      onClick={async () => {
+                                                        const letters = (q.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean);
+                                                        const nextLetter = computeNextLetter(letters);
+                                                        const members = mcqGroupMembers(section, q.id);
+                                                        for (const m of members) {
+                                                          await createOption.mutateAsync({
+                                                            questionId: m.id,
+                                                            optionText: `Option ${nextLetter}`,
+                                                            optionLetter: nextLetter,
+                                                            optionOrder: (m.options?.length || 0) + 1,
+                                                          });
+                                                        }
+                                                      }}
+                                                    >Add Opt</button>
+                                                    <button
+                                                      type="button"
+                                                      className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
+                                                      onClick={() => setOpenLocalOptions((prev) => ({ ...prev, [q.id]: !prev[q.id] }))}
+                                                    >{openLocalOptions[q.id] ? 'Hide' : 'Edit'} Local</button>
+                                                  </>
+                                                ) : (
+                                                  <button
+                                                    type="button"
+                                                    className="text-[10px] px-2 py-0.5 border rounded border-purple-300 text-purple-700 hover:bg-purple-50"
+                                                    onClick={() => toggleCustomOptionsForGroup(section, q, true)}
+                                                  >Customize opts</button>
+                                                )}
+                                                {meta.customOptionsGroup && openLocalOptions[q.id] && (
+                                                  <div className="w-full mt-2 bg-white border rounded p-2 text-[11px] space-y-1">
+                                                    {(q.options || []).map((opt: any) => {
+                                                      const letter = opt.option_letter || opt.letter;
+                                                      return (
+                                                        <div key={opt.id || letter} className="flex items-center gap-2">
+                                                          <span className="w-5 text-gray-600 font-medium">{letter}</span>
+                                                          <input
+                                                            defaultValue={opt.option_text || opt.text || ''}
+                                                            placeholder={`Option ${letter}`}
+                                                            className="flex-1 border rounded px-2 py-1"
+                                                            onBlur={async (e) => {
+                                                              const value = e.target.value;
+                                                              if ((opt.option_text || opt.text || '') === value) return;
+                                                              const members = mcqGroupMembers(section, q.id);
+                                                              for (const m of members) {
+                                                                const match = (m.options || []).find((o: any) => (o.option_letter || o.letter) === letter);
+                                                                if (match) {
+                                                                  await updateOption.mutateAsync({ optionId: match.id, data: { optionText: value }, questionId: m.id });
+                                                                }
+                                                              }
+                                                            }}
+                                                          />
+                                                          <button
+                                                            type="button"
+                                                            className="text-[10px] px-1.5 py-0.5 border rounded border-red-300 text-red-600 hover:bg-red-50"
+                                                            title="Remove this option from the group"
+                                                            onClick={async () => {
+                                                              if (!window.confirm(`Remove option ${letter} from this group's local options?`)) return;
+                                                              const members = mcqGroupMembers(section, q.id);
+                                                              for (const m of members) {
+                                                                const match = (m.options || []).find((o: any) => (o.option_letter || o.letter) === letter);
+                                                                if (match) {
+                                                                  await deleteOption.mutateAsync({ optionId: match.id, questionId: m.id });
+                                                                }
+                                                                if (m.correctAnswer) {
+                                                                  if (m.metadata?.allowMultiSelect) {
+                                                                    const parts = (m.correctAnswer || '').split('|').filter(Boolean);
+                                                                    if (parts.includes(letter)) {
+                                                                      const next = parts.filter((p: string) => p !== letter).join('|');
+                                                                      await updateQuestion.mutateAsync({ questionId: m.id, data: { correctAnswer: next } });
+                                                                    }
+                                                                  } else if (m.correctAnswer === letter) {
+                                                                    await updateQuestion.mutateAsync({ questionId: m.id, data: { correctAnswer: '' } });
+                                                                  }
+                                                                }
+                                                              }
+                                                            }}
+                                                          >Del</button>
+                                                        </div>
+                                                      );
+                                                    })}
+                                                    <div className="text-[10px] text-gray-500">These options apply to Questions {q.questionNumber}–{meta.groupRangeEnd}. Editing text updates all members.</div>
+                                                  </div>
+                                                )}
+                                                <button
+                                                  type="button"
+                                                  className="text-[10px] px-2 py-0.5 border rounded border-purple-300 text-purple-700 hover:bg-purple-50"
+                                                  onClick={async () => {
+                                                    if (!window.confirm('Remove this group? Members will be detached.')) return;
+                                                    const newMeta: any = { ...meta };
+                                                    delete newMeta.groupRangeEnd;
+                                                    delete newMeta.customOptionsGroup;
+                                                    await updateQuestion.mutateAsync({ questionId: q.id, data: { metadata: newMeta } });
+                                                    section.questions.filter((qq: any) => qq.metadata?.groupMemberOf === q.id).forEach(async (m: any) => {
+                                                      const mMeta: any = { ...(m.metadata || {}) };
+                                                      delete mMeta.groupMemberOf;
+                                                      delete mMeta.customOptionsGroup;
+                                                      await updateQuestion.mutateAsync({ questionId: m.id, data: { metadata: mMeta } });
+                                                    });
+                                                  }}
+                                                >Clear</button>
+                                              </div>
+                                            );
+                                          }
                                           return (
                                             <button
-                                              key={`${q.id}-${letter}`}
-                                              onClick={async () => {
-                                                const answer = letter;
-                                                await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: answer } });
-                                                if (q.metadata?.groupRangeEnd) {
-                                                  section.questions.filter((m:any)=> m.metadata?.groupMemberOf === q.id).forEach((m:any) => {
-                                                    updateQuestion.mutate({ questionId: m.id, data: { correctAnswer: answer } });
-                                                  });
-                                                }
-                                              }}
-                                              className={`px-2 py-1 rounded border text-xs ${ (q.correctAnswer || '') === letter ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-700'}`}
-                                            >{letter}</button>
-                                          );
-                                        });
-                                      })()}
-                                    </div>
-                                  )}
-                                  {/* Grouping controls */}
-                                  <div className="flex flex-col items-start gap-1 ml-2">
-                                    {(() => {
-                                      const meta = q.metadata || {};
-                                      // If this is a member of a group, show badge + clear option only on anchor? allow clearing by anchor only.
-                                      if (meta.groupMemberOf) {
-                                        const anchor = section.questions.find((qq:any)=>qq.id===meta.groupMemberOf);
-                                        const anchorNum = anchor?.questionNumber || '?';
-                                        return (
-                                          <span className="text-[10px] px-2 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-700" title={`Member of group starting at Q${anchorNum}`}>Member of Q{anchorNum}</span>
-                                        );
-                                      }
-                                      // Anchor case
-                                      if (meta.groupRangeEnd) {
-                                        return (
-                                          <div className="flex items-center gap-1 flex-wrap">
-                                            <span className="text-[10px] px-2 py-0.5 rounded bg-purple-600 text-white" title="Group anchor">Group Q{q.questionNumber}–{meta.groupRangeEnd}</span>
-                                            {meta.customOptionsGroup ? (
-                                              <>
-                                                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-700" title="Group has custom options">Local opts</span>
-                                                <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50" onClick={() => toggleCustomOptionsForGroup(section, q, false)}>Shared opts</button>
-                                                <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50" onClick={async () => {
-                                                  const letters = (q.options || []).map((o:any)=>o.option_letter||o.letter).filter(Boolean);
-                                                  const nextLetter = computeNextLetter(letters);
-                                                  const members = mcqGroupMembers(section, q.id);
-                                                  for (const m of members) {
-                                                    await createOption.mutateAsync({ questionId: m.id, optionText: `Option ${nextLetter}`, optionLetter: nextLetter, optionOrder: (m.options?.length||0)+1 });
-                                                  }
-                                                }}>Add Opt</button>
-                                                <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50" onClick={() => setOpenLocalOptions(prev => ({ ...prev, [q.id]: !prev[q.id] }))}>{openLocalOptions[q.id] ? 'Hide' : 'Edit'} Local</button>
-                                              </>
-                                            ) : (
-                                              <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-purple-300 text-purple-700 hover:bg-purple-50" onClick={() => toggleCustomOptionsForGroup(section, q, true)}>Customize opts</button>
-                                            )}
-                                            {meta.customOptionsGroup && openLocalOptions[q.id] && (
-                                              <div className="w-full mt-2 bg-white border rounded p-2 text-[11px] space-y-1">
-                                                {(q.options || []).map((opt:any) => {
-                                                  const letter = opt.option_letter || opt.letter;
-                                                  return (
-                                                    <div key={opt.id || letter} className="flex items-center gap-2">
-                                                      <span className="w-5 text-gray-600 font-medium">{letter}</span>
-                                                      <input
-                                                        defaultValue={opt.option_text || opt.text || ''}
-                                                        placeholder={`Option ${letter}`}
-                                                        className="flex-1 border rounded px-2 py-1"
-                                                        onBlur={async (e) => {
-                                                          const value = e.target.value;
-                                                          if ((opt.option_text || opt.text || '') === value) return;
-                                                          // Update this option for every member in group to keep consistent
-                                                          const members = mcqGroupMembers(section, q.id);
-                                                          for (const m of members) {
-                                                            const match = (m.options || []).find((o:any)=> (o.option_letter||o.letter) === letter);
-                                                            if (match) {
-                                                              await updateOption.mutateAsync({ optionId: match.id, data: { optionText: value }, questionId: m.id });
-                                                            }
-                                                          }
-                                                        }}
-                                                      />
-                                                      <button
-                                                        type="button"
-                                                        className="text-[10px] px-1.5 py-0.5 border rounded border-red-300 text-red-600 hover:bg-red-50"
-                                                        title="Remove this option from the group"
-                                                        onClick={async () => {
-                                                          if (!window.confirm(`Remove option ${letter} from this group's local options?`)) return;
-                                                          const members = mcqGroupMembers(section, q.id);
-                                                          for (const m of members) {
-                                                            const match = (m.options || []).find((o:any)=> (o.option_letter||o.letter) === letter);
-                                                            if (match) {
-                                                              await deleteOption.mutateAsync({ optionId: match.id, questionId: m.id });
-                                                            }
-                                                            // Clean up correctAnswer if it referenced this letter
-                                                            if (m.correctAnswer) {
-                                                              if (m.metadata?.allowMultiSelect) {
-                                                                const parts = (m.correctAnswer || '').split('|').filter(Boolean);
-                                                                if (parts.includes(letter)) {
-                                                                  const next = parts.filter((p:string)=>p!==letter).join('|');
-                                                                  await updateQuestion.mutateAsync({ questionId: m.id, data: { correctAnswer: next } });
-                                                                }
-                                                              } else if (m.correctAnswer === letter) {
-                                                                await updateQuestion.mutateAsync({ questionId: m.id, data: { correctAnswer: '' } });
-                                                              }
-                                                            }
-                                                          }
-                                                        }}
-                                                      >Del</button>
-                                                    </div>
-                                                  );
-                                                })}
-                                                <div className="text-[10px] text-gray-500">These options apply to Questions {q.questionNumber}–{meta.groupRangeEnd}. Editing text updates all members.</div>
-                                              </div>
-                                            )}
-                                            <button
                                               type="button"
-                                              className="text-[10px] px-2 py-0.5 border rounded border-purple-300 text-purple-700 hover:bg-purple-50"
-                                              onClick={async () => {
-                                                if (!window.confirm('Remove this group? Members will be detached.')) return;
-                                                const newMeta = { ...meta }; delete newMeta.groupRangeEnd; delete newMeta.customOptionsGroup; await updateQuestion.mutateAsync({ questionId: q.id, data: { metadata: newMeta } });
-                                                section.questions.filter((qq:any)=>qq.metadata?.groupMemberOf === q.id).forEach(async (m:any) => {
-                                                  const mMeta = { ...(m.metadata||{}) }; delete mMeta.groupMemberOf; delete mMeta.customOptionsGroup; await updateQuestion.mutateAsync({ questionId: m.id, data: { metadata: mMeta } });
+                                              className="text-[10px] px-2 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-50"
+                                              onClick={() => {
+                                                const maxNum = Math.max(...section.questions.filter((qq: any) => qq.questionType === 'multiple_choice').map((qq: any) => qq.questionNumber));
+                                                const endStr = window.prompt(`Group range end question number (greater than ${q.questionNumber} and <= ${maxNum})`, String((q.questionNumber || 0) + 1));
+                                                if (!endStr) return;
+                                                const endNum = Number(endStr);
+                                                if (isNaN(endNum) || endNum <= (q.questionNumber || 0) || endNum > maxNum) { toast.error('Invalid end number'); return; }
+                                                const members = section.questions.filter((qq: any) => qq.questionType === 'multiple_choice' && qq.questionNumber > (q.questionNumber || 0) && qq.questionNumber <= endNum);
+                                                if (members.length !== (endNum - (q.questionNumber || 0))) { toast.error('Missing questions in range'); return; }
+                                                const anchorMeta = { ...(q.metadata || {}), groupRangeEnd: endNum };
+                                                updateQuestion.mutate({ questionId: q.id, data: { metadata: anchorMeta } });
+                                                members.forEach((m: any) => {
+                                                  const mMeta = { ...(m.metadata || {}), groupMemberOf: q.id };
+                                                  updateQuestion.mutate({ questionId: m.id, data: { metadata: mMeta } });
                                                 });
                                               }}
-                                            >Clear</button>
-                                          </div>
-                                        );
-                                      }
-                                      // Provide create group action (only if subsequent consecutive questions of same type exist)
-                                      return (
-                                        <button
-                                          type="button"
-                                          className="text-[10px] px-2 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-50"
-                                          onClick={() => {
-                                            const maxNum = Math.max(...section.questions.filter((qq:any)=>qq.questionType==='multiple_choice').map((qq:any)=>qq.questionNumber));
-                                            const endStr = window.prompt(`Group range end question number (greater than ${q.questionNumber} and <= ${maxNum})`, String(q.questionNumber + 1));
-                                            if (!endStr) return;
-                                            const endNum = Number(endStr);
-                                            if (isNaN(endNum) || endNum <= q.questionNumber || endNum > maxNum) { toast.error('Invalid end number'); return; }
-                                            // Ensure all intermediate questions are same type and exist
-                                            const members = section.questions.filter((qq:any)=> qq.questionType==='multiple_choice' && qq.questionNumber>q.questionNumber && qq.questionNumber<=endNum);
-                                            if (members.length !== (endNum - q.questionNumber)) { toast.error('Missing questions in range'); return; }
-                                            // Update anchor
-                                            const anchorMeta = { ...(meta), groupRangeEnd: endNum };
-                                            updateQuestion.mutate({ questionId: q.id, data: { metadata: anchorMeta } });
-                                            // Update members
-                                            members.forEach((m:any) => {
-                                              const mMeta = { ...(m.metadata||{}), groupMemberOf: q.id };
-                                              updateQuestion.mutate({ questionId: m.id, data: { metadata: mMeta } });
-                                            });
-                                          }}
-                                        >Make Group</button>
-                                      );
-                                    })()}
-                                        {/* Standalone (non-group) local options customization */}
+                                            >Make Group</button>
+                                          );
+                                        })()}
                                         {!q.metadata?.groupMemberOf && !q.metadata?.groupRangeEnd && (
                                           <div className="flex items-start gap-1 flex-wrap mt-1">
                                             {q.metadata?.customOptionsGroup ? (
@@ -1804,7 +2094,7 @@ const AdminExamEdit: React.FC = () => {
                                                 <button
                                                   type="button"
                                                   className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
-                                                  onClick={() => setOpenLocalOptions(prev => ({ ...prev, [q.id]: !prev[q.id] }))}
+                                                  onClick={() => setOpenLocalOptions((prev) => ({ ...prev, [q.id]: !prev[q.id] }))}
                                                 >{openLocalOptions[q.id] ? 'Hide' : 'Edit'} Local</button>
                                               </>
                                             ) : (
@@ -1816,7 +2106,7 @@ const AdminExamEdit: React.FC = () => {
                                             )}
                                             {q.metadata?.customOptionsGroup && openLocalOptions[q.id] && (
                                               <div className="w-full mt-2 bg-white border rounded p-2 text-[11px] space-y-1">
-                                                {(q.options || []).map((opt:any) => {
+                                                {(q.options || []).map((opt: any) => {
                                                   const letter = opt.option_letter || opt.letter;
                                                   return (
                                                     <div key={opt.id || letter} className="flex items-center gap-2">
@@ -1838,12 +2128,11 @@ const AdminExamEdit: React.FC = () => {
                                                         onClick={async () => {
                                                           if (!window.confirm(`Remove option ${letter}?`)) return;
                                                           await deleteOption.mutateAsync({ optionId: opt.id, questionId: q.id });
-                                                          // Clean up correctAnswer if it referenced this letter
                                                           if (q.correctAnswer) {
                                                             if (q.metadata?.allowMultiSelect) {
                                                               const parts = (q.correctAnswer || '').split('|').filter(Boolean);
                                                               if (parts.includes(letter)) {
-                                                                const next = parts.filter((p:string)=>p!==letter).join('|');
+                                                                const next = parts.filter((p: string) => p !== letter).join('|');
                                                                 await updateQuestion.mutateAsync({ questionId: q.id, data: { correctAnswer: next } });
                                                               }
                                                             } else if (q.correctAnswer === letter) {
@@ -1859,9 +2148,14 @@ const AdminExamEdit: React.FC = () => {
                                                   type="button"
                                                   className="text-[10px] px-2 py-0.5 border rounded border-amber-300 text-amber-700 hover:bg-amber-50"
                                                   onClick={async () => {
-                                                    const letters = (q.options || []).map((o:any)=>o.option_letter||o.letter).filter(Boolean);
+                                                    const letters = (q.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean);
                                                     const nextLetter = computeNextLetter(letters);
-                                                    await createOption.mutateAsync({ questionId: q.id, optionText: `Option ${nextLetter}`, optionLetter: nextLetter, optionOrder: (q.options?.length||0)+1 });
+                                                    await createOption.mutateAsync({
+                                                      questionId: q.id,
+                                                      optionText: `Option ${nextLetter}`,
+                                                      optionLetter: nextLetter,
+                                                      optionOrder: (q.options?.length || 0) + 1,
+                                                    });
                                                   }}
                                                 >Add Opt</button>
                                                 <div className="text-[10px] text-gray-500">These options apply only to Question {q.questionNumber}.</div>
@@ -1869,9 +2163,10 @@ const AdminExamEdit: React.FC = () => {
                                             )}
                                           </div>
                                         )}
-                                  </div>
-                                </div>
-                              ))}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
                             </div>
                           </div>
                         </div>
@@ -1887,7 +2182,7 @@ const AdminExamEdit: React.FC = () => {
                       </div>
                       <div className="p-3">
                         <div className="mb-3 text-xs text-gray-500">Correct answer expects exactly two option letters separated by pipe (e.g. A|C) or a JSON array ["A","C"].</div>
-                        {section.questions.filter((q: any) => q.questionType === 'multi_select').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
+                        {sectionWithFiltered.questions.filter((q: any) => q.questionType === 'multi_select').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
                           <div key={`ms-row-${q.id}`} className="flex items-start gap-2 mb-2">
                             <div className="w-10 text-xs text-gray-500 pt-2">Q{q.questionNumber || q.order || i + 1}</div>
                             <div className="flex-1 space-y-2">
@@ -1943,7 +2238,7 @@ const AdminExamEdit: React.FC = () => {
                           className="w-full rounded border border-gray-300 text-xs p-2"
                           rows={2}
                         />
-                        {section.questions.filter((q: any) => q.questionType === 'true_false').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
+                        {sectionWithFiltered.questions.filter((q: any) => q.questionType === 'true_false').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
                           <div key={`tf-row-${q.id}`} className="flex items-center gap-2">
                             <div className="w-10 text-xs text-gray-500">Q{q.questionNumber || q.order || i + 1}</div>
                             <input defaultValue={q.questionText || ''} placeholder="Question text" onBlur={(e) => updateQuestion.mutate({ questionId: q.id, data: { questionText: e.target.value } })} className="flex-1 rounded-md border-gray-300 text-sm" />
@@ -1987,38 +2282,32 @@ const AdminExamEdit: React.FC = () => {
                           rows={2}
                         />
                         <div className="flex justify-end mb-1">
-                          <button type="button" className="text-xs px-2 py-1 border rounded" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'fill_blank' })}>+ Add Blank</button>
+                          <button type="button" className="text-xs px-2 py-1 border rounded" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'fill_blank', metadata: withPartMeta(section) })}>+ Add Blank</button>
                         </div>
-                        {section.questions.filter((q: any) => q.questionType === 'fill_blank').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
+                        {sectionWithFiltered.questions.filter((q: any) => q.questionType === 'fill_blank').sort((a: any,b: any)=>getNum(a)-getNum(b)).map((q: any, i: number) => (
                           <div key={`fb-row-${q.id}`} className="flex items-center gap-2 group">
                             <div className="w-10 text-xs text-gray-500">Q{q.questionNumber || q.order || i + 1}</div>
                             <input defaultValue={q.questionText || ''} placeholder="Question text" onBlur={(e) => updateQuestion.mutate({ questionId: q.id, data: { questionText: e.target.value } })} className="flex-1 rounded-md border-gray-300 text-sm" />
                             <input defaultValue={q.correctAnswer || ''} placeholder="Answers e.g. red|crimson;white;blue|azure" onBlur={(e) => updateQuestion.mutate({ questionId: q.id, data: { correctAnswer: e.target.value } })} className="w-72 rounded-md border-gray-300 text-sm" />
-                            <label className="flex items-center gap-1 text-[10px] text-gray-600 whitespace-nowrap pr-1">
+                            {/* Unified checkbox: Multiple blanks act as single question (different answers).
+                                Legacy support: pre-check if previous singleNumber or conversation flags were set. */}
+                            <label className="flex items-center gap-1 text-[10px] text-gray-600 whitespace-nowrap pr-1" title="When enabled, multiple blanks in this item are treated as one question number (student can input different answers per blank). Replaces old 'Single #' and 'Conversation' options.">
                               <input
                                 type="checkbox"
                                 className="rounded border-gray-300"
-                                defaultChecked={!!q.metadata?.singleNumber}
+                                defaultChecked={!!(q.metadata?.combineBlanks || q.metadata?.singleNumber || q.metadata?.conversation)}
                                 onChange={(e) => {
-                                  const meta = { ...(q.metadata || {}) };
-                                  if (e.target.checked) meta.singleNumber = true; else delete meta.singleNumber;
+                                  const meta: any = { ...(q.metadata || {}) };
+                                  if (e.target.checked) {
+                                    meta.combineBlanks = true;
+                                    // Preserve backward compatibility flags if present (do not delete), but new UI only toggles combineBlanks.
+                                  } else {
+                                    delete meta.combineBlanks;
+                                  }
                                   updateQuestion.mutate({ questionId: q.id, data: { metadata: meta } });
                                 }}
                               />
-                              Single #
-                            </label>
-                            <label className="flex items-center gap-1 text-[10px] text-gray-600 whitespace-nowrap pr-1" title="Treat this multi-blank as a conversation transcript (lighter line-height, speaker labels, no extra question header).">
-                              <input
-                                type="checkbox"
-                                className="rounded border-gray-300"
-                                defaultChecked={!!q.metadata?.conversation}
-                                onChange={(e) => {
-                                  const meta = { ...(q.metadata || {}) };
-                                  if (e.target.checked) meta.conversation = true; else delete meta.conversation;
-                                  updateQuestion.mutate({ questionId: q.id, data: { metadata: meta } });
-                                }}
-                              />
-                              Conversation
+                              Multiple blanks as single
                             </label>
                             <button type="button" className="opacity-0 group-hover:opacity-100 transition text-xs text-red-600 px-2 py-1 border rounded" onClick={() => { if (window.confirm('Delete this question?')) deleteQuestion.mutate({ questionId: q.id }); }}>Delete</button>
                           </div>
@@ -2029,7 +2318,7 @@ const AdminExamEdit: React.FC = () => {
                 }
                 if (tm.type === 'drag_drop') {
                   // Drag & Drop grouping: anchor questions (no groupMemberOf) manage options; members inherit via metadata.groupMemberOf
-                  const ddQuestions = section.questions.filter((q:any)=> q.questionType==='drag_drop');
+                  const ddQuestions = sectionWithFiltered.questions.filter((q:any)=> q.questionType==='drag_drop');
                   const anchors = ddQuestions.filter((q:any)=> !q.metadata?.groupMemberOf);
                   const getMembers = (anchorId:string) => ddQuestions.filter((m:any)=> m.metadata?.groupMemberOf === anchorId);
                   const computeNextLetterLocal = (anchor:any) => {
@@ -2044,7 +2333,7 @@ const AdminExamEdit: React.FC = () => {
                           <button
                             type="button"
                             className="text-xs px-2 py-1 border rounded border-gray-300 text-gray-600 hover:bg-gray-100"
-                            onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'drag_drop', metadata: { layout: 'rows' }, questionText: 'Drag & Drop Group Instruction' })}
+                            onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'drag_drop', metadata: withPartMeta(section, { layout: 'rows' }), questionText: 'Drag & Drop Group Instruction' })}
                           >+ Add Drag-Drop Group</button>
                           <label className="flex items-center gap-2 text-xs text-gray-600">
                             <input type="checkbox" className="rounded border-gray-300" checked={!!showAdvanced[section.id]} onChange={(e) => setShowAdvanced(prev => ({ ...prev, [section.id]: e.target.checked }))} />
@@ -2156,7 +2445,7 @@ const AdminExamEdit: React.FC = () => {
                                   <div className="md:col-span-3">
                                     <div className="flex items-center justify-between mb-1">
                                       <span className="text-xs text-gray-600">Items (questions)</span>
-                                      <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-green-300 text-green-700" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'drag_drop', metadata: { groupMemberOf: anchor.id }, questionText: 'New item' })}>Add Item</button>
+                                      <button type="button" className="text-[10px] px-2 py-0.5 border rounded border-green-300 text-green-700" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'drag_drop', metadata: withPartMeta(section, { groupMemberOf: anchor.id }), questionText: 'New item' })}>Add Item</button>
                                     </div>
                                     <div className="space-y-2">
                                       {/* Anchor item row (so numbering starts at anchor) */}
@@ -2262,11 +2551,11 @@ const AdminExamEdit: React.FC = () => {
                   </select>
                   <button className="text-xs px-2 py-1 border rounded" onClick={() => {
                     const sel = (document.getElementById(`add-type-${section.id}`) as HTMLSelectElement).value;
-                    createQuestion.mutate({ sectionId: section.id, questionType: sel });
+                    createQuestion.mutate({ sectionId: section.id, questionType: sel, metadata: withPartMeta(section) });
                   }}>+ Add Question</button>
                 </div>
               </div>
-              {(section.questions || []).filter((q: any) => q.questionType !== 'matching').map((q: any) => (
+              {(sectionWithFiltered.questions || []).filter((q: any) => q.questionType !== 'matching').map((q: any) => (
                 <div
                   key={q.id}
                   className="border border-gray-200 rounded-lg p-4 group"
@@ -2280,7 +2569,7 @@ const AdminExamEdit: React.FC = () => {
                     <button className="opacity-0 group-hover:opacity-100 transition text-[10px] px-2 py-1 rounded bg-red-50 text-red-700 border border-red-200" onClick={() => { if (window.confirm('Delete this question?')) deleteQuestion.mutate({ questionId: q.id }); }}>Delete</button>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-6 gap-3 items-start">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <span className={`inline-block w-2.5 h-2.5 rounded-full border ${
                         (questionStatus[q.id] || 'idle') === 'idle' ? 'bg-gray-300 border-gray-300' :
                         questionStatus[q.id] === 'dirty' ? 'bg-blue-400 border-blue-400' :
@@ -2288,6 +2577,11 @@ const AdminExamEdit: React.FC = () => {
                         questionStatus[q.id] === 'saved' ? 'bg-green-500 border-green-500' : 'bg-red-500 border-red-500'
                       }`} title={`Status: ${questionStatus[q.id] || 'idle'}`}></span>
                       <span className="text-xs text-gray-500 w-6">#{q.questionNumber || q.order || ''}</span>
+                      {FULL_MOCK && (section.sectionType==='listening' || section.sectionType==='reading') && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-700">
+                          {section.sectionType==='listening' ? `Part ${q.metadata?.listeningPart || 1}` : `Passage ${q.metadata?.readingPart || 1}`}
+                        </span>
+                      )}
                       <select defaultValue={q.questionType} onChange={(e) => { setStatus(q.id, 'dirty'); updateQuestion.mutate({ questionId: q.id, data: { questionType: e.target.value } }); setStatus(q.id, 'saving'); }} className="rounded-md border-gray-300">
                       <option value="multiple_choice">Multiple Choice</option>
                       <option value="multi_select">Multi-Select (Two)</option>
@@ -2394,6 +2688,7 @@ const AdminExamEdit: React.FC = () => {
                     {(q.questionType === 'short_answer') && (
                       <div className="md:col-span-6 bg-amber-50 border border-amber-200 rounded p-3 space-y-2">
                         <div className="text-xs font-semibold text-amber-700">Short Answer Settings</div>
+                        <div className="text-[10px] text-amber-700 bg-amber-100 border border-amber-200 rounded px-2 py-1">Deprecated: new Short Answer questions cannot be created. Existing ones remain editable or can be deleted.</div>
                         <div className="flex gap-4">
                           <label className="text-xs text-amber-800 flex flex-col gap-1">
                             Max Words
@@ -2410,7 +2705,8 @@ const AdminExamEdit: React.FC = () => {
             </div>
             )}
           </div>
-        ))}
+        );
+      })}
       </div>
   </div>
   <ConfirmDialog
@@ -2427,5 +2723,3 @@ const AdminExamEdit: React.FC = () => {
 };
 
 export default AdminExamEdit;
-
-

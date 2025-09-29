@@ -15,19 +15,30 @@ interface TimerProps {
 
 const Timer: React.FC<TimerProps> = ({ duration, onTimeUp, isPaused, darkMode }) => {
   const [timeLeft, setTimeLeft] = useState(duration * 60);
+
+  useEffect(() => {
+    setTimeLeft(duration * 60);
+  }, [duration]);
+
   useEffect(() => {
     if (isPaused) return;
     const timer = setInterval(() => {
       setTimeLeft(prev => {
-        if (prev <= 1) { clearInterval(timer); onTimeUp(); return 0; }
+        if (prev <= 1) {
+          clearInterval(timer);
+          onTimeUp();
+          return 0;
+        }
         return prev - 1;
       });
     }, 1000);
     return () => clearInterval(timer);
   }, [isPaused, onTimeUp]);
+
   const minutes = Math.floor(timeLeft / 60);
   const seconds = timeLeft % 60;
   const urgency = timeLeft <= 300 ? (timeLeft <= 120 ? 'text-red-500' : 'text-amber-500') : (darkMode ? 'text-gray-100' : 'text-gray-900');
+
   return (
     <div className={"flex items-center space-x-2 font-mono text-lg font-semibold " + urgency}>
       <Clock className="h-5 w-5" />
@@ -37,6 +48,23 @@ const Timer: React.FC<TimerProps> = ({ duration, onTimeUp, isPaused, darkMode })
   );
 };
 
+const SECTION_DURATION_MINUTES: Record<string, number> = { listening: 30, reading: 60, writing: 60, speaking: 15 };
+
+// Pretty name for section type/title
+const formatSectionName = (section: any): string => {
+  if (!section) return 'Section';
+  const title = section.title || section.sectionType || 'Section';
+  return String(title).charAt(0).toUpperCase() + String(title).slice(1);
+};
+
+// Determine duration (minutes) for a given section
+const resolveSectionDuration = (section: any, exam: any): number => {
+  if (!section) return Math.max(1, Number(exam?.durationMinutes) || 60);
+  const t = String(section.sectionType || '').toLowerCase();
+  const d = SECTION_DURATION_MINUTES[t];
+  return d ? d : 60;
+};
+
 const ExamTaking: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
   const [searchParams] = useSearchParams();
@@ -44,9 +72,15 @@ const ExamTaking: React.FC = () => {
   const sidFromUrl = searchParams.get('sid') || undefined;
   const navigate = useNavigate();
   const [answers, setAnswers] = useState<Record<string, { questionId: string; answer: string | string[] }>>({});
-  const [isPaused] = useState(false);
+  const [fillBlankDrafts, setFillBlankDrafts] = useState<Record<string, string[]>>({});
+  const [isPaused, setIsPaused] = useState(false);
   const [showConfirmSubmit, setShowConfirmSubmit] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sectionTimerDuration, setSectionTimerDuration] = useState<number>(0);
+  const [timerKey, setTimerKey] = useState(0);
+  const previousSectionIndexRef = useRef<number | null>(null);
+  const transitionReasonRef = useRef<'manual' | 'timeUp' | null>(null);
+  const [sectionTransition, setSectionTransition] = useState<{ fromName: string; toName: string; reason: 'manual' | 'timeUp'; } | null>(null);
   // UI preferences
   const [showSettings, setShowSettings] = useState(false);
   const [prefFontSize, setPrefFontSize] = useState<number>(() => {
@@ -60,7 +94,7 @@ const ExamTaking: React.FC = () => {
   useEffect(() => { localStorage.setItem('readingFontSize', String(prefFontSize)); }, [prefFontSize]);
   useEffect(() => { localStorage.setItem('readingFontFamily', prefFontFamily); }, [prefFontFamily]);
   useEffect(() => { localStorage.setItem('examDarkMode', darkMode ? '1' : '0'); }, [darkMode]);
-  
+
   // Derived style helpers
   const primaryTextClass = darkMode ? 'text-gray-100' : 'text-gray-900';
   const secondaryTextClass = darkMode ? 'text-gray-400' : 'text-gray-600';
@@ -321,6 +355,89 @@ const ExamTaking: React.FC = () => {
       console.log('[ExamTaking][debugTables] section questions', currentSection.questions.map((q:any)=> ({ id:q.id, num:q.questionNumber, type:q.questionType, metaType: typeof q.metadata })));
     }
   }, [debugTables, currentSection]);
+  useEffect(() => {
+    const sections = exam?.sections || [];
+    if (!sections.length) return;
+
+    const current = sections[currentSectionIndex];
+    const newDuration = resolveSectionDuration(current, exam);
+    setSectionTimerDuration(newDuration);
+    setTimerKey(prev => prev + 1);
+
+    const prevIndex = previousSectionIndexRef.current;
+    if (prevIndex === null) {
+      previousSectionIndexRef.current = currentSectionIndex;
+      setSectionTransition(null);
+      setIsPaused(false);
+      transitionReasonRef.current = null;
+      return;
+    }
+
+    const fromSection = sections[prevIndex];
+    const toSection = current;
+    const fromType = (fromSection?.sectionType || '').toLowerCase();
+    const toType = (toSection?.sectionType || '').toLowerCase();
+    const movingForward = currentSectionIndex > prevIndex;
+
+    if (movingForward && fromType && toType && fromType !== toType) {
+      setSectionTransition({
+        fromName: formatSectionName(fromSection),
+        toName: formatSectionName(toSection),
+        reason: transitionReasonRef.current || 'manual',
+      });
+      setIsPaused(true);
+    } else {
+      setSectionTransition(null);
+      setIsPaused(false);
+    }
+
+    previousSectionIndexRef.current = currentSectionIndex;
+    transitionReasonRef.current = null;
+  }, [exam, currentSectionIndex, formatSectionName]);
+
+  useEffect(() => {
+    if (!exam) return;
+    try {
+      const dump = (exam.sections || []).map((section: any) => ({
+        sectionId: section.id,
+        type: section.sectionType,
+        questions: (section.questions || []).map((q: any) => ({
+          id: q.id,
+          qnum: q.questionNumber,
+          metadata: q.metadata,
+        })),
+      }));
+      (window as any).__dropdownDump = dump;
+      console.log('[DropdownDump]', dump);
+    } catch (e) {
+      console.warn('[DropdownDump] failed', e);
+    }
+  }, [exam]);
+
+  const handleSectionTransitionContinue = () => {
+    setSectionTransition(null);
+    setIsPaused(false);
+  };
+
+  // Section transition overlay (restored) - shows when moving between major sections after time up/manual advance
+  const transitionOverlay = sectionTransition ? (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className={(darkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900') + ' w-full max-w-md rounded-lg shadow-xl p-6'}>
+        <h2 className="text-xl font-semibold mb-2">Next Section: {sectionTransition.toName}</h2>
+        <p className="text-sm mb-4">
+          {(sectionTransition.reason === 'timeUp' ? `${sectionTransition.fromName} time has ended.` : `${sectionTransition.fromName} complete.`)} Ready to begin {sectionTransition.toName}?
+        </p>
+        <button
+          type="button"
+          onClick={handleSectionTransitionContinue}
+          className="w-full px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          Begin {sectionTransition.toName}
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   const isListeningSection = (currentSection?.sectionType || '').toLowerCase() === 'listening';
   const isWritingSection = (currentSection?.sectionType || '').toLowerCase() === 'writing';
   // Writing parts (Task 1 / Task 2). Default mapping: writing_task1 -> Part 1, essay -> Part 2, overrideable via metadata.writingPart
@@ -457,7 +574,7 @@ const ExamTaking: React.FC = () => {
   // blankNumberMap: questionId -> assigned sequential numbers for blanks.
   // Modes:
   //   Default (no metadata.singleNumber): multi-blank fill_blank consumes one number per blank (displayed as a range Questions X–Y).
-  //   If metadata.singleNumber === true: consumes only ONE number; all blanks share that number (IELTS style for certain tasks).
+  //   If metadata.singleNumber === true OR metadata.combineBlanks === true: consumes only ONE number; all blanks share that number (legacy singleNumber + new combineBlanks flag).
   const blankNumberMap = React.useMemo(() => {
     const map: Record<string, number[]> = {};
     const list = [...visibleQuestions];
@@ -472,6 +589,8 @@ const ExamTaking: React.FC = () => {
         // Use existing questionNumber as anchor; if multi-blank allocate synthetic subsequent numbers just for display (not persisted)
         const base = q.questionNumber || 0;
         if (blanks <=1 || q.metadata?.singleNumber) map[q.id] = [base];
+  const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks); // backward compatible
+  if (blanks <=1 || combine) map[q.id] = [base];
         else {
           const nums: number[] = []; for (let i=0;i<blanks;i++) nums.push(base + i); map[q.id] = nums;
         }
@@ -522,7 +641,7 @@ const ExamTaking: React.FC = () => {
             groupInstruction: meta?.groupInstruction || '',
             memberOf: meta?.groupMemberOf || '',
             rangeEnd: meta?.groupRangeEnd || '',
-            singleNumber: meta?.singleNumber || false,
+            singleNumber: !!(meta?.singleNumber || meta?.combineBlanks),
             listeningPart: meta?.listeningPart || (q.questionNumber ? Math.ceil(q.questionNumber/10):''),
             metadata: meta
           };
@@ -614,6 +733,12 @@ const ExamTaking: React.FC = () => {
 
   const clearHeadingFromQuestion = (questionId: string) => {
     setAnswers(prev => ({ ...prev, [questionId]: { questionId, answer: '' } }));
+    setFillBlankDrafts(prev => {
+      if (!prev[questionId]) return prev;
+      const next = { ...prev };
+      delete next[questionId];
+      return next;
+    });
   };
 
   const resolveHeadingText = (letter: string | undefined) => {
@@ -622,17 +747,31 @@ const ExamTaking: React.FC = () => {
     return found?.text || found?.option_text || letter;
   };
 
+  const changeSection = React.useCallback((targetIndex: number, reason: 'manual' | 'timeUp' = 'manual', targetQuestionIndex?: number) => {
+    const sections = exam?.sections || [];
+    if (!sections[targetIndex]) return;
+    transitionReasonRef.current = reason;
+    setCurrentSectionIndex(targetIndex);
+    if (typeof targetQuestionIndex === 'number' && !Number.isNaN(targetQuestionIndex)) {
+      setCurrentQuestionIndex(targetQuestionIndex);
+    } else {
+      setCurrentQuestionIndex(0);
+    }
+  }, [exam?.sections]);
+
   const goToQuestion = (sectionIndex: number, questionIndex: number) => {
-    setCurrentSectionIndex(sectionIndex);
-    setCurrentQuestionIndex(questionIndex);
+    if (sectionIndex === currentSectionIndex) {
+      setCurrentQuestionIndex(questionIndex);
+    } else {
+      changeSection(sectionIndex, 'manual', questionIndex);
+    }
   };
 
   const goToNextQuestion = () => {
     if (currentQuestionIndex < visibleQuestions.length - 1) {
       setCurrentQuestionIndex(prev => prev + 1);
     } else if (currentSectionIndex < (exam?.sections?.length || 0) - 1) {
-      setCurrentSectionIndex(prev => prev + 1);
-      setCurrentQuestionIndex(0);
+      changeSection(currentSectionIndex + 1, 'manual', 0);
     }
   };
 
@@ -640,11 +779,9 @@ const ExamTaking: React.FC = () => {
     if (currentQuestionIndex > 0) {
       setCurrentQuestionIndex(prev => prev - 1);
     } else if (currentSectionIndex > 0) {
-      // Move to previous section last visible question
       const prevSection = exam?.sections?.[currentSectionIndex - 1];
       const prevVisible = (prevSection?.questions || []).filter((q: any) => !q.metadata?.groupMemberOf && q.questionType !== 'matching');
-      setCurrentSectionIndex(prev => prev - 1);
-      setCurrentQuestionIndex(prevVisible.length ? prevVisible.length - 1 : 0);
+      changeSection(currentSectionIndex - 1, 'manual', prevVisible.length ? prevVisible.length - 1 : 0);
     }
   };
 
@@ -659,18 +796,86 @@ const ExamTaking: React.FC = () => {
     return () => window.removeEventListener('keydown', handler);
   }, [isListeningSection, goToNextQuestion, goToPreviousQuestion]);
 
-  const handleAnswerChange = (questionId: string, answer: string | string[]) => {
+  const handleAnswerChange = (questionId: string, answer: string | string[], blankIndex?: number) => {
+    const persistDraft = (payload: string | string[] | null) => {
+      try {
+        const key = sessionId ? `draft_${sessionId}` : 'draft_temp';
+        const existingRaw = localStorage.getItem(key);
+        const existing = existingRaw ? JSON.parse(existingRaw) : {};
+        if (payload === null) {
+          delete existing[questionId];
+        } else {
+          existing[questionId] = { questionId, answer: payload };
+        }
+        localStorage.setItem(key, JSON.stringify(existing));
+      } catch {}
+    };
+
+    if (typeof blankIndex === 'number') {
+      const rawValue = typeof answer === 'string'
+        ? answer
+        : (Array.isArray(answer) ? (answer[blankIndex] ?? '') : '');
+      const prevDraft = fillBlankDrafts[questionId]
+        ?? (Array.isArray(answers[questionId]?.answer)
+          ? [...(answers[questionId]?.answer as string[])]
+          : (typeof answers[questionId]?.answer === 'string' && (answers[questionId]?.answer as string).length
+            ? [answers[questionId]?.answer as string]
+            : []));
+      const base = [...prevDraft];
+      while (base.length <= blankIndex) base.push('');
+      base[blankIndex] = rawValue;
+      const finalArray = [...base];
+      while (finalArray.length > 0 && finalArray[finalArray.length - 1] === '') {
+        finalArray.pop();
+      }
+      setFillBlankDrafts(prev => {
+        const next = { ...prev };
+        if (finalArray.length) next[questionId] = [...finalArray];
+        else delete next[questionId];
+        return next;
+      });
+      setAnswers(prev => {
+        const next = { ...prev } as typeof prev;
+        next[questionId] = { questionId, answer: finalArray.length ? [...finalArray] : [] };
+        return next;
+      });
+      persistDraft(finalArray.length ? finalArray : []);
+      return;
+    }
+
+    setFillBlankDrafts(prev => {
+      if (!prev[questionId]) return prev;
+      const next = { ...prev };
+      delete next[questionId];
+      return next;
+    });
     setAnswers(prev => ({ ...prev, [questionId]: { questionId, answer } }));
-    // Persist to localStorage immediately
-    try {
-      const key = sessionId ? `draft_${sessionId}` : 'draft_temp';
-      const existing = JSON.parse(localStorage.getItem(key) || '{}');
-      existing[questionId] = { questionId, answer };
-      localStorage.setItem(key, JSON.stringify(existing));
-    } catch {}
+    persistDraft(answer);
   };
 
-  const handleTimeUp = () => { if (sessionId) submit.mutate(sessionId); };
+  const getBlankValues = (questionId: string): string[] => {
+    const draft = fillBlankDrafts[questionId];
+    if (draft) return draft;
+    const existing = answers[questionId]?.answer;
+    if (Array.isArray(existing)) return existing as string[];
+    if (typeof existing === 'string' && existing.length) return [existing];
+    return [];
+  };
+
+  const handleTimeUp = React.useCallback(() => {
+    const totalSections = exam?.sections?.length || 0;
+    if (!totalSections) {
+      if (sessionId) submit.mutate(sessionId);
+      return;
+    }
+
+    const isLastSection = currentSectionIndex >= totalSections - 1;
+    if (isLastSection) {
+      if (sessionId) submit.mutate(sessionId);
+    } else {
+      changeSection(currentSectionIndex + 1, 'timeUp', 0);
+    }
+  }, [exam?.sections, currentSectionIndex, sessionId, submit, changeSection]);
 
   const { user } = useAuth();
 
@@ -916,7 +1121,7 @@ const ExamTaking: React.FC = () => {
 
   if (isListeningSection) {
     return (
-      <div className={"h-screen flex flex-col overflow-hidden select-text " + (darkMode ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900')}>
+      <div className={(darkMode ? 'dark ' : '') + "h-screen flex flex-col overflow-hidden select-text " + (darkMode ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900')}>
         {/* Top header mimicking IELTS listening part banner */}
         <div className={(darkMode ? 'bg-gray-800 border-gray-700' : 'bg-white') + " border-b px-4 py-3 flex items-center justify-between shadow-sm"}>
           <div className="flex flex-col">
@@ -969,11 +1174,46 @@ const ExamTaking: React.FC = () => {
                 )}
               </div>
             )}
-            {/* Use global exam duration only (ignore per-section durations) */}
-            <Timer darkMode={darkMode} duration={exam?.durationMinutes || 30} onTimeUp={handleTimeUp} isPaused={isPaused} />
+            <button onClick={() => setShowSettings(s => !s)} className={(showSettings ? 'ring-2 ring-blue-500 ' : '') + "px-3 py-2 rounded text-sm border transition-colors " + (darkMode ? 'border-gray-600 bg-gray-700 hover:bg-gray-600 text-gray-100' : 'border-gray-300 bg-white hover:bg-gray-100 text-gray-700')}>Settings</button>
+            {/* Per-section timer (Listening) */}
+            <Timer key={`timer-${timerKey}`} darkMode={darkMode} duration={sectionTimerDuration || 30} onTimeUp={handleTimeUp} isPaused={isPaused} />
             <button onClick={() => setShowConfirmSubmit(true)} className="px-3 py-2 text-xs bg-red-600 text-white rounded hover:bg-red-700">Submit</button>
           </div>
         </div>
+        {showSettings && (
+          <div className={(darkMode ? 'bg-gray-800/95 backdrop-blur border-gray-700 text-gray-200' : 'bg-white/95 backdrop-blur') + " border-b px-4 py-4 text-sm"}>
+            <div className="flex flex-wrap gap-6 items-start">
+              <div className="flex flex-col w-40">
+                <label className="text-[11px] uppercase tracking-wide font-semibold opacity-70 mb-1">Font Size</label>
+                <input type="range" min={14} max={24} value={prefFontSize} onChange={(e)=> setPrefFontSize(Number(e.target.value))} className="w-full accent-purple-600" />
+                <div className="mt-1 text-xs font-mono">{prefFontSize}px</div>
+              </div>
+              <div className="flex flex-col w-48">
+                <label className="text-[11px] uppercase tracking-wide font-semibold opacity-70 mb-1">Font Family</label>
+                <select value={prefFontFamily} onChange={(e)=> setPrefFontFamily(e.target.value)} className={"border rounded px-2 py-2 text-sm focus:ring-2 focus:ring-blue-500 " + (darkMode ? 'bg-gray-900 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-800')}>
+                  <option value="serif">Serif (IELTS style)</option>
+                  <option value="sans">Sans</option>
+                  <option value="mono">Mono</option>
+                </select>
+              </div>
+              <div className="flex flex-col w-32">
+                <label className="text-[11px] uppercase tracking-wide font-semibold opacity-70 mb-2">Theme</label>
+                <button
+                  onClick={()=> setDarkMode(d => !d)}
+                  className={"relative inline-flex items-center h-8 px-3 rounded border text-xs font-medium transition-colors " + (darkMode ? 'bg-gray-900 border-gray-600 text-gray-100 hover:bg-gray-700' : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-100')}
+                >{darkMode ? 'Dark Mode' : 'Light Mode'}</button>
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="text-[11px] uppercase tracking-wide font-semibold opacity-70 mb-1">Quick</label>
+                <div className="flex gap-2">
+                  <button onClick={()=> { setPrefFontSize(16); setPrefFontFamily('serif'); }} className="px-3 py-1.5 text-xs rounded border border-blue-500 text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30">IELTS Default</button>
+                  <button onClick={()=> { setPrefFontSize(18); setPrefFontFamily('sans'); }} className="px-3 py-1.5 text-xs rounded border border-gray-400 hover:bg-gray-50 dark:border-gray-600 dark:hover:bg-gray-700/50">Readable</button>
+                  <button onClick={()=> { setPrefFontSize(16); setPrefFontFamily('serif'); setDarkMode(false); }} className="px-3 py-1.5 text-xs rounded border border-red-500 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30">Reset</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         {/* Part banner */}
         <div className={(darkMode ? 'bg-gray-1000' : 'bg-gray-100') + ' border-b px-4 py-2 text-sm'}>
           <span className="font-semibold">Part {effectiveListeningPart}</span>
@@ -1031,9 +1271,18 @@ const ExamTaking: React.FC = () => {
               const partNum = effectiveListeningPart;
             const hasTableInPart = (exam?.sections || []).some((sec:any) => (sec.questions||[]).some((q:any) => {
               if (q.questionType !== 'simple_table') return false;
-              let meta = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
-              const qPart = meta?.listeningPart || (q.questionNumber ? Math.ceil(q.questionNumber/10) : 1);
-              return qPart === partNum;
+              let meta:any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
+              const rows:any[][] = meta?.simpleTable?.rows || [];
+              let firstNum = Number(meta?.simpleTable?.sequenceStart);
+              if (!firstNum || isNaN(firstNum)) {
+                const nums:number[] = [];
+                rows.forEach((row:any[]) => row.forEach((cell:any) => { if (cell?.type==='question' && typeof cell.questionNumber==='number') nums.push(cell.questionNumber); }));
+                if (nums.length) firstNum = Math.min(...nums);
+              }
+              const explicitPart = Number(meta?.listeningPart);
+              const inferredPart = firstNum ? Math.ceil(firstNum / 10) : (q.questionNumber ? Math.ceil(q.questionNumber/10) : undefined);
+              const part = explicitPart || inferredPart;
+              return part === partNum;
             }));
             if (hasTableInPart) return null;
             return <div className="text-sm text-gray-500 italic">No questions have been added for this listening part yet.</div>;
@@ -1138,7 +1387,24 @@ const ExamTaking: React.FC = () => {
           {(() => {
             // Build flow items with an order index = questionNumber (or first table number)
             const questions = [...listeningPartQuestions];
-            const simpleTables = (currentSection?.questions || []).filter((q:any)=> q.questionType==='simple_table');
+            // Only include simple_table blocks that belong to the current listening part
+            const simpleTables = (currentSection?.questions || []).filter((q:any)=> q.questionType==='simple_table').filter((q:any) => {
+              try {
+                let meta:any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
+                const rows:any[][] = meta?.simpleTable?.rows || [];
+                let firstNum = Number(meta?.simpleTable?.sequenceStart);
+                if (!firstNum || isNaN(firstNum)) {
+                  const nums:number[] = [];
+                  rows.forEach((row:any[]) => row.forEach((cell:any) => { if (cell?.type==='question' && typeof cell.questionNumber==='number') nums.push(cell.questionNumber); }));
+                  if (nums.length) firstNum = Math.min(...nums);
+                }
+                const explicitPart = Number(meta?.listeningPart);
+                const inferredPart = firstNum ? Math.ceil(firstNum / 10) : undefined;
+                const part = explicitPart || inferredPart;
+                // If we can't infer, hide by default in other parts to avoid duplicates
+                return part ? (part === effectiveListeningPart) : false;
+              } catch { return false; }
+            });
             const tableItems = simpleTables.map((q:any) => {
               let meta:any = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
               const rows:any[][] = meta?.simpleTable?.rows || [];
@@ -1325,6 +1591,14 @@ const ExamTaking: React.FC = () => {
                   const selectCount = Number(q.metadata?.selectCount) || 2;
                   const current = answers[q.id]?.answer as any;
                   const selectedLetters: string[] = allowMulti ? (Array.isArray(current) ? current : (typeof current === 'string' && current ? current.split('|') : [])) : ([]);
+                  // Detect dropdown mode from various metadata aliases
+                  const metaAny: any = q.metadata || {};
+                  const dropdownRaw = metaAny?.displayMode ?? metaAny?.display_mode ?? metaAny?.renderMode ?? metaAny?.dropdown ?? q.displayMode ?? q.renderMode ?? (typeof q.dropdown !== 'undefined' ? q.dropdown : undefined);
+                  const dropdownMode = (!allowMulti) && (dropdownRaw === true
+                    || dropdownRaw === 'dropdown'
+                    || dropdownRaw === 'Dropdown'
+                    || (typeof dropdownRaw === 'string' && dropdownRaw.toLowerCase() === 'dropdown')
+                    || (typeof dropdownRaw === 'string' && dropdownRaw.toLowerCase() === 'true'));
                   return (
                     <div key={q.id} className="text-sm flex flex-col gap-2">
                       <div className="flex items-start gap-2 flex-wrap">
@@ -1334,10 +1608,10 @@ const ExamTaking: React.FC = () => {
                         </div>
                       </div>
                       <div className="ml-10 flex flex-col gap-1">
-                        {(q.options || []).map((opt: any, idx: number) => {
-                          const letter = opt.option_letter || opt.letter || String.fromCharCode(65 + idx);
-                          const label = opt.option_text || opt.text || '';
-                          if (allowMulti) {
+                        {allowMulti ? (
+                          (q.options || []).map((opt: any, idx: number) => {
+                            const letter = opt.option_letter || opt.letter || String.fromCharCode(65 + idx);
+                            const label = opt.option_text || opt.text || '';
                             const checked = selectedLetters.includes(letter);
                             return (
                               <label
@@ -1355,25 +1629,47 @@ const ExamTaking: React.FC = () => {
                                 <span className="flex-1">{letter}. {label}</span>
                               </label>
                             );
-                          }
-                          const selected = (answers[q.id]?.answer as string) === letter;
-                          return (
-                            <label
-                              key={letter}
-                              className={`flex items-start gap-2 cursor-pointer rounded px-3 py-2 border transition-colors ${selected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-gray-200 border-gray-300') : (darkMode ? 'border-gray-600 hover:bg-gray-700' : 'border-transparent hover:bg-gray-100')}`}
-                              onClick={() => handleAnswerChange(q.id, letter)}
+                          })
+                        ) : dropdownMode ? (
+                          <div className="flex items-center gap-2">
+                            <select
+                              className={`text-sm px-3 py-2 rounded border w-full ${darkMode ? 'bg-gray-800 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                              value={typeof answers[q.id]?.answer === 'string' ? (answers[q.id]?.answer as string) : ''}
+                              onChange={(e) => handleAnswerChange(q.id, e.target.value)}
                             >
-                              <input
-                                type="radio"
-                                className={'mt-1 ' + (darkMode ? 'accent-blue-500' : '')}
-                                value={letter}
-                                checked={selected}
-                                onChange={() => handleAnswerChange(q.id, letter)}
-                              />
-                              <span className={'text-sm select-none ' + (darkMode ? 'text-gray-100':'text-gray-900')}>{letter}) {label}</span>
-                            </label>
-                          );
-                        })}
+                              <option value="">-- Select --</option>
+                              {(q.options || []).map((opt: any, idx: number) => {
+                                const letter = (opt.option_letter || opt.letter || '').toString().trim() || String.fromCharCode(65 + idx);
+                                const label = opt.option_text || opt.text || '';
+                                return (
+                                  <option key={opt.id || `${q.id}_${idx}`} value={letter}>{letter}) {label || `Option ${letter}`}</option>
+                                );
+                              })}
+                            </select>
+                          </div>
+                        ) : (
+                          (q.options || []).map((opt: any, idx: number) => {
+                            const letter = opt.option_letter || opt.letter || String.fromCharCode(65 + idx);
+                            const label = opt.option_text || opt.text || '';
+                            const selected = (answers[q.id]?.answer as string) === letter;
+                            return (
+                              <label
+                                key={letter}
+                                className={`flex items-start gap-2 cursor-pointer rounded px-3 py-2 border transition-colors ${selected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-gray-200 border-gray-300') : (darkMode ? 'border-gray-600 hover:bg-gray-700' : 'border-transparent hover:bg-gray-100')}`}
+                                onClick={() => handleAnswerChange(q.id, letter)}
+                              >
+                                <input
+                                  type="radio"
+                                  className={'mt-1 ' + (darkMode ? 'accent-blue-500' : '')}
+                                  value={letter}
+                                  checked={selected}
+                                  onChange={() => handleAnswerChange(q.id, letter)}
+                                />
+                                <span className={'text-sm select-none ' + (darkMode ? 'text-gray-100':'text-gray-900')}>{letter}) {label}</span>
+                              </label>
+                            );
+                          })
+                        )}
                         {allowMulti && <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Select {selectCount} answers.</div>}
                       </div>
                     </div>
@@ -1432,31 +1728,48 @@ const ExamTaking: React.FC = () => {
                   );
                 }
                 // Default fill-in-the-blank / note completion
-                const val = (answers[q.id]?.answer as string) || '';
+                const answerValues = getBlankValues(q.id);
                 const rawQuestion = normalizeNewlines((q.questionText || '').trim());
-                // Detect inline placeholder tokens in question text (___ or {answer}) and replace single instance with input, else use prefix/suffix pattern.
+                // Detect inline placeholder tokens in question text (___ or {answerX}) and bind each blank to its own state slot.
                 let contentNode: React.ReactNode;
                 if (rawQuestion) {
-                  const tokenRegex = /(\{answer\}|_{3,})/i;
+                  const tokenRegex = /(\{answer\d*\}|_{3,})/gi;
                   if (tokenRegex.test(rawQuestion)) {
                     const parts = rawQuestion.split(tokenRegex);
+                    let blankIndex = 0;
                     contentNode = (
                       <span className="flex flex-wrap items-center gap-2">
                         {parts.map((p: string, i: number) => {
-                          if (/^(\{answer\}|_{3,})$/i.test(p)) {
+                          if (/^(\{answer\d*\}|_{3,})$/i.test(p)) {
+                            const idxLocal = blankIndex;
+                            const val = answerValues[idxLocal] || '';
+                            let overlayNumber: number | undefined;
+                            const overlayList = blankNumberMap[q.id];
+                            if (overlayList && overlayList.length > idxLocal) {
+                              const isMulti = overlayList.length > 1;
+                              if (!((q.metadata?.singleNumber || q.metadata?.combineBlanks) && isMulti)) {
+                                overlayNumber = overlayList[idxLocal];
+                              }
+                            }
+                            blankIndex += 1;
                             return (
-                              <span key={i} className="relative inline-flex">
+                              <span key={`blank-${q.id}-${idxLocal}`} className="relative inline-flex mx-1">
                                 <input
                                   type="text"
                                   value={val}
-                                  onChange={(e)=> handleAnswerChange(q.id, e.target.value)}
+                                  onChange={(e)=> handleAnswerChange(q.id, e.target.value, idxLocal)}
                                   className={'px-2 py-1 rounded border text-center text-sm font-medium tracking-wide min-w-[110px] ' + (darkMode ? 'bg-gray-900 border-gray-600 text-gray-100 focus:ring-2 focus:ring-blue-500' : 'bg-white border-gray-400 text-gray-900 focus:ring-2 focus:ring-blue-500')}
+                                  data-qnum={overlayNumber !== undefined ? overlayNumber : undefined}
                                 />
-                                {!val && <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] font-semibold ' + (darkMode ? 'text-gray-500':'text-gray-600')}>{qNum}</span>}
+                                {!val && overlayNumber !== undefined && (
+                                  <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] font-semibold ' + (darkMode ? 'text-gray-500':'text-gray-600')}>
+                                    {overlayNumber}
+                                  </span>
+                                )}
                               </span>
                             );
                           }
-                          return <span key={i}>{p}</span>;
+                          return <span key={`txt-${q.id}-${i}`}>{p}</span>;
                         })}
                       </span>
                     );
@@ -1464,7 +1777,29 @@ const ExamTaking: React.FC = () => {
                     contentNode = <span className="font-medium leading-snug whitespace-pre-wrap">{rawQuestion}</span>;
                   }
                 } else if (prefix || suffix) {
-                  contentNode = <span className="font-medium leading-snug">{prefix} ____ {suffix}</span>;
+                  const singleValue = answerValues[0] || '';
+                  const overlayList = blankNumberMap[q.id];
+                  const overlayNumber = overlayList && overlayList.length ? overlayList[0] : (typeof q.questionNumber === 'number' ? q.questionNumber : undefined);
+                  contentNode = (
+                    <span className="flex items-center gap-2">
+                      {prefix && <span className={secondaryTextClass}>{prefix}</span>}
+                      <span className="relative inline-flex">
+                        <input
+                          type="text"
+                          value={singleValue}
+                          onChange={(e) => handleAnswerChange(q.id, e.target.value, 0)}
+                          className={'px-2 py-1 rounded border text-center text-sm font-medium tracking-wide min-w-[110px] ' + (darkMode ? 'bg-gray-900 border-gray-600 text-gray-100 focus:ring-2 focus:ring-blue-500' : 'bg-white border-gray-400 text-gray-900 focus:ring-2 focus:ring-blue-500')}
+                          data-qnum={overlayNumber !== undefined ? overlayNumber : undefined}
+                        />
+                        {!singleValue && overlayNumber !== undefined && (
+                          <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] font-semibold ' + (darkMode ? 'text-gray-500':'text-gray-600')}>
+                            {overlayNumber}
+                          </span>
+                        )}
+                      </span>
+                      {suffix && <span className={secondaryTextClass}>{suffix}</span>}
+                    </span>
+                  );
                 } else {
                   contentNode = null;
                 }
@@ -1476,13 +1811,27 @@ const ExamTaking: React.FC = () => {
                         {contentNode ? contentNode : (
                           <span className="flex items-center gap-2">
                             {prefix && <span className={secondaryTextClass}>{prefix}</span>}
-                            <input
-                              type="text"
-                              value={val}
-                              onChange={(e)=> handleAnswerChange(q.id, e.target.value)}
-                              className={'px-2 py-1 rounded border text-center text-sm font-medium tracking-wide min-w-[110px] ' + (darkMode ? 'bg-gray-900 border-gray-600 text-gray-100 focus:ring-2 focus:ring-blue-500' : 'bg-white border-gray-400 text-gray-900 focus:ring-2 focus:ring-blue-500')}
-                              data-qnum={qNum}
-                            />
+                            {(() => {
+                              const fallbackValue = answerValues[0] || '';
+                              const overlayList = blankNumberMap[q.id];
+                              const overlayNumber = overlayList && overlayList.length ? overlayList[0] : (typeof q.questionNumber === 'number' ? q.questionNumber : undefined);
+                              return (
+                                <span className="relative inline-flex">
+                                  <input
+                                    type="text"
+                                    value={fallbackValue}
+                                    onChange={(e)=> handleAnswerChange(q.id, e.target.value, 0)}
+                                    className={'px-2 py-1 rounded border text-center text-sm font-medium tracking-wide min-w-[110px] ' + (darkMode ? 'bg-gray-900 border-gray-600 text-gray-100 focus:ring-2 focus:ring-blue-500' : 'bg-white border-gray-400 text-gray-900 focus:ring-2 focus:ring-blue-500')}
+                                    data-qnum={overlayNumber !== undefined ? overlayNumber : qNum}
+                                  />
+                                  {!fallbackValue && overlayNumber !== undefined && (
+                                    <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] font-semibold ' + (darkMode ? 'text-gray-500':'text-gray-600')}>
+                                      {overlayNumber}
+                                    </span>
+                                  )}
+                                </span>
+                              );
+                            })()}
                             {suffix && <span className={secondaryTextClass}>{suffix}</span>}
                           </span>
                         )}
@@ -1554,7 +1903,7 @@ const ExamTaking: React.FC = () => {
 
             if (multiSectionListening) {
               // Switch section if needed
-              if (targetSectionIdx !== currentSectionIndex) setCurrentSectionIndex(targetSectionIdx);
+              if (targetSectionIdx !== currentSectionIndex) changeSection(targetSectionIdx, 'manual');
               // For regular questions, set index by sorting that section's non-table questions
               if (reg) {
                 const sec = (exam?.sections || [])[targetSectionIdx];
@@ -1703,12 +2052,15 @@ const ExamTaking: React.FC = () => {
                     const text = normalizeNewlines(q.questionText || '');
                     const curly = (text.match(/\{answer\d+\}/gi) || []).length;
                     const underscores = (text.match(/_{3,}/g) || []).length;
-                    const blanks = meta?.singleNumber ? 1 : (curly || underscores || 1);
-                    const ansVal = answers[q.id]?.answer;
-                    for (let i=0;i<blanks;i++) {
-                      const num = (q.questionNumber || 0) + (blanks>1 ? i : 0);
-                      const isAns = Array.isArray(ansVal) ? !!ansVal[i] : !!ansVal;
-                      mark(num, isAns);
+                    const combine = !!(meta?.singleNumber || meta?.combineBlanks);
+                    const blanks = combine ? 1 : (curly || underscores || 1);
+                    const answerValues = getBlankValues(q.id);
+                    for (let i = 0; i < blanks; i++) {
+                      const num = (q.questionNumber || 0) + (blanks > 1 ? i : 0);
+                      const value = combine
+                        ? (answerValues[0] ?? '')
+                        : (answerValues[i] ?? '');
+                      mark(num, !!value);
                     }
                   } else if (typeof q.questionNumber === 'number') {
                     mark(q.questionNumber, !!(answers[q.id]?.answer));
@@ -1731,7 +2083,7 @@ const ExamTaking: React.FC = () => {
                     onClick={() => {
                       // switch to that section
                       const globalIndex = (exam?.sections || []).findIndex((s: any) => s.id === targetSection.id);
-                      if (globalIndex !== -1) setCurrentSectionIndex(globalIndex);
+                      if (globalIndex !== -1) changeSection(globalIndex, 'manual');
                       setCurrentQuestionIndex(0);
                     }}
                     className={'px-3 py-1.5 rounded border font-medium ' + (p === effectiveListeningPart ? 'bg-blue-600 border-blue-600 text-white' : (darkMode ? 'bg-gray-900 border-gray-600 text-gray-300 hover:bg-gray-700' : 'bg-gray-50 border-gray-300 text-gray-600 hover:bg-gray-100'))}
@@ -1761,7 +2113,20 @@ const ExamTaking: React.FC = () => {
               (currentSection?.questions || []).forEach((q:any) => {
                 let meta = q.metadata; if (meta && typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
                 if (q.questionType === 'simple_table') {
-                  extractSimpleTableNumbersFromQuestion({ ...q, metadata: meta }).forEach(({num, answered}) => { if (numBelongsToCurrentPart(num)) mark(num, answered); });
+                  // Only include numbers from tables belonging to current part
+                  const explicitPart = Number((meta as any)?.listeningPart);
+                  const rows:any[][] = (meta as any)?.simpleTable?.rows || [];
+                  let firstNum = Number((meta as any)?.simpleTable?.sequenceStart);
+                  if (!firstNum || isNaN(firstNum)) {
+                    const nums:number[] = [];
+                    rows.forEach((row:any[]) => row.forEach((cell:any) => { if (cell?.type==='question' && typeof cell.questionNumber==='number') nums.push(cell.questionNumber); }));
+                    if (nums.length) firstNum = Math.min(...nums);
+                  }
+                  const inferredPart = firstNum ? Math.ceil(firstNum / 10) : undefined;
+                  const part = explicitPart || inferredPart;
+                  if (part === effectiveListeningPart) {
+                    extractSimpleTableNumbersFromQuestion({ ...q, metadata: meta }).forEach(({num, answered}) => { if (numBelongsToCurrentPart(num)) mark(num, answered); });
+                  }
                   return;
                 }
                 if (!inThisPartByQuestion({ ...q, metadata: meta })) return;
@@ -1769,12 +2134,15 @@ const ExamTaking: React.FC = () => {
                   const text = normalizeNewlines(q.questionText || '');
                   const curly = (text.match(/\{answer\d+\}/gi) || []).length;
                   const underscores = (text.match(/_{3,}/g) || []).length;
-                  const blanks = meta?.singleNumber ? 1 : (curly || underscores || 1);
-                  const ansVal = answers[q.id]?.answer;
-                  for (let i=0;i<blanks;i++) {
-                    const num = (q.questionNumber || 0) + (blanks>1 ? i : 0);
-                    const isAns = Array.isArray(ansVal) ? !!ansVal[i] : !!ansVal;
-                    mark(num, isAns);
+                  const combine = !!(meta?.singleNumber || meta?.combineBlanks);
+                  const blanks = combine ? 1 : (curly || underscores || 1);
+                  const answerValues = getBlankValues(q.id);
+                  for (let i = 0; i < blanks; i++) {
+                    const num = (q.questionNumber || 0) + (blanks > 1 ? i : 0);
+                    const value = combine
+                      ? (answerValues[0] ?? '')
+                      : (answerValues[i] ?? '');
+                    mark(num, !!value);
                   }
                 } else if (typeof q.questionNumber === 'number') {
                   mark(q.questionNumber, !!(answers[q.id]?.answer));
@@ -1821,6 +2189,7 @@ const ExamTaking: React.FC = () => {
             </div>
           </div>
         )}
+        {transitionOverlay}
       </div>
     );
   }
@@ -1862,8 +2231,8 @@ const ExamTaking: React.FC = () => {
         </div>
         <div className="flex items-center gap-4">
           <button onClick={() => setShowSettings(s => !s)} className={(showSettings ? 'ring-2 ring-blue-500 ' : '') + "px-3 py-2 rounded text-sm border transition-colors " + (darkMode ? 'border-gray-600 bg-gray-700 hover:bg-gray-600 text-gray-100' : 'border-gray-300 bg-white hover:bg-gray-100 text-gray-700')}>Settings</button>
-          {/* Global timer only (ignore per-section durations) */}
-          <Timer darkMode={darkMode} duration={exam?.durationMinutes || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
+          {/* Per-section timer (Reading/Writing/etc.) */}
+          <Timer key={`timer-${timerKey}`} darkMode={darkMode} duration={sectionTimerDuration || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
           {exam && <button onClick={() => setShowConfirmSubmit(true)} className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700">Submit</button>}
         </div>
       </div>
@@ -2348,7 +2717,7 @@ const ExamTaking: React.FC = () => {
                 {/* Table container rendered (if any) before question list */}
                 {tableContainer && (() => {
                   const q = tableContainer;
-                  
+
                   // Simple Table Rendering
                   if (q.questionType === 'simple_table') {
                     // Ensure metadata parsed (backend may return JSON string)
@@ -2358,7 +2727,7 @@ const ExamTaking: React.FC = () => {
                     }
                     const tableMeta = meta?.simpleTable || {};
                     const rows: any[][] = Array.isArray(tableMeta.rows) ? tableMeta.rows : [];
-                    
+
                     if (!rows.length) {
                       return (
                         <div className="mb-8 pb-4 border-b border-dashed border-gray-300 dark:border-gray-700">
@@ -2368,7 +2737,7 @@ const ExamTaking: React.FC = () => {
                         </div>
                       );
                     }
-                    
+
                     return (
                       <div className="mb-8 pb-4 border-b border-dashed border-gray-300 dark:border-gray-700">
                         {q.questionText && <div className="mb-2 font-medium text-sm whitespace-pre-wrap leading-snug">{normalizeNewlines(q.questionText)}</div>}
@@ -2514,7 +2883,7 @@ const ExamTaking: React.FC = () => {
                       </div>
                     );
                   }
-                  
+
                   // Legacy Table Rendering (existing complex system)
                   const isLegacy = q.questionType === 'essay' && q.metadata?.tableBlock;
                   const tableMeta = isLegacy ? (q.metadata?.tableBlock || {}) : (q.metadata?.table || {});
@@ -2635,6 +3004,32 @@ const ExamTaking: React.FC = () => {
                       if (getWritingPart(q) !== currentWritingPart) return null;
                     } catch {}
                   }
+                  let metaAny: any = q.metadata;
+                  if (metaAny && typeof metaAny === 'string') {
+                    try { metaAny = JSON.parse(metaAny); } catch { metaAny = {}; }
+                  }
+                  if (!metaAny || typeof metaAny !== 'object') metaAny = {};
+                  if (q.metadata !== metaAny) {
+                    q.metadata = metaAny;
+                  }
+                  const dropdownRaw = metaAny?.displayMode ?? metaAny?.display_mode ?? metaAny?.renderMode ?? metaAny?.dropdown ?? q.displayMode ?? q.renderMode ?? (typeof q.dropdown !== 'undefined' ? q.dropdown : undefined);
+                  const dropdownMode = dropdownRaw === true
+                    || dropdownRaw === 'dropdown'
+                    || dropdownRaw === 'Dropdown'
+                    || (typeof dropdownRaw === 'string' && dropdownRaw.toLowerCase() === 'dropdown')
+                    || (typeof dropdownRaw === 'string' && dropdownRaw.toLowerCase() === 'true');
+                  if (typeof window !== 'undefined') {
+                    const dbg = (window as any).__dropdownDebug || ((window as any).__dropdownDebug = {});
+                    dbg[q.id] = {
+                      qnum: q.questionNumber,
+                      dropdownRaw,
+                      dropdownMode,
+                      metadata: metaAny,
+                    };
+                    if (dropdownMode) {
+                      console.log('[DropdownRender]', q.id, q.questionNumber, dropdownRaw, metaAny);
+                    }
+                  }
                   const displayNumber = (blankNumberMap[q.id]?.[0]) || q.questionNumber || (idx + 1);
                   // Interactive fill_blank: support placeholders {answer1} OR runs of underscores ___ inline.
                   let renderedQuestionText: React.ReactNode = normalizeNewlines(q.questionText) || q.text;
@@ -2667,7 +3062,17 @@ const ExamTaking: React.FC = () => {
                         const targetQ = fillBlankByNumber[num];
                         if (targetQ) {
                           renderedCompositeNumbers.add(num);
-                          const val = (answers[targetQ.id]?.answer as string) || '';
+                          const blankNumbers = blankNumberMap[targetQ.id] || [];
+                          const idxLocal = (() => {
+                            if (!blankNumbers.length) return 0;
+                            const idx = blankNumbers.indexOf(num);
+                            if (idx >= 0) return idx;
+                            const base = typeof targetQ.questionNumber === 'number' ? targetQ.questionNumber : num;
+                            const offset = num - base;
+                            return offset >= 0 ? offset : 0;
+                          })();
+                          const values = getBlankValues(targetQ.id);
+                          const val = values[idxLocal] || '';
                           parts.push(
                             <span key={`comp-${targetQ.id}`} className="mx-1 inline-block align-middle">
                               <span className="relative inline-flex">
@@ -2675,8 +3080,8 @@ const ExamTaking: React.FC = () => {
                                   type="text"
                                   className="px-2 py-1 border border-gray-400 rounded-sm text-sm min-w-[110px] focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-center font-medium tracking-wide"
                                   value={val}
-                                  onChange={(e) => handleAnswerChange(targetQ.id, e.target.value)}
-                                  data-qnum={num}
+                                  onChange={(e) => handleAnswerChange(targetQ.id, e.target.value, idxLocal)}
+                                  data-qnum={blankNumbers.length > idxLocal ? blankNumbers[idxLocal] : num}
                                 />
                                 {!val && (
                                   <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-semibold text-gray-700 select-none">{num}</span>
@@ -2699,7 +3104,29 @@ const ExamTaking: React.FC = () => {
                     // (Non-anchor members already skipped earlier return null path)
                   }
                   if (q.questionType === 'fill_blank' && typeof (q.questionText || '') === 'string') {
-                    const text = q.questionText;
+                    const hasComposite = !!q.metadata?.compositeTemplate; // compositeTemplate manages its own referenced blanks
+                    // Normalize duplicate / non-sequential {answerX} tokens client-side so each blank maps to its own index.
+                    // We DO NOT persist this change; it's only for rendering + answer array indexing.
+                    // Rationale: authors sometimes copy/paste and leave {answer1} repeated which previously caused
+                    // multiple inputs to bind to index 0 (mirrored typing). We rewrite to {answer1}{answer2}... left-to-right.
+                    let text = q.questionText as string;
+                    const placeholderMatches = hasComposite ? [] : [...text.matchAll(/\{answer(\d+)\}/gi)];
+                    if (placeholderMatches.length) {
+                      // Determine whether indices are strictly 1..n; if not, rewrite.
+                      let needsRewrite = false;
+                      for (let i = 0; i < placeholderMatches.length; i++) {
+                        const rawIdx = Number(placeholderMatches[i][1]);
+                        if (isNaN(rawIdx) || rawIdx !== i + 1) { needsRewrite = true; break; }
+                      }
+                      if (needsRewrite) {
+                        let counter = 1;
+                        text = text.replace(/\{answer(\d+)\}/gi, () => `{answer${counter++}}`);
+                        try {
+                          const dbg = (window as any).__placeholderDebug || ((window as any).__placeholderDebug = {});
+                          dbg[q.id] = { original: q.questionText, normalized: text };
+                        } catch {}
+                      }
+                    }
                     const hasCurly = /\{answer\d+\}/i.test(text);
                     const hasUnderscore = /_{3,}/.test(text);
                     if (hasCurly || hasUnderscore) {
@@ -2708,7 +3135,7 @@ const ExamTaking: React.FC = () => {
                       const isConversation = !!q.metadata?.conversation;
                       const speakerRegex = /^(?:[A-Z][A-Za-z']{0,12}|Man|Woman|Boy|Girl|Host|Speaker|Student|Tutor|Agent|Caller|Customer|Professor|Lecturer|Guide)\s*:/;
                       const nodes: React.ReactNode[] = [];
-                      const answerArray = Array.isArray(answers[q.id]?.answer) ? answers[q.id]?.answer as string[] : [];
+                      const answerArray = getBlankValues(q.id);
                       if (hasCurly) {
                         const regex = /\{(answer\d+)\}/gi;
                         let lastIndex = 0; let match; let blankIndex = 0;
@@ -2717,10 +3144,13 @@ const ExamTaking: React.FC = () => {
                           if (before) nodes.push(before);
                           const idxLocal = blankIndex;
                           const val = answerArray[idxLocal] || '';
-                          let overlayNumber: number | undefined = undefined;
-                          if (blankNumberMap[q.id]) {
-                            const isMulti = blankNumberMap[q.id].length > 1;
-                            if (!(q.metadata?.singleNumber && isMulti)) overlayNumber = blankNumberMap[q.id][idxLocal];
+                          let overlayNumber: number | undefined;
+                          const overlayList = blankNumberMap[q.id];
+                          if (overlayList && overlayList.length > idxLocal) {
+                            const isMulti = overlayList.length > 1;
+                            if (!((q.metadata?.singleNumber || q.metadata?.combineBlanks) && isMulti)) {
+                              overlayNumber = overlayList[idxLocal];
+                            }
                           }
                           nodes.push(
                             <span key={`blank-${q.id}-${idxLocal}`} className="mx-1 inline-block align-middle">
@@ -2729,12 +3159,7 @@ const ExamTaking: React.FC = () => {
                                   type="text"
                                   className={"px-2 py-1 rounded-sm text-sm min-w-[110px] focus:ring-2 text-center font-medium tracking-wide transition-colors " + inputBase + ' ' + blankInputExtra}
                                   value={val}
-                                  onChange={(e) => {
-                                    const prev = Array.isArray(answers[q.id]?.answer) ? [...(answers[q.id]?.answer as string[])] : [];
-                                    while (prev.length <= idxLocal) prev.push('');
-                                    prev[idxLocal] = e.target.value;
-                                    handleAnswerChange(q.id, prev);
-                                  }}
+                                  onChange={(e) => handleAnswerChange(q.id, e.target.value, idxLocal)}
                                   data-qnum={(() => { const nums = blankNumberMap[q.id]; return (nums && nums.length > idxLocal) ? nums[idxLocal] : undefined; })()}
                                 />
                                 {!val && overlayNumber !== undefined && (
@@ -2756,10 +3181,13 @@ const ExamTaking: React.FC = () => {
                           if (before) nodes.push(before);
                           const idxLocal = blankIndex;
                           const val = answerArray[idxLocal] || '';
-                          let overlayNumber: number | undefined = undefined;
-                          if (blankNumberMap[q.id]) {
-                            const isMulti = blankNumberMap[q.id].length > 1;
-                            if (!(q.metadata?.singleNumber && isMulti)) overlayNumber = blankNumberMap[q.id][idxLocal];
+                          let overlayNumber: number | undefined;
+                          const overlayList = blankNumberMap[q.id];
+                          if (overlayList && overlayList.length > idxLocal) {
+                            const isMulti = overlayList.length > 1;
+                            if (!((q.metadata?.singleNumber || q.metadata?.combineBlanks) && isMulti)) {
+                              overlayNumber = overlayList[idxLocal];
+                            }
                           }
                           nodes.push(
                             <span key={`ublank-${q.id}-${idxLocal}`} className="mx-1 inline-block align-middle">
@@ -2768,12 +3196,7 @@ const ExamTaking: React.FC = () => {
                                   type="text"
                                   className={"px-2 py-1 rounded-sm text-sm min-w-[110px] focus:ring-2 text-center font-medium tracking-wide transition-colors " + inputBase + ' ' + blankInputExtra}
                                   value={val}
-                                  onChange={(e) => {
-                                    const prev = Array.isArray(answers[q.id]?.answer) ? [...(answers[q.id]?.answer as string[])] : [];
-                                    while (prev.length <= idxLocal) prev.push('');
-                                    prev[idxLocal] = e.target.value;
-                                    handleAnswerChange(q.id, prev);
-                                  }}
+                                  onChange={(e) => handleAnswerChange(q.id, e.target.value, idxLocal)}
                                   data-qnum={(() => { const nums = blankNumberMap[q.id]; return (nums && nums.length > idxLocal) ? nums[idxLocal] : undefined; })()}
                                 />
                                 {!val && overlayNumber !== undefined && (
@@ -2819,26 +3242,25 @@ const ExamTaking: React.FC = () => {
                                 }
                               }
                               // Insert input component aligned center small
-                              const val = answerArray[blankCursor] || '';
-                              let overlayNumber: number | undefined = undefined;
-                              if (blankNumberMap[q.id]) {
-                                const isMulti = blankNumberMap[q.id].length > 1;
-                                if (!(q.metadata?.singleNumber && isMulti)) overlayNumber = blankNumberMap[q.id][blankCursor];
+                              const idxLocal = blankCursor;
+                              const val = answerArray[idxLocal] || '';
+                              let overlayNumber: number | undefined;
+                              const overlayList = blankNumberMap[q.id];
+                              if (overlayList && overlayList.length > idxLocal) {
+                                const isMulti = overlayList.length > 1;
+                                if (!((q.metadata?.singleNumber || q.metadata?.combineBlanks) && isMulti)) {
+                                  overlayNumber = overlayList[idxLocal];
+                                }
                               }
                               lineBuffer.push(
-                                <span key={'convblank-'+blankCursor} className="mx-1 inline-block align-middle">
+                                <span key={'convblank-'+idxLocal} className="mx-1 inline-block align-middle">
                                   <span className="relative inline-flex">
                                     <input
                                       type="text"
                                       className={"px-2 py-1 rounded-sm text-sm min-w-[90px] focus:ring-2 text-center font-medium tracking-wide transition-colors " + inputBase + ' ' + blankInputExtra}
                                       value={val}
-                                      onChange={(e) => {
-                                        const prev = Array.isArray(answers[q.id]?.answer) ? [...(answers[q.id]?.answer as string[])] : [];
-                                        while (prev.length <= blankCursor) prev.push('');
-                                        prev[blankCursor] = e.target.value;
-                                        handleAnswerChange(q.id, prev);
-                                      }}
-                                      data-qnum={(() => { const nums = blankNumberMap[q.id]; return (nums && nums.length > blankCursor) ? nums[blankCursor] : undefined; })()}
+                                      onChange={(e) => handleAnswerChange(q.id, e.target.value, idxLocal)}
+                                      data-qnum={(() => { const nums = blankNumberMap[q.id]; return (nums && nums.length > idxLocal) ? nums[idxLocal] : undefined; })()}
                                     />
                                     {!val && overlayNumber !== undefined && (
                                       <span className={"pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] font-semibold select-none " + (darkMode ? 'text-gray-500' : 'text-gray-700')}>{overlayNumber}</span>
@@ -2965,6 +3387,7 @@ const ExamTaking: React.FC = () => {
                                   if (q.metadata?.groupRangeEnd) return `Questions ${q.questionNumber}–${q.metadata.groupRangeEnd}`;
                                   const nums = blankNumberMap[q.id];
                                   if (q.questionType === 'fill_blank' && nums && nums.length > 1 && !q.metadata?.singleNumber) return `Questions ${nums[0]}–${nums[nums.length - 1]}`;
+                                  if (q.questionType === 'fill_blank' && nums && nums.length > 1 && !(q.metadata?.singleNumber || q.metadata?.combineBlanks)) return `Questions ${nums[0]}–${nums[nums.length - 1]}`;
                                   return `Question ${displayNumber}`;
                                 })()} -
                               </span>
@@ -3023,35 +3446,52 @@ const ExamTaking: React.FC = () => {
                           </div>
                         ) : (
                           <div className="space-y-1">
-                            {(q.options || []).map((option: any, index: number) => {
-                              const rawValue = option.value ?? option.letter ?? option.option_letter ?? option.text ?? option;
-                              const value = typeof rawValue === 'string' ? rawValue : String(rawValue ?? '');
-                              const optionLetter = (option.letter || option.option_letter || '').toString().trim();
-                              const indicator = optionLetter ? optionLetter.toUpperCase() : (index < 26 ? String.fromCharCode(65 + index) : String(index + 1));
-                              const baseText = option.text || option.option_text || (typeof option === 'string' ? option : '');
-                              const label = baseText || value;
-                              const currentRaw = answers[q.id]?.answer;
-                              const current = typeof currentRaw === 'string' ? currentRaw : '';
-                              const isSelected = current === value;
-                              return (
-                                <div
-                                  key={option.id || `${q.id}_${index}`}
-                                  className={`flex items-center gap-3 text-sm px-3 py-2 border rounded cursor-pointer select-none transition-colors ${isSelected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50 active:bg-gray-100')}`}
-                                  onClick={() => handleAnswerChange(q.id, value)}
-                                  role="radio"
-                                  aria-checked={isSelected}
-                                  tabIndex={0}
-                                  onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); (e.currentTarget as HTMLElement).click(); } }}
-                                >
-                                  <span className={`mt-0.5 inline-flex w-6 h-6 border rounded-full items-center justify-center text-[11px] font-semibold ${isSelected ? (darkMode ? 'bg-blue-500 border-blue-500 text-white' : 'bg-blue-500 border-blue-500 text-white') : (darkMode ? 'border-gray-500 text-gray-300' : 'border-gray-400 text-gray-700')}`}>
-                                    {indicator}
-                                  </span>
-                                  <span className="flex-1 text-left">
-                                    {label}
-                                  </span>
-                                </div>
-                              );
-                            })}
+                    {dropdownMode ? (
+                      <div className="flex items-center gap-2">
+                        <select
+                          className={`text-sm px-3 py-2 rounded border w-full ${darkMode ? 'bg-gray-800 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                          value={typeof answers[q.id]?.answer === 'string' ? (answers[q.id]?.answer as string) : ''}
+                          onChange={(e) => handleAnswerChange(q.id, e.target.value)}
+                        >
+                          <option value="">-- Select --</option>
+                          {(q.options || []).map((option: any, index: number) => {
+                            const letter = (option.letter || option.option_letter || '').toString().trim() || (index < 26 ? String.fromCharCode(65 + index) : String(index + 1));
+                            const text = option.text || option.option_text || '';
+                            return <option key={option.id || `${q.id}_${index}`} value={letter}>{letter}) {text || `Option ${letter}`}</option>;
+                          })}
+                        </select>
+                      </div>
+                    ) : (
+                              (q.options || []).map((option: any, index: number) => {
+                                const rawValue = option.value ?? option.letter ?? option.option_letter ?? option.text ?? option;
+                                const value = typeof rawValue === 'string' ? rawValue : String(rawValue ?? '');
+                                const optionLetter = (option.letter || option.option_letter || '').toString().trim();
+                                const indicator = optionLetter ? optionLetter.toUpperCase() : (index < 26 ? String.fromCharCode(65 + index) : String(index + 1));
+                                const baseText = option.text || option.option_text || (typeof option === 'string' ? option : '');
+                                const label = baseText || value;
+                                const currentRaw = answers[q.id]?.answer;
+                                const current = typeof currentRaw === 'string' ? currentRaw : '';
+                                const isSelected = current === value;
+                                return (
+                                  <div
+                                    key={option.id || `${q.id}_${index}`}
+                                    className={`flex items-center gap-3 text-sm px-3 py-2 border rounded cursor-pointer select-none transition-colors ${isSelected ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50 active:bg-gray-100')}`}
+                                    onClick={() => handleAnswerChange(q.id, value)}
+                                    role="radio"
+                                    aria-checked={isSelected}
+                                    tabIndex={0}
+                                    onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); (e.currentTarget as HTMLElement).click(); } }}
+                                  >
+                                    <span className={`mt-0.5 inline-flex w-6 h-6 border rounded-full items-center justify-center text-[11px] font-semibold ${isSelected ? (darkMode ? 'bg-blue-500 border-blue-500 text-white' : 'bg-blue-500 border-blue-500 text-white') : (darkMode ? 'border-gray-500 text-gray-300' : 'border-gray-400 text-gray-700')}`}>
+                                      {indicator}
+                                    </span>
+                                    <span className="flex-1 text-left">
+                                      {label}
+                                    </span>
+                                  </div>
+                                );
+                              })
+                            )}
                           </div>
                         )}
                       </div>
@@ -3369,24 +3809,28 @@ const ExamTaking: React.FC = () => {
                         />
                       </div>
                     )}
-        {(q.questionType === 'fill_blank' || q.type === 'number') && !hasInlinePlaceholders && (
-                      <div className="mt-2">
-                        <span className="relative inline-flex">
-                          <input
-                            type="text"
-                            value={(answers[q.id]?.answer as string) || ''}
-                            onChange={(e) => handleAnswerChange(q.id, e.target.value)}
-          className={'px-3 py-2 rounded-sm text-sm min-w-[140px] focus:ring-2 text-center font-medium tracking-wide transition-colors ' + inputBase + ' ' + blankInputExtra}
-          data-qnum={(blankNumberMap[q.id]?.[0]) || q.questionNumber || undefined}
-                          />
-                          {!(answers[q.id]?.answer) && (
-                            <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-semibold select-none ' + (darkMode ? 'text-gray-500' : 'text-gray-700')}>
-                              {(blankNumberMap[q.id]?.[0]) || q.questionNumber || ''}
-                            </span>
-                          )}
-                        </span>
-                      </div>
-                    )}
+        {(q.questionType === 'fill_blank' || q.type === 'number') && !hasInlinePlaceholders && (() => {
+                      const singleValue = getBlankValues(q.id)[0] || '';
+                      const overlayNum = (blankNumberMap[q.id]?.[0]) || q.questionNumber || undefined;
+                      return (
+                        <div className="mt-2">
+                          <span className="relative inline-flex">
+                            <input
+                              type="text"
+                              value={singleValue}
+                              onChange={(e) => handleAnswerChange(q.id, e.target.value)}
+                              className={'px-3 py-2 rounded-sm text-sm min-w-[140px] focus:ring-2 text-center font-medium tracking-wide transition-colors ' + inputBase + ' ' + blankInputExtra}
+                              data-qnum={overlayNum}
+                            />
+                            {!singleValue && overlayNum !== undefined && (
+                              <span className={'pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-semibold select-none ' + (darkMode ? 'text-gray-500' : 'text-gray-700')}>
+                                {overlayNum}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      );
+                    })()}
                   </div>
                 );});})()}
               </div>
@@ -3440,12 +3884,15 @@ const ExamTaking: React.FC = () => {
             const text = normalizeNewlines(q.questionText || '');
             const curly = (text.match(/\{answer\d+\}/gi) || []).length;
             const underscores = (text.match(/_{3,}/g) || []).length;
-            const blanks = q.metadata?.singleNumber ? 1 : (curly || underscores || 1);
-            const ansVal = answers[q.id]?.answer;
-            for (let i=0;i<blanks;i++) {
-              const num = (q.questionNumber || 0) + (blanks>1 ? i : 0);
-              const isAns = Array.isArray(ansVal) ? !!ansVal[i] : !!ansVal;
-              mark(num, isAns);
+            const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks);
+            const blanks = combine ? 1 : (curly || underscores || 1);
+            const answerValues = getBlankValues(q.id);
+            for (let i = 0; i < blanks; i++) {
+              const num = (q.questionNumber || 0) + (blanks > 1 ? i : 0);
+              const value = combine
+                ? (answerValues[0] ?? '')
+                : (answerValues[i] ?? '');
+              mark(num, !!value);
             }
           } else if (typeof q.questionNumber === 'number') {
             mark(q.questionNumber, !!(answers[q.id]?.answer));
@@ -3536,12 +3983,15 @@ const ExamTaking: React.FC = () => {
                   const text = normalizeNewlines(q.questionText || '');
                   const curly = (text.match(/\{answer\d+\}/gi) || []).length;
                   const underscores = (text.match(/_{3,}/g) || []).length;
-                  const blanks = q.metadata?.singleNumber ? 1 : (curly || underscores || 1);
-                  const ansVal = answers[q.id]?.answer;
-                  for (let i=0;i<blanks;i++) {
-                    const num = (q.questionNumber || 0) + (blanks>1 ? i : 0);
-                    const isAns = Array.isArray(ansVal) ? !!ansVal[i] : !!ansVal;
-                    mark(num, isAns);
+                  const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks);
+                  const blanks = combine ? 1 : (curly || underscores || 1);
+                  const answerValues = getBlankValues(q.id);
+                  for (let i = 0; i < blanks; i++) {
+                    const num = (q.questionNumber || 0) + (blanks > 1 ? i : 0);
+                    const value = combine
+                      ? (answerValues[0] ?? '')
+                      : (answerValues[i] ?? '');
+                    mark(num, !!value);
                   }
                 } else if ((q.questionType === 'multiple_choice' && q.metadata?.allowMultiSelect) || q.questionType === 'multi_select') {
                   const required = Number(q.metadata?.selectCount) || 2;

@@ -269,7 +269,7 @@ export const setupSocketHandlers = (io: Server): void => {
     });
 
     // Force submit exam (admin only)
-    socket.on('exam:force_submit', async (data: { sessionId: string, reason: string }) => {
+  socket.on('exam:force_submit', async (data: { sessionId: string, reason: string }) => {
       if (!socket.userId || !['admin', 'super_admin'].includes(socket.userRole || '')) {
         socket.emit('error', { message: 'Admin access required' });
         return;
@@ -295,8 +295,13 @@ export const setupSocketHandlers = (io: Server): void => {
           JSON.stringify({ reason: data.reason })
         ]);
 
-        // Notify student
-        socket.to(`exam:*:${data.sessionId}`).emit('exam:force_submit', {
+        // Find the active session to get examId for proper room emit
+        const active = Array.from(activeSessions.values()).find(s => s.id === data.sessionId);
+
+        // Notify student in the specific exam room if known; otherwise broadcast to admin room listeners
+        const targetRoom = active ? `exam:${active.examId}:${data.sessionId}` : undefined;
+        const emitter = targetRoom ? socket.to(targetRoom) : socket;
+        emitter.emit('exam:force_submit', {
           reason: data.reason,
           timestamp: new Date().toISOString()
         });

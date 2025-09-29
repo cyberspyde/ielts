@@ -62,11 +62,10 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
       newSocket.on('connect', () => {
         console.log('Socket connected:', newSocket.id);
         setIsConnected(true);
-        
-        // Join user-specific room
-        newSocket.emit('user:join', {
-          userId: user.id,
-          role: user.role,
+
+        // Authenticate socket connection with server
+        newSocket.emit('authenticate', {
+          token: token,
         });
       });
 
@@ -95,6 +94,16 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
       newSocket.on('reconnect_error', (error) => {
         console.error('Socket reconnection error:', error);
         toast.error('Failed to reconnect');
+      });
+
+      // Auth flow acknowledgments
+      newSocket.on('authenticated', () => {
+        console.log('Socket authenticated');
+      });
+
+      newSocket.on('authentication_error', (data) => {
+        console.error('Socket authentication failed:', data?.message);
+        toast.error('Socket authentication failed');
       });
 
       // Exam-specific events

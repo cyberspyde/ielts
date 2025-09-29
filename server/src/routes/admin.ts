@@ -6,6 +6,7 @@ import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
 import { query, logger } from '../config/database-no-redis';
 import { asyncHandler, createValidationError, createNotFoundError, AppError } from '../middleware/errorHandler';
+import { normalizeSimpleTableAnswer } from '../utils/simpleTable';
 import { authMiddleware, requireRole, requireAdmin, requireSuperAdmin, rateLimitByUser } from '../middleware/auth';
 
 const router = Router();
@@ -321,6 +322,50 @@ router.get('/dashboard',
   })
 );
 
+// GET /api/admin/sessions/calendar - Daily counts for a month to power calendar UI
+router.get('/sessions/calendar', asyncHandler(async (req: Request, res: Response) => {
+  // Inputs: year, month (1-12), or startDate/endDate (ISO). If none, use current month.
+  const { year, month, startDate, endDate, examId, status } = req.query as any;
+
+  let rangeStart: Date;
+  let rangeEnd: Date;
+
+  if (startDate && endDate) {
+    rangeStart = new Date(String(startDate));
+    rangeEnd = new Date(String(endDate));
+  } else {
+    const now = new Date();
+    const y = Number(year) || now.getFullYear();
+    const m = Number(month) ? Number(month) - 1 : now.getMonth(); // JS month 0-11
+    rangeStart = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+    rangeEnd = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
+  }
+
+  let where = 'WHERE 1=1';
+  const params: any[] = [];
+  let p = 1;
+
+  // Use submitted_at if present, else created_at, same as list ordering
+  where += ` AND COALESCE(es.submitted_at, es.created_at) >= $${p++}`; params.push(rangeStart);
+  where += ` AND COALESCE(es.submitted_at, es.created_at) < $${p++}`; params.push(rangeEnd);
+
+  if (examId) { where += ` AND es.exam_id = $${p++}`; params.push(examId); }
+  if (status) { where += ` AND es.status = $${p++}`; params.push(status); }
+
+  const sql = `
+    SELECT to_char(COALESCE(es.submitted_at, es.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+           COUNT(*)::int as count
+    FROM exam_sessions es
+    ${where}
+    GROUP BY 1
+    ORDER BY 1
+  `;
+
+  const result = await query(sql, params);
+  const counts = result.rows.reduce((acc: any, row: any) => { acc[row.day] = row.count; return acc; }, {});
+  res.json({ success: true, data: { start: rangeStart.toISOString(), end: rangeEnd.toISOString(), counts } });
+}));
+
 // PATCH /api/admin/sessions/:sessionId/answers/:questionId/grade - grade a single answer
 router.patch('/sessions/:sessionId/answers/:questionId/grade',
   body('pointsEarned').isFloat({ min: 0 }).withMessage('pointsEarned required'),
@@ -395,6 +440,59 @@ router.post('/sessions/:sessionId/approve', asyncHandler(async (req: Request, re
 // ==========================
 // Exams Management (Admin)
 // ==========================
+
+// GET /api/admin/exams - List exams for admin (with optional filters)
+router.get('/exams',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { page = 1, limit = 200, search, type, tag } = req.query as Record<string, string>;
+    const offset = (Number(page) - 1) * Number(limit);
+
+    let where = 'WHERE 1=1';
+    const params: any[] = [];
+    let p = 1;
+    if (search) {
+      where += ` AND (e.title ILIKE $${p} OR e.description ILIKE $${p})`;
+      params.push(`%${search}%`);
+      p++;
+    }
+    if (type && (type === 'academic' || type === 'general_training')) {
+      where += ` AND e.exam_type = $${p++}`;
+      params.push(type);
+    }
+    if (tag && typeof tag === 'string' && tag.trim()) {
+      where += ` AND COALESCE(e.tags, '{}') @> ARRAY[$${p++}]::text[]`;
+      params.push(tag.trim().toLowerCase());
+    }
+
+    const listSql = `
+      SELECT e.id, e.title, e.description, e.exam_type, e.duration_minutes,
+             e.is_active, e.created_at, e.tags,
+             COUNT(s.id) AS section_count
+        FROM exams e
+   LEFT JOIN exam_sections s ON s.exam_id = e.id
+       ${where}
+    GROUP BY e.id
+    ORDER BY e.created_at DESC
+       LIMIT $${p++} OFFSET $${p++}
+    `;
+    params.push(Number(limit), offset);
+
+    const rows = await query(listSql, params);
+    const data = rows.rows.map((r: any) => ({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      examType: r.exam_type,
+      durationMinutes: r.duration_minutes,
+      isActive: r.is_active,
+      sectionCount: Number(r.section_count || 0),
+      createdAt: r.created_at,
+      tags: Array.isArray(r.tags) ? r.tags : [],
+    }));
+
+    res.json({ success: true, data });
+  })
+);
 
 // POST /api/admin/exams - Create a new exam
 router.post('/exams',
@@ -872,6 +970,7 @@ router.post('/exams/:examId/questions/bulk',
   body('groups.*.options').optional().isArray().withMessage('Options must be an array when provided'),
   body('groups.*.correctAnswers').optional().isArray().withMessage('correctAnswers must be an array when provided'),
   body('groups.*.correctAnswer').optional(),
+  body('groups.*.metadata').optional(),
   body('groups.*.questionTexts').optional().isArray().withMessage('questionTexts must be an array when provided'),
   body('groups.*.fillMissing').optional().isBoolean(),
   asyncHandler(async (req: Request, res: Response) => {
@@ -918,23 +1017,24 @@ router.post('/exams/:examId/questions/bulk',
         }
         const questionText = (Array.isArray(g.questionTexts) ? g.questionTexts[num - startNum] : g.questionText) || '';
         const points = g.points || 1.0;
-        let metadata: any = null;
+        // Start with caller-provided metadata (shallow clone) to allow listeningPart/readingPart, etc.
+        let metadata: any = g.metadata ? { ...(g.metadata || {}) } : null;
         if (dbQuestionType === 'drag_drop') {
           if (num === startNum) {
             // Anchor: provide a default layout if not specified by client and store group range end
-            metadata = { layout: (g.layout || 'rows'), groupRangeEnd: endNum };
+            metadata = { ...(metadata||{}), layout: (g.layout || 'rows'), groupRangeEnd: endNum };
           } else {
             if (!dragDropAnchorId) {
               throw new AppError('Internal error creating drag_drop group (missing anchor id)', 500);
             }
-            metadata = { groupMemberOf: dragDropAnchorId };
+            metadata = { ...(metadata||{}), groupMemberOf: dragDropAnchorId };
           }
         } else if (dbQuestionType === 'essay') {
           // Auto-assign writing part for convenience when creating ranges: first -> part 1, second -> part 2
           // If more than 2 created, fallback to part 1 for the rest; admins can adjust later.
           const idxWithin = num - startNum; // 0-based
           const part = idxWithin === 0 ? 1 : (idxWithin === 1 ? 2 : 1);
-          metadata = { ...(g.metadata || {}), writingPart: part };
+          metadata = { ...(metadata || {}), writingPart: part };
         }
 
         const rQ = await query(`
@@ -1436,7 +1536,9 @@ router.get('/sessions',
       examId, 
       status,
       userId,
-      todayOnly
+      todayOnly,
+      startDate,
+      endDate
     } = req.query;
 
     const offset = (Number(page) - 1) * Number(limit);
@@ -1462,6 +1564,16 @@ router.get('/sessions',
 
     if (String(todayOnly) === 'true') {
       whereClause += " AND COALESCE(es.submitted_at, es.created_at) >= date_trunc('day', now()) AND COALESCE(es.submitted_at, es.created_at) < date_trunc('day', now()) + INTERVAL '1 day'";
+    }
+
+    // Arbitrary date range filter (inclusive start, exclusive end)
+    if (startDate) {
+      whereClause += ` AND COALESCE(es.submitted_at, es.created_at) >= $${paramCount++}`;
+      queryParams.push(new Date(String(startDate)));
+    }
+    if (endDate) {
+      whereClause += ` AND COALESCE(es.submitted_at, es.created_at) < $${paramCount++}`;
+      queryParams.push(new Date(String(endDate)));
     }
 
     const sessionsQuery = `
@@ -1620,7 +1732,14 @@ router.get('/sessions/:sessionId/results',
 
     const answers = answersResult.rows.map((row: any) => {
       let parsedStudent: any = null;
-      try { parsedStudent = JSON.parse(row.student_answer || 'null'); } catch { parsedStudent = row.student_answer; }
+      try {
+        parsedStudent = JSON.parse(row.student_answer || 'null');
+      } catch {
+        parsedStudent = row.student_answer;
+      }
+      if (row.question_type === 'simple_table') {
+        parsedStudent = normalizeSimpleTableAnswer(parsedStudent, row.question_metadata);
+      }
       return {
         questionId: row.question_id,
         questionNumber: row.question_number,
@@ -1669,101 +1788,266 @@ router.get('/sessions/:sessionId/results',
 // GET /api/admin/analytics - Get analytics data
 router.get('/analytics',
   asyncHandler(async (req: Request, res: Response) => {
-    const { 
-      period = '30d',
-      examId 
-    } = req.query;
+    const { startDate, endDate, examId } = req.query as { startDate?: string; endDate?: string; examId?: string };
 
-    // Determine date range based on period
-    let dateCondition = "created_at >= CURRENT_DATE - INTERVAL '30 days'";
-    if (period === '7d') {
-      dateCondition = "created_at >= CURRENT_DATE - INTERVAL '7 days'";
-    } else if (period === '90d') {
-      dateCondition = "created_at >= CURRENT_DATE - INTERVAL '90 days'";
-    } else if (period === '1y') {
-      dateCondition = "created_at >= CURRENT_DATE - INTERVAL '1 year'";
+    const toIsoDate = (value: Date): string => value.toISOString().split('T')[0];
+    const normalizeDate = (value?: string): string | undefined => {
+      if (!value) return undefined;
+      const trimmed = value.trim();
+      return trimmed.length ? trimmed : undefined;
+    };
+
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const resolvedStartDate = normalizeDate(startDate) ?? toIsoDate(thirtyDaysAgo);
+    const resolvedEndDate = normalizeDate(endDate) ?? toIsoDate(now);
+
+    const sessionFilters: string[] = ["es.status = 'submitted'"];
+    const queryParams: string[] = [];
+    let paramIndex = 1;
+
+    if (examId && examId.trim().length) {
+      sessionFilters.push(`es.exam_id = $${paramIndex}`);
+      queryParams.push(examId.trim());
+      paramIndex += 1;
     }
 
-    let examCondition = '';
-    const queryParams = [];
-    if (examId) {
-      examCondition = 'AND exam_id = $1';
-      queryParams.push(examId);
+    if (resolvedStartDate) {
+      sessionFilters.push(`DATE(es.created_at) >= $${paramIndex}`);
+      queryParams.push(resolvedStartDate);
+      paramIndex += 1;
     }
 
-    // Get various analytics
+    if (resolvedEndDate) {
+      sessionFilters.push(`DATE(es.created_at) <= $${paramIndex}`);
+      queryParams.push(resolvedEndDate);
+      paramIndex += 1;
+    }
+
+    const sessionWhereClause = `WHERE ${sessionFilters.join(' AND ')}`;
+    const extendSessionWhere = (extra?: string): string => extra ? `${sessionWhereClause} AND ${extra}` : sessionWhereClause;
+
     const [
-      sessionsByDay,
-      scoreDistribution,
-      performanceByExam,
-      averageScores
+      totalStudentsResult,
+      totalExamsResult,
+      sessionSummaryResult,
+      sectionPerformanceResult,
+      topExamsResult,
+      topTicketPerformersResult,
+      questionStatsResult,
+      scoreDistributionResult
     ] = await Promise.all([
-      // Sessions by day
+      query(`SELECT COUNT(*)::int as total_students FROM users WHERE role = 'student'`),
+      query(`SELECT COUNT(*)::int as total_exams FROM exams`),
       query(`
-        SELECT 
-          DATE(created_at) as date,
-          COUNT(*) as sessions,
-          COUNT(CASE WHEN status = 'submitted' THEN 1 END) as completed
-        FROM exam_sessions 
-        WHERE ${dateCondition} ${examCondition}
-        GROUP BY DATE(created_at)
-        ORDER BY date
-      `, queryParams),
-
-      // Score distribution
+        SELECT
+          COUNT(*)::int as total_sessions,
+          COUNT(*) FILTER (WHERE es.percentage_score IS NOT NULL)::int as scored_sessions,
+          AVG(es.percentage_score)::numeric as average_score,
+          SUM(CASE WHEN es.is_passed IS TRUE THEN 1 ELSE 0 END)::int as passed_sessions
+        FROM exam_sessions es
+        ${sessionWhereClause}
+      `, [...queryParams]),
       query(`
-        SELECT 
-          CASE 
-            WHEN percentage_score >= 80 THEN '80-100'
-            WHEN percentage_score >= 60 THEN '60-79'
-            WHEN percentage_score >= 40 THEN '40-59'
-            WHEN percentage_score >= 20 THEN '20-39'
-            ELSE '0-19'
-          END as score_range,
-          COUNT(*) as count
-        FROM exam_sessions 
-        WHERE status = 'submitted' AND percentage_score IS NOT NULL
-        AND ${dateCondition} ${examCondition}
-        GROUP BY score_range
-        ORDER BY score_range
-      `, queryParams),
-
-      // Performance by exam (average percentage over period)
+        SELECT
+          LOWER(sec.section_type::text) as section_type,
+          COUNT(DISTINCT es.id)::int as sessions,
+          SUM(COALESCE(esa.points_earned, 0))::numeric as total_points_earned,
+          SUM(COALESCE(eq.points, 0))::numeric as total_points_available,
+          AVG(CASE WHEN esa.is_correct IS TRUE THEN 1 WHEN esa.is_correct IS FALSE THEN 0 ELSE NULL END) as accuracy
+        FROM exam_session_answers esa
+        JOIN exam_sessions es ON esa.session_id = es.id
+        JOIN exam_questions eq ON esa.question_id = eq.id
+        JOIN exam_sections sec ON eq.section_id = sec.id
+        ${sessionWhereClause}
+        GROUP BY sec.section_type
+      `, [...queryParams]),
       query(`
-        SELECT 
-          e.title as exam_title,
-          COUNT(*) as total_attempts,
-          ROUND(AVG(es.percentage_score)::numeric, 2) as avg_percentage
+        SELECT
+          e.id,
+          e.title,
+          COUNT(*)::int as total_attempts,
+          AVG(es.percentage_score)::numeric as average_score,
+          SUM(CASE WHEN es.is_passed IS TRUE THEN 1 ELSE 0 END)::int as passed_attempts
         FROM exam_sessions es
         JOIN exams e ON es.exam_id = e.id
-        WHERE es.status = 'submitted' AND es.percentage_score IS NOT NULL AND ${dateCondition} ${examCondition}
+        ${sessionWhereClause}
         GROUP BY e.id, e.title
-        ORDER BY avg_percentage DESC
-      `, queryParams),
-
-      // Average scores over time
+        ORDER BY total_attempts DESC
+        LIMIT 5
+      `, [...queryParams]),
       query(`
-        SELECT 
-          DATE(created_at) as date,
-          AVG(percentage_score) as avg_score,
-          COUNT(*) as session_count
-        FROM exam_sessions 
-        WHERE status = 'submitted' AND percentage_score IS NOT NULL
-        AND ${dateCondition} ${examCondition}
-        GROUP BY DATE(created_at)
-        ORDER BY date
-      `, queryParams)
+        SELECT
+          COALESCE(
+            NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
+            NULLIF(t.issued_to_name, ''),
+            'Ticket User'
+          ) as performer_name,
+          MAX(t.ticket_code) as ticket_code,
+          AVG(es.percentage_score)::numeric as average_score,
+          COUNT(*)::int as attempts
+        FROM exam_sessions es
+        LEFT JOIN users u ON es.user_id = u.id
+        LEFT JOIN tickets t ON es.ticket_id = t.id
+        ${extendSessionWhere('es.ticket_id IS NOT NULL')}
+        GROUP BY 1
+        ORDER BY average_score DESC, attempts DESC
+        LIMIT 5
+      `, [...queryParams]),
+      query(`
+        SELECT
+          eq.id as question_id,
+          eq.question_text,
+          LOWER(sec.section_type::text) as section_type,
+          e.title as exam_title,
+          COUNT(*)::int as attempts,
+          AVG(CASE WHEN esa.is_correct IS TRUE THEN 1 WHEN esa.is_correct IS FALSE THEN 0 ELSE NULL END) as accuracy
+        FROM exam_session_answers esa
+        JOIN exam_sessions es ON esa.session_id = es.id
+        JOIN exam_questions eq ON esa.question_id = eq.id
+        JOIN exam_sections sec ON eq.section_id = sec.id
+        JOIN exams e ON sec.exam_id = e.id
+        ${extendSessionWhere('esa.is_correct IS NOT NULL')}
+        GROUP BY eq.id, eq.question_text, sec.section_type, e.title
+      `, [...queryParams]),
+      query(`
+        SELECT
+          CASE
+            WHEN es.percentage_score >= 80 THEN '80-100'
+            WHEN es.percentage_score >= 60 THEN '60-79'
+            WHEN es.percentage_score >= 40 THEN '40-59'
+            WHEN es.percentage_score >= 20 THEN '20-39'
+            ELSE '0-19'
+          END as range,
+          COUNT(*)::int as count
+        FROM exam_sessions es
+        ${extendSessionWhere('es.percentage_score IS NOT NULL')}
+        GROUP BY 1
+        ORDER BY 1
+      `, [...queryParams])
     ]);
 
+    const toNumber = (value: unknown, fallback = 0): number => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const roundToOneDecimal = (value: number): number => Math.round(value * 10) / 10;
+
+    const totalStudents = toNumber(totalStudentsResult.rows[0]?.total_students);
+    const totalExams = toNumber(totalExamsResult.rows[0]?.total_exams);
+
+    const sessionSummaryRow = sessionSummaryResult.rows[0] ?? {
+      total_sessions: 0,
+      scored_sessions: 0,
+      average_score: null,
+      passed_sessions: 0
+    };
+    const totalSessions = toNumber(sessionSummaryRow.total_sessions);
+    const scoredSessions = toNumber(sessionSummaryRow.scored_sessions);
+    const averageScoreRaw = sessionSummaryRow.average_score === null ? null : Number(sessionSummaryRow.average_score);
+    const averageScore = averageScoreRaw === null ? 0 : roundToOneDecimal(averageScoreRaw);
+    const passedSessions = toNumber(sessionSummaryRow.passed_sessions);
+    const passRate = totalSessions > 0 ? roundToOneDecimal((passedSessions / totalSessions) * 100) : 0;
+
+    const sectionPerformance = sectionPerformanceResult.rows.map((row: any) => {
+      const totalPointsAvailable = toNumber(row.total_points_available);
+      const totalPointsEarned = toNumber(row.total_points_earned);
+      const accuracyRatio = row.accuracy === null ? null : Number(row.accuracy);
+      const scorePercent = totalPointsAvailable > 0 ? (totalPointsEarned / totalPointsAvailable) * 100 : null;
+      return {
+        section: row.section_type,
+        sessions: toNumber(row.sessions),
+        accuracyPercent: accuracyRatio === null ? null : roundToOneDecimal(accuracyRatio * 100),
+        averageScorePercent: scorePercent === null ? null : roundToOneDecimal(scorePercent)
+      };
+    });
+
+    const topExams = topExamsResult.rows.map((row: any) => {
+      const attempts = toNumber(row.total_attempts);
+      const passedAttempts = toNumber(row.passed_attempts);
+      const examAverageRaw = row.average_score === null ? null : Number(row.average_score);
+      const examAverage = examAverageRaw === null ? 0 : roundToOneDecimal(examAverageRaw);
+      const examPassRate = attempts > 0 ? roundToOneDecimal((passedAttempts / attempts) * 100) : 0;
+      return {
+        examId: row.id,
+        examTitle: row.title,
+        totalAttempts: attempts,
+        averageScore: examAverage,
+        passRate: examPassRate
+      };
+    });
+
+    const topTicketPerformers = topTicketPerformersResult.rows.map((row: any) => {
+      const performerAverageRaw = row.average_score === null ? null : Number(row.average_score);
+      return {
+        name: row.performer_name,
+        ticketCode: row.ticket_code,
+        averageScore: performerAverageRaw === null ? 0 : roundToOneDecimal(performerAverageRaw),
+        attempts: toNumber(row.attempts)
+      };
+    });
+
+    const questionStats = questionStatsResult.rows
+      .map((row: any) => {
+        const accuracyRatio = row.accuracy === null ? null : Number(row.accuracy);
+        return {
+          questionId: row.question_id,
+          questionText: row.question_text,
+          examTitle: row.exam_title,
+          section: row.section_type,
+          attempts: toNumber(row.attempts),
+          accuracyPercent: accuracyRatio === null ? null : roundToOneDecimal(accuracyRatio * 100)
+        };
+      })
+      .filter((item: any) => item.accuracyPercent !== null && item.attempts > 0);
+
+    const questionStatsWithThreshold = questionStats.filter((item: any) => item.attempts >= 3);
+    const hardestQuestions = [...questionStatsWithThreshold]
+      .sort((a, b) => (a.accuracyPercent ?? 101) - (b.accuracyPercent ?? 101))
+      .slice(0, 5);
+    const easiestQuestions = [...questionStatsWithThreshold]
+      .sort((a, b) => (b.accuracyPercent ?? -1) - (a.accuracyPercent ?? -1))
+      .slice(0, 5);
+
+    const scoreDistribution = scoreDistributionResult.rows.map((row: any) => ({
+      range: row.range,
+      count: toNumber(row.count)
+    }));
+
     const analytics = {
-      period,
-      sessionsByDay: sessionsByDay.rows,
-      scoreDistribution: scoreDistribution.rows,
-      performanceByExam: performanceByExam.rows,
-      averageScores: averageScores.rows.map((row: any) => ({
-        ...row,
-        avg_score: parseFloat(row.avg_score || 0).toFixed(2)
-      }))
+      dateRange: {
+        startDate: resolvedStartDate,
+        endDate: resolvedEndDate
+      },
+      filters: {
+        examId: examId ? examId.trim() : null
+      },
+      totals: {
+        students: totalStudents,
+        exams: totalExams,
+        sessions: totalSessions,
+        scoredSessions
+      },
+      averages: {
+        score: averageScore,
+        passRate
+      },
+      scoreDistribution,
+      sectionPerformance,
+      topExams,
+      topTicketPerformers,
+      questionDifficulty: {
+        hardest: hardestQuestions,
+        easiest: easiestQuestions
+      },
+      totalStudents,
+      totalExams,
+      totalSessions,
+      scoredSessions,
+      averageScore,
+      passRate
     };
 
     res.json({

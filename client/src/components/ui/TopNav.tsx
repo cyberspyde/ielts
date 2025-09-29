@@ -18,16 +18,15 @@ const TopNav: React.FC = () => {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between py-3">
           <div className="flex items-center space-x-6">
-            <Link to="/dashboard" className="text-gray-900 font-semibold">IELTS Platform</Link>
+            <Link to="/exams" className="text-gray-900 font-semibold">IELTS Platform</Link>
             <nav className="hidden md:flex items-center space-x-4">
-              <Link to="/dashboard" className="text-gray-700 hover:text-gray-900">Dashboard</Link>
               <Link to="/exams" className="text-gray-700 hover:text-gray-900">Exams</Link>
               {isAdmin && (
                 <>
-                  <Link to="/admin" className="text-gray-700 hover:text-gray-900">Admin</Link>
+                  <Link to="/admin/exams" className="text-gray-700 hover:text-gray-900">Manage Exams</Link>
                   <Link to="/admin/sessions" className="text-gray-700 hover:text-gray-900">Sessions</Link>
                   <Link to="/admin/tickets" className="text-gray-700 hover:text-gray-900">Tickets</Link>
-                  <Link to="/admin/students" className="text-gray-700 hover:text-gray-900">Manage Students</Link>
+                  {/* Manage Students temporarily hidden */}
                   <Link to="/admin/analytics" className="text-gray-700 hover:text-gray-900">Analytics</Link>
                 </>
               )}

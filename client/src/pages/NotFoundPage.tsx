@@ -16,7 +16,7 @@ export const NotFoundPage: React.FC = () => {
         
         <div className="space-y-4">
           <Link
-            to="/dashboard"
+            to="/exams"
             className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors duration-200"
           >
             <Home className="h-4 w-4 mr-2" />

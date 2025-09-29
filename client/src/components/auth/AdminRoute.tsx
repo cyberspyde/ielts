@@ -22,7 +22,7 @@ export const AdminRoute: React.FC<AdminRouteProps> = ({ children }) => {
 
   if (user?.role !== 'admin' && user?.role !== 'super_admin') {
     // Redirect to dashboard if user is not admin
-    return <Navigate to="/dashboard" replace />;
+  return <Navigate to="/exams" replace />;
   }
 
   return <>{children}</>;

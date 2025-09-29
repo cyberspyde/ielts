@@ -3,6 +3,7 @@ import { body, validationResult } from 'express-validator';
 import { query, logger } from '../config/database-no-redis';
 import { asyncHandler, createValidationError, createNotFoundError, AppError } from '../middleware/errorHandler';
 import { authMiddleware, optionalAuth, requireRole, rateLimitByUser } from '../middleware/auth';
+import { normalizeSimpleTableAnswer } from '../utils/simpleTable';
 
 const router = Router();
 
@@ -511,8 +512,9 @@ router.post('/:id/start',
     checkValidationErrors(req);
 
     const { id: examId } = req.params;
-    const { ticketCode, section } = req.body;
-    const userId = req.user?.id || null;
+  const { ticketCode, section } = req.body;
+  const userId = req.user?.id || null;
+  const isAdminUser = !!req.user && (req.user.role === 'admin' || req.user.role === 'super_admin');
 
     const examResult = await query(`
       SELECT id, title, duration_minutes, is_active,
@@ -560,7 +562,11 @@ router.post('/:id/start',
           ticketId: parentSession.ticket_id,
         });
         if (resolution.completed) {
-          throw new AppError('You have already completed this full mock exam.', 400);
+          // For admins, allow creating a fresh attempt; for students enforce single attempt
+          if (!isAdminUser) {
+            throw new AppError('You have already completed this full mock exam.', 400);
+          }
+          // else fall through to create a new parent session below
         }
         if (resolution.childSession) {
           return res.status(200).json({
@@ -592,7 +598,7 @@ router.post('/:id/start',
            AND status = 'submitted'
          LIMIT 1
       `, [userId, examId]);
-      if (prevChild.rowCount > 0) {
+      if (prevChild.rowCount > 0 && !isAdminUser) {
         throw new AppError('You have already completed this full mock exam.', 400);
       }
     }
@@ -632,7 +638,7 @@ router.post('/:id/start',
       const previousAttempt = await query(`
         SELECT 1 FROM exam_sessions WHERE user_id = $1 AND exam_id = $2 AND status = 'submitted' LIMIT 1
       `, [userId, examId]);
-      if (previousAttempt.rowCount > 0) {
+      if (previousAttempt.rowCount > 0 && !isAdminUser) {
         throw new AppError('You have already completed this exam.', 400);
       }
     }
@@ -842,8 +848,41 @@ router.post('/sessions/:sessionId/submit',
 
   if (answers && Array.isArray(answers) && answers.length) {
       const normalize = (v: any) => String(v ?? '').trim().toLowerCase();
-      const answerMap: Record<string, any> = {};
-      for (const a of answers) answerMap[a.questionId] = a.studentAnswer;
+      // Consolidate composite question IDs like "<uuid>_<row>_<col>" into base UUID with aggregated cells
+      const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const parseCompositeId = (qid: string): { baseId: string; subKey?: string } => {
+        if (!qid) return { baseId: qid } as any;
+        const parts = String(qid).split('_');
+        const maybe = parts[0];
+        if (uuidRe.test(maybe)) {
+          const rest = parts.slice(1).join('_');
+          return { baseId: maybe, subKey: rest || undefined };
+        }
+        return { baseId: qid } as any;
+      };
+
+      const combined: Record<string, any> = {};
+      for (const a of answers) {
+        const { baseId, subKey } = parseCompositeId(a.questionId);
+        if (subKey) {
+          if (!combined[baseId] || typeof combined[baseId] !== 'object' || Array.isArray(combined[baseId])) {
+            combined[baseId] = { cells: {} as Record<string, any> };
+          }
+          if (!combined[baseId].cells || typeof combined[baseId].cells !== 'object') combined[baseId].cells = {};
+          const m = String(subKey).match(/^(.*)_b(\d+)$/);
+          if (m) {
+            const baseCellKey = m[1]; const idx = parseInt(m[2], 10);
+            if (!Array.isArray(combined[baseId].cells[baseCellKey])) combined[baseId].cells[baseCellKey] = [];
+            combined[baseId].cells[baseCellKey][idx] = a.studentAnswer;
+          } else {
+            combined[baseId].cells[String(subKey)] = a.studentAnswer;
+          }
+        } else {
+          combined[baseId] = a.studentAnswer;
+        }
+      }
+
+      const answerMap: Record<string, any> = combined;
       const ids = Object.keys(answerMap);
       const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
       const questionRows = (await query(`
@@ -1111,6 +1150,18 @@ router.post('/sessions/:sessionId/submit',
       WHERE id = $4
     `, [totalScore, percentageScore, timeSpentSeconds, sessionId]);
 
+    if (session.ticket_id) {
+      await query(`
+        UPDATE tickets
+           SET status = CASE
+             WHEN COALESCE(current_uses, 0) >= COALESCE(max_uses, 1) THEN 'used'::ticket_status
+             ELSE status
+           END,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1
+      `, [session.ticket_id]);
+    }
+
     let bundleInfo: any = null;
     if (session.parent_session_id) {
       const parentResult = await query(`
@@ -1206,13 +1257,55 @@ router.post('/sessions/:sessionId/answers', optionalAuth, asyncHandler(async (re
   const s = await query('SELECT id, status FROM exam_sessions WHERE id = $1', [sessionId]);
   if (s.rowCount === 0) throw createNotFoundError('Exam session');
   if (s.rows[0].status === 'submitted') throw new AppError('Session already submitted', 400);
+
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const parseCompositeId = (qid: string): { baseId: string; subKey?: string } => {
+    if (!qid) return { baseId: qid } as any;
+    const parts = String(qid).split('_');
+    const maybe = parts[0];
+    if (uuidRe.test(maybe)) {
+      const rest = parts.slice(1).join('_');
+      return { baseId: maybe, subKey: rest || undefined };
+    }
+    return { baseId: qid } as any;
+  };
+
   for (const a of answers) {
-    await query(`
-      INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at)
-      VALUES ($1,$2,$3,CURRENT_TIMESTAMP)
-      ON CONFLICT (session_id, question_id)
-      DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP
-    `, [sessionId, a.questionId, JSON.stringify(a.answer)]);
+    const { baseId, subKey } = parseCompositeId(a.questionId);
+    if (subKey) {
+      // Merge per-cell value into an aggregated object for the base question
+      let existing: any = null;
+      try {
+        const r = await query(`SELECT student_answer FROM exam_session_answers WHERE session_id = $1 AND question_id = $2`, [sessionId, baseId]);
+        if (r.rowCount > 0) {
+          try { existing = JSON.parse(r.rows[0].student_answer || 'null'); } catch { existing = r.rows[0].student_answer; }
+        }
+      } catch {}
+      let payload: any = (existing && typeof existing === 'object' && !Array.isArray(existing)) ? existing : {};
+      if (!payload.cells || typeof payload.cells !== 'object') payload.cells = {};
+      const m = String(subKey).match(/^(.*)_b(\d+)$/);
+      if (m) {
+        const baseCellKey = m[1]; const idx = parseInt(m[2], 10);
+        const curr = payload.cells[baseCellKey];
+        if (!Array.isArray(curr)) payload.cells[baseCellKey] = [];
+        payload.cells[baseCellKey][idx] = a.answer;
+      } else {
+        payload.cells[String(subKey)] = a.answer;
+      }
+      await query(`
+        INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at)
+        VALUES ($1,$2,$3,CURRENT_TIMESTAMP)
+        ON CONFLICT (session_id, question_id)
+        DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP
+      `, [sessionId, baseId, JSON.stringify(payload)]);
+    } else {
+      await query(`
+        INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at)
+        VALUES ($1,$2,$3,CURRENT_TIMESTAMP)
+        ON CONFLICT (session_id, question_id)
+        DO UPDATE SET student_answer = EXCLUDED.student_answer, answered_at = CURRENT_TIMESTAMP
+      `, [sessionId, baseId, JSON.stringify(a.answer)]);
+    }
   }
   res.json({ success: true, message: 'Answers saved' });
 }));
@@ -1428,7 +1521,15 @@ router.get('/sessions/:sessionId/results',
     `, [sessionId, s.exam_id]);
 
     const answers = answersResult.rows.map((row: any) => {
-      let parsedStudent: any = null; try { parsedStudent = JSON.parse(row.student_answer || 'null'); } catch { parsedStudent = row.student_answer; }
+      let parsedStudent: any = null;
+      try {
+        parsedStudent = JSON.parse(row.student_answer || 'null');
+      } catch {
+        parsedStudent = row.student_answer;
+      }
+      if (row.question_type === 'simple_table') {
+        parsedStudent = normalizeSimpleTableAnswer(parsedStudent, row.question_metadata);
+      }
       return {
         questionId: row.question_id,
         questionNumber: row.question_number,

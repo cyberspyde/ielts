@@ -15,7 +15,6 @@ import { AdminRoute } from './components/auth/AdminRoute';
 import { LoginPage } from './pages/auth/LoginPage';
 import { RegisterPage } from './pages/auth/RegisterPage';
 import { TicketValidationPage } from './pages/auth/TicketValidationPage';
-import AdminDashboard from './pages/admin/Dashboard';
 import AdminExams from './pages/admin/Exams';
 import AdminExamCreate from './pages/admin/ExamCreate';
 import AdminExamEdit from './pages/admin/ExamEdit';
@@ -25,7 +24,6 @@ import AdminTicketPrint from './pages/admin/AdminTicketPrint';
 import AdminAnalytics from './pages/admin/Analytics';
 import AdminSessions from './pages/admin/AdminSessions';
 import AdminSessionResults from './pages/admin/AdminSessionResults';
-import { StudentDashboard } from './pages/student/Dashboard';
 import ExamList from './pages/student/ExamList';
 import ExamTaking from './pages/student/ExamTaking';
 import { NotFoundPage } from './pages/NotFoundPage';
@@ -61,7 +59,7 @@ function App() {
                 {/* Admin Routes */}
                 <Route path="/admin" element={
                   <AdminRoute>
-                    <AdminDashboard />
+                    <Navigate to="/admin/exams" replace />
                   </AdminRoute>
                 } />
                 <Route path="/admin/exams" element={
@@ -111,11 +109,7 @@ function App() {
                 } />
                 
                 {/* Student Routes */}
-                <Route path="/dashboard" element={
-                  <ProtectedRoute>
-                    <StudentDashboard />
-                  </ProtectedRoute>
-                } />
+                <Route path="/dashboard" element={<Navigate to="/exams" replace />} />
                 <Route path="/exams" element={
                   <ProtectedRoute>
                     <ExamList />
@@ -126,7 +120,7 @@ function App() {
                 <Route path="/results" element={<PublicResultCheck />} />
                 
                 {/* Default redirects */}
-                <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/" element={<Navigate to="/exams" replace />} />
                 <Route path="*" element={<NotFoundPage />} />
               </Routes>
               </ErrorBoundary>

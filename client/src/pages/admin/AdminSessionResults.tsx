@@ -5,6 +5,7 @@ import { ArrowLeft, Loader2, XCircle, Ticket, User, Calendar, Clock, BookOpen, C
 import { apiService } from '../../services/api';
 import ConfirmDialog from '../../components/ui/ConfirmDialog';
 import { toast } from 'react-toastify';
+import { tallyFillBlank, toMetadataObject } from '../../utils/resultMetrics';
 
 interface AdminSessionResultsData {
   session: any;
@@ -81,113 +82,89 @@ const AdminSessionResults: React.FC = () => {
     const exam = data?.exam;
     const answersRaw = (data?.answers || []) as any[];
     const ans = answersRaw.map((a: any) => {
-      // Normalize metadata if it's a string
-      let qMeta = a.questionMetadata;
-      if (qMeta && typeof qMeta === 'string') {
-        try { qMeta = JSON.parse(qMeta); } catch { qMeta = undefined; }
-      }
-      // Reconstruct graded for simple_table if missing
-      const sa = a.studentAnswer;
-      if (sa && typeof sa === 'object' && sa.type === 'simple_table' && (!Array.isArray(sa.graded) || sa.graded.length === 0)) {
-        const rows: any[][] = qMeta?.simpleTable?.rows || [];
-        const graded: any[] = [];
-        const norm = (v: any) => String(v ?? '').trim().toLowerCase();
-        const judge = (qType: string, studentVal: any, correctSpec: string): boolean => {
-          const rec = norm(studentVal);
-          if (!correctSpec) return false;
-          if (qType === 'multiple_choice') {
-            const exp = correctSpec.split('|').map(norm).filter(Boolean);
-            const got = rec.split('|').filter(Boolean);
-            const uniq = (arr: string[]) => Array.from(new Set(arr));
-            const eU = uniq(exp); const gU = uniq(got);
-            return eU.length === gU.length && eU.every(v => gU.includes(v));
-          }
-          if (qType === 'true_false') {
-            const map: Record<string, string> = { t: 'true', f: 'false', ng: 'not given', notgiven: 'not given' };
-            return (map[rec] || rec) === (map[norm(correctSpec)] || norm(correctSpec));
-          }
-          // generic: support variants split by '|'
-          return correctSpec.split('|').map(norm).includes(rec);
-        };
-        rows.forEach((row: any[], ri: number) => row.forEach((cell: any, ci: number) => {
-          if (!cell || cell.type !== 'question') return;
-          const keyBase = `${ri}_${ci}`;
-          const cellKey = `${ri}_${ci}`;
-          const qType = cell.questionType || 'fill_blank';
-          const val = sa.cells?.[cellKey];
-          const baseNum = typeof cell.questionNumber === 'number' ? cell.questionNumber : undefined;
-          if (Array.isArray(val)) {
-            val.forEach((v: any, idx: number) => {
-              const corr = typeof cell.correctAnswer === 'string'
-                ? (cell.correctAnswer.split(';')[idx] ?? cell.correctAnswer)
-                : String(cell.correctAnswer ?? '');
+      const qMeta = toMetadataObject(a.questionMetadata);
+      a.questionMetadata = qMeta;
+      const ensureObj = (value: any): Record<string, any> => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+      const isSimpleTable = a.questionType === 'simple_table';
+      if (isSimpleTable) {
+        const target = ensureObj(a.studentAnswer);
+        if (!target.cells || typeof target.cells !== 'object') {
+          target.cells = ensureObj(target.cells);
+        }
+        if (!Array.isArray(target.graded) || target.graded.length === 0) {
+          const rows: any[][] = qMeta?.simpleTable?.rows || [];
+          const graded: any[] = [];
+          const norm = (v: any) => String(v ?? '').trim().toLowerCase();
+          const judge = (qType: string, studentVal: any, correctSpec: string): boolean => {
+            const rec = norm(studentVal);
+            if (!correctSpec) return false;
+            if (qType === 'multiple_choice') {
+              const exp = correctSpec.split('|').map(norm).filter(Boolean);
+              const got = rec.split('|').filter(Boolean);
+              const uniq = (arr: string[]) => Array.from(new Set(arr));
+              const eU = uniq(exp); const gU = uniq(got);
+              return eU.length === gU.length && eU.every((v) => gU.includes(v));
+            }
+            if (qType === 'true_false') {
+              const map: Record<string, string> = { t: 'true', f: 'false', ng: 'not given', notgiven: 'not given' };
+              return (map[rec] || rec) === (map[norm(correctSpec)] || norm(correctSpec));
+            }
+            // generic: support variants split by '|'
+            return correctSpec.split('|').map(norm).includes(rec);
+          };
+          rows.forEach((row: any[], ri: number) => row.forEach((cell: any, ci: number) => {
+            if (!cell || cell.type !== 'question') return;
+            const keyBase = `${ri}_${ci}`;
+            const cellKey = `${ri}_${ci}`;
+            const qType = cell.questionType || 'fill_blank';
+            const val = target.cells?.[cellKey];
+            const baseNum = typeof cell.questionNumber === 'number' ? cell.questionNumber : undefined;
+            if (Array.isArray(val)) {
+              val.forEach((v: any, idx: number) => {
+                const corr = typeof cell.correctAnswer === 'string'
+                  ? (cell.correctAnswer.split(';')[idx] ?? cell.correctAnswer)
+                  : String(cell.correctAnswer ?? '');
+                graded.push({
+                  key: `${keyBase}_b${idx}`,
+                  questionType: qType,
+                  questionNumber: baseNum !== undefined ? baseNum + idx : undefined,
+                  studentAnswer: v,
+                  correctAnswer: corr,
+                  points: cell.points || 1,
+                  isCorrect: judge(qType, v, corr)
+                });
+              });
+            } else {
+              const corr = String(cell.correctAnswer ?? '');
               graded.push({
-                key: `${keyBase}_b${idx}`,
+                key: `${keyBase}`,
                 questionType: qType,
-                questionNumber: baseNum !== undefined ? baseNum + idx : undefined,
-                studentAnswer: v,
+                questionNumber: baseNum,
+                studentAnswer: val,
                 correctAnswer: corr,
                 points: cell.points || 1,
-                isCorrect: judge(qType, v, corr)
+                isCorrect: judge(qType, val, corr)
               });
-            });
-          } else {
-            const corr = String(cell.correctAnswer ?? '');
-            graded.push({
-              key: `${keyBase}`,
-              questionType: qType,
-              questionNumber: baseNum,
-              studentAnswer: val,
-              correctAnswer: corr,
-              points: cell.points || 1,
-              isCorrect: judge(qType, val, corr)
-            });
-          }
-        }));
-        sa.graded = graded;
+            }
+          }));
+          target.graded = graded;
+        }
+        target.type = 'simple_table';
+        a.studentAnswer = target;
       }
       return a;
     });
-    const norm = (s:any) => String(s ?? '').toLowerCase().replace(/\s+/g,' ').trim();
-    const countFillBlankArray = (a: any): { total: number; correct: number } => {
-      const sa = a.studentAnswer;
-      if (!Array.isArray(sa)) return { total: 1, correct: a.isCorrect ? 1 : 0 };
-      // Build per-blank accepted groups
-      let groups: string[][] | null = null;
-      if (typeof a.correctAnswer === 'string') {
-        if (a.correctAnswer.includes(';')) {
-          groups = a.correctAnswer.split(';').map((g:string)=> g.split('|').map((x:string)=> norm(x)).filter(Boolean));
-        } else if (a.correctAnswer.length > 0) {
-          // Same accepted set for each blank
-          const accepts = a.correctAnswer.split('|').map((x:string)=> norm(x)).filter(Boolean);
-          groups = Array.from({ length: sa.length }, ()=> accepts);
-        }
-      } else {
-        try {
-          const parsed = JSON.parse(a.correctAnswer || 'null');
-          if (Array.isArray(parsed)) groups = parsed.map((g:any)=> Array.isArray(g)? g.map((x:any)=> norm(x)): [norm(g)]);
-        } catch {}
-      }
-      const total = sa.length;
-      let correct = 0;
-      sa.forEach((ans:any, idx:number) => {
-        const recv = norm(ans);
-        const accepts = groups?.[idx] || [];
-        if (accepts.length ? accepts.includes(recv) : false) correct += 1;
-      });
-      return { total, correct };
-    };
 
     let totalQuestions = 0;
     let correctQuestions = 0;
     ans.forEach((a: any) => {
       const sa = a.studentAnswer;
-      if (sa && typeof sa === 'object' && sa.type === 'simple_table') {
-        const graded = Array.isArray(sa.graded) ? sa.graded : [];
+      if (a.questionType === 'simple_table') {
+        const graded = Array.isArray(sa?.graded) ? sa.graded : [];
         totalQuestions += graded.length;
         correctQuestions += graded.filter((g: any) => g.isCorrect).length;
       } else if (a.questionType === 'fill_blank' && Array.isArray(sa)) {
-        const { total, correct } = countFillBlankArray(a);
+        const { total, correct } = tallyFillBlank(a);
         totalQuestions += total;
         correctQuestions += correct;
       } else {
@@ -250,29 +227,14 @@ const AdminSessionResults: React.FC = () => {
     (answers || []).forEach((a: any) => {
       if ((a.sectionType || '').toLowerCase() !== section) return;
       const sa = a.studentAnswer;
-      if (sa && typeof sa === 'object' && sa.type === 'simple_table') {
-        const graded: any[] = Array.isArray(sa.graded) ? sa.graded : [];
+      if (a.questionType === 'simple_table') {
+        const graded: any[] = Array.isArray(sa?.graded) ? sa.graded : [];
         total += graded.length;
         correct += graded.filter((g:any)=> g.isCorrect).length;
       } else if (a.questionType === 'fill_blank' && Array.isArray(sa)) {
-        const { total: t, correct: c } = (():{total:number;correct:number}=>{
-          // reuse logic from summary
-          let groups: string[][] | null = null;
-          if (typeof a.correctAnswer === 'string') {
-            if (a.correctAnswer.includes(';')) {
-              groups = a.correctAnswer.split(';').map((g:string)=> g.split('|').map((x:string)=> String(x||'').toLowerCase().replace(/\s+/g,' ').trim()).filter(Boolean));
-            } else if (a.correctAnswer.length > 0) {
-              const accepts = a.correctAnswer.split('|').map((x:string)=> String(x||'').toLowerCase().replace(/\s+/g,' ').trim()).filter(Boolean);
-              groups = Array.from({ length: sa.length }, ()=> accepts);
-            }
-          } else {
-            try { const parsed = JSON.parse(a.correctAnswer || 'null'); if (Array.isArray(parsed)) groups = parsed.map((g:any)=> Array.isArray(g)? g.map((x:any)=> String(x||'').toLowerCase().replace(/\s+/g,' ').trim()): [String(g||'').toLowerCase().replace(/\s+/g,' ').trim()]); } catch {}
-          }
-          const totalLocal = sa.length; let correctLocal = 0;
-          sa.forEach((ans:any, idx:number)=>{ const recv = String(ans||'').toLowerCase().replace(/\s+/g,' ').trim(); const accepts = groups?.[idx] || []; if (accepts.length && accepts.includes(recv)) correctLocal += 1; });
-          return { total: totalLocal, correct: correctLocal };
-        })();
-        total += t; correct += c;
+        const { total: t, correct: c } = tallyFillBlank(a);
+        total += t;
+        correct += c;
       } else {
         total += 1;
         if (a.isCorrect) correct += 1;
@@ -286,7 +248,20 @@ const AdminSessionResults: React.FC = () => {
   readingTotal = Math.min(readingTotal, 40);
   readingCorrect = Math.min(readingCorrect, readingTotal);
   const overallTotal = (() => {
-    let t = 0; (answers || []).forEach((a:any)=>{ const sa=a.studentAnswer; if (sa && typeof sa==='object' && sa.type==='simple_table') { const graded:any[]=Array.isArray(sa.graded)?sa.graded:[]; t+=graded.length; } else if (a.questionType==='fill_blank' && Array.isArray(sa)) { t += sa.length; } else { t+=1; } }); return t; })();
+    let t = 0;
+    (summary.answers || []).forEach((a: any) => {
+      const sa = a.studentAnswer;
+      if (a.questionType === 'simple_table') {
+        const graded: any[] = Array.isArray(sa?.graded) ? sa.graded : [];
+        t += graded.length;
+      } else if (a.questionType === 'fill_blank' && Array.isArray(sa)) {
+        t += tallyFillBlank(a).total;
+      } else {
+        t += 1;
+      }
+    });
+    return t;
+  })();
   const listeningBand = listeningTotal ? listeningBandFromCorrect(listeningCorrect) : null;
   const readingBand = readingTotal ? readingBandFromCorrect(readingCorrect, exam?.type) : null;
 
@@ -458,8 +433,7 @@ const AdminSessionResults: React.FC = () => {
                 }
               });
               return items.map(({ key, heading, a }) => {
-                const sa = a.studentAnswer;
-                const isSimpleTable = sa && typeof sa === 'object' && sa.type === 'simple_table';
+                const isSimpleTable = a.questionType === 'simple_table';
                 return (
                   <div key={key} className="p-4 border border-gray-200 rounded">
                     <div className="flex items-start justify-between">
@@ -470,7 +444,7 @@ const AdminSessionResults: React.FC = () => {
                       <div className="text-gray-600">Student answer: <span className="text-gray-900">{renderStudentAnswer(a.studentAnswer)}</span></div>
                       {(() => {
                         const sa = a.studentAnswer;
-                        if (sa && typeof sa === 'object' && sa.type === 'simple_table' && Array.isArray(sa.graded)) {
+                        if (a.questionType === 'simple_table' && Array.isArray(sa?.graded)) {
                           return (
                             <div className="mt-2">
                               <div className="text-gray-700 font-medium text-xs mb-1">Simple Table Detail</div>

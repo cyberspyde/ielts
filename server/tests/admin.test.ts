@@ -620,6 +620,125 @@ describe('Admin Routes Tests', () => {
     });
   });
 
+  describe('Admin Session Results - Simple Table Normalization', () => {
+    let simpleExamId: string;
+    let simpleSectionId: string;
+    let simpleQuestionId: string;
+    let simpleSessionId: string;
+
+    beforeAll(async () => {
+      const adminRow = await query('SELECT id FROM users WHERE email = $1', ['testadmin@example.com']);
+      const adminUserId = adminRow.rows[0].id;
+      const studentRow = await query('SELECT id FROM users WHERE email = $1', ['teststudent@example.com']);
+      const studentId = studentRow.rows[0].id;
+
+      simpleExamId = uuidv4();
+      simpleSectionId = uuidv4();
+      simpleQuestionId = uuidv4();
+      simpleSessionId = uuidv4();
+
+      await testPool!.query(`
+        INSERT INTO exams (id, title, description, exam_type, duration_minutes, passing_score, is_active, instructions, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `, [
+        simpleExamId,
+        'Simple Table Exam',
+        'Exam with simple table question',
+        'academic',
+        60,
+        6.5,
+        true,
+        'Simple table instructions',
+        adminUserId
+      ]);
+
+      await testPool!.query(`
+        INSERT INTO exam_sections (id, exam_id, section_type, title, description, duration_minutes, max_score, section_order, instructions)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `, [
+        simpleSectionId,
+        simpleExamId,
+        'reading',
+        'Simple Table Section',
+        'Section for simple table question',
+        30,
+        10,
+        1,
+        'Answer the table items'
+      ]);
+
+      const metadata = {
+        simpleTable: {
+          rows: [
+            [
+              { type: 'label', text: 'Animals' },
+              { type: 'question', questionType: 'fill_blank', questionNumber: 1, points: 1, correctAnswer: 'cat' },
+              { type: 'question', questionType: 'fill_blank', questionNumber: 2, points: 1, correctAnswer: 'dog' }
+            ]
+          ]
+        }
+      };
+
+      await testPool!.query(`
+        INSERT INTO exam_questions (id, section_id, question_type, question_text, question_number, points, correct_answer, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `, [
+        simpleQuestionId,
+        simpleSectionId,
+        'simple_table',
+        'Fill the animal names',
+        1,
+        2,
+        null,
+        JSON.stringify(metadata)
+      ]);
+
+      await testPool!.query(`
+        INSERT INTO exam_sessions (id, user_id, exam_id, status, started_at, submitted_at, total_score, percentage_score)
+        VALUES ($1, $2, $3, 'submitted', NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '5 minutes', $4, $5)
+      `, [
+        simpleSessionId,
+        studentId,
+        simpleExamId,
+        2,
+        100
+      ]);
+
+      const simpleAnswerPayload = { cells: { '0_1': 'cat', '0_2': 'dog' } };
+      await testPool!.query(`
+        INSERT INTO exam_session_answers (id, session_id, question_id, student_answer, answered_at, is_correct, points_earned)
+        VALUES ($1, $2, $3, $4, NOW(), $5, $6)
+      `, [
+        uuidv4(),
+        simpleSessionId,
+        simpleQuestionId,
+        JSON.stringify(simpleAnswerPayload),
+        true,
+        2
+      ]);
+    });
+
+    it('should expand simple table answers with graded entries', async () => {
+      const response = await request(app)
+        .get(`/api/admin/sessions/${simpleSessionId}/results`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      const { answers } = response.body.data;
+      expect(Array.isArray(answers)).toBe(true);
+
+      const tableAnswer = answers.find((entry: any) => entry.questionType === 'simple_table');
+      expect(tableAnswer).toBeDefined();
+      expect(tableAnswer.studentAnswer).toBeDefined();
+      expect(tableAnswer.studentAnswer.type).toBe('simple_table');
+      expect(Array.isArray(tableAnswer.studentAnswer.graded)).toBe(true);
+      expect(tableAnswer.studentAnswer.graded.length).toBe(2);
+      const correctCount = tableAnswer.studentAnswer.graded.filter((item: any) => item.isCorrect).length;
+      expect(correctCount).toBe(2);
+    });
+  });
+
   afterAll(async () => {
     // Comprehensive cleanup
     await testPool!.query('DELETE FROM admin_logs');

@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Calendar, Clock, BookOpen, CheckCircle } from 'lucide-react';
 import { apiService } from '../../services/api';
+import { tallyFillBlank, toMetadataObject } from '../../utils/resultMetrics';
 
 const ExamResults: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -27,6 +28,8 @@ const ExamResults: React.FC = () => {
     let readingTotal = 0; let readingCorrect = 0;
     let listeningTotal = 0; let listeningCorrect = 0;
     answers.forEach((a: any) => {
+      const metadataObj = toMetadataObject(a.questionMetadata);
+      a.questionMetadata = metadataObj;
       const sa = a.studentAnswer;
       if (sa && typeof sa === 'object' && sa.type === 'simple_table') {
         let graded = Array.isArray(sa.graded) ? sa.graded : [];
@@ -136,6 +139,17 @@ const ExamResults: React.FC = () => {
         correctQuestions += correct;
         if (a.sectionType === 'reading') { readingTotal += counted; readingCorrect += correct; }
         if (a.sectionType === 'listening') { listeningTotal += counted; listeningCorrect += correct; }
+      } else if (a.questionType === 'fill_blank' && Array.isArray(sa)) {
+        const { total, correct } = tallyFillBlank({
+          studentAnswer: sa,
+          correctAnswer: a.correctAnswer,
+          questionMetadata: metadataObj,
+          isCorrect: a.isCorrect,
+        });
+        totalQuestions += total;
+        correctQuestions += correct;
+        if (a.sectionType === 'reading') { readingTotal += total; readingCorrect += correct; }
+        if (a.sectionType === 'listening') { listeningTotal += total; listeningCorrect += correct; }
       } else {
         totalQuestions += 1;
         const isC = !!a.isCorrect;

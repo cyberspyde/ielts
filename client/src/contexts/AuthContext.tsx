@@ -163,9 +163,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         
         // Redirect based on user role
         if (user.role === 'admin' || user.role === 'super_admin') {
-          navigate('/admin');
+          navigate('/admin'); // redirected to /admin/exams in router
         } else {
-          navigate('/dashboard');
+          navigate('/exams');
         }
       } else {
         throw new Error(response.message || 'Login failed');
@@ -201,7 +201,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         });
         
         toast.success('Registration successful!');
-        navigate('/dashboard');
+  navigate('/exams');
       } else {
         throw new Error(response.message || 'Registration failed');
       }

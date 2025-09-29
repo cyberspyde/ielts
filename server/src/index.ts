@@ -21,8 +21,17 @@ import { requestLogger } from './middleware/requestLogger';
 export const app = express();
 const server = createServer(app);
 const io = new Server(server, {
+  path: '/socket.io',
   cors: {
-    origin: true,
+    // Allow typical dev origins; true also allowed but some proxies need explicit strings
+    origin: [
+      'http://localhost:5173', // Vite default
+      'http://127.0.0.1:5173',
+      'http://localhost:3000',
+      'http://127.0.0.1:3000',
+      'http://localhost:7000',
+      'http://127.0.0.1:7000'
+    ],
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true
   }

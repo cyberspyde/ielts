@@ -177,26 +177,77 @@ export interface TicketValidationForm {
   code: string;
 }
 
-// Dashboard Types
-export interface DashboardStats {
+// Dashboard Types removed: dashboard no longer used in UI
+
+export interface ScoreDistributionBucket {
+  range: string;
+  count: number;
+}
+
+export interface SectionPerformanceStat {
+  section: string;
+  sessions: number;
+  accuracyPercent: number | null;
+  averageScorePercent: number | null;
+}
+
+export interface ExamAttemptsStat {
+  examId: string;
+  examTitle: string;
+  totalAttempts: number;
+  averageScore: number;
+  passRate: number;
+}
+
+export interface TicketPerformerStat {
+  name: string;
+  ticketCode: string | null;
+  averageScore: number;
+  attempts: number;
+}
+
+export interface QuestionDifficultyStat {
+  questionId: string;
+  questionText: string;
+  examTitle: string;
+  section: string;
+  attempts: number;
+  accuracyPercent: number | null;
+}
+
+export interface AdminAnalyticsSummary {
+  dateRange: {
+    startDate: string;
+    endDate: string;
+  };
+  filters: {
+    examId: string | null;
+  };
+  totals: {
+    students: number;
+    exams: number;
+    sessions: number;
+    scoredSessions: number;
+  };
+  averages: {
+    score: number;
+    passRate: number;
+  };
+  scoreDistribution: ScoreDistributionBucket[];
+  sectionPerformance: SectionPerformanceStat[];
+  topExams: ExamAttemptsStat[];
+  topTicketPerformers: TicketPerformerStat[];
+  questionDifficulty: {
+    hardest: QuestionDifficultyStat[];
+    easiest: QuestionDifficultyStat[];
+  };
   totalStudents: number;
   totalExams: number;
-  activeExams: number;
-  totalTickets: number;
-  usedTickets: number;
-  recentResults: ExamResult[];
+  totalSessions: number;
+  scoredSessions: number;
+  averageScore: number;
+  passRate: number;
 }
-
-export interface AdminDashboardStats extends DashboardStats {
-  totalAdmins: number;
-  pendingTickets: number;
-  examSessions: {
-    active: number;
-    completed: number;
-    abandoned: number;
-  };
-}
-
 // Socket Types
 export interface SocketEvents {
   'exam:start': (data: { examId: string; studentId: string }) => void;
@@ -233,3 +284,4 @@ export interface SortOptions {
   field: string;
   direction: 'asc' | 'desc';
 }
+
