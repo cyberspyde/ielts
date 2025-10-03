@@ -12,6 +12,8 @@ describe('Exam Routes Tests', () => {
   let testSectionId: string;
   let testQuestionId: string;
   let testTicketCode: string;
+  let groupAnchorQuestionId: string;
+  let groupMemberQuestionId: string;
 
   beforeAll(async () => {
     await seedTestData();
@@ -72,6 +74,37 @@ describe('Exam Routes Tests', () => {
       'A'
     ]);
     testQuestionId = questionResult.rows[0].id;
+
+    // Create grouped multi-select anchor and member questions
+    groupAnchorQuestionId = uuidv4();
+    groupMemberQuestionId = uuidv4();
+    await testPool!.query(`
+      INSERT INTO exam_questions (id, section_id, question_type, question_text, question_number, points, correct_answer, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `, [
+      groupAnchorQuestionId,
+      testSectionId,
+      'multiple_choice',
+      'Grouped anchor question',
+      10,
+      1.0,
+      'A|B',
+      JSON.stringify({ groupRangeEnd: 11, allowMultiSelect: true })
+    ]);
+
+    await testPool!.query(`
+      INSERT INTO exam_questions (id, section_id, question_type, question_text, question_number, points, correct_answer, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `, [
+      groupMemberQuestionId,
+      testSectionId,
+      'multiple_choice',
+      'Grouped member question',
+      11,
+      1.0,
+      'A|B',
+      JSON.stringify({ groupMemberOf: groupAnchorQuestionId })
+    ]);
 
     // Create test question option
     await testPool!.query(`
@@ -342,6 +375,47 @@ describe('Exam Routes Tests', () => {
       expect(sessionResult.rows[0].total_score).toBeGreaterThan(0);
       expect(answerResult.rows[0].is_correct).toBe(true);
       expect(answerResult.rows[0].points_earned).toBe(1.0);
+    });
+
+    it('should propagate grouped multi-select answers to grouped members', async () => {
+      const startResponse = await request(app)
+        .post(`/api/exams/${testExamId}/start`)
+        .set('Authorization', `Bearer ${studentToken}`)
+        .expect(200);
+
+      const sessionId = startResponse.body.data.sessionId;
+
+      const answers = [
+        {
+          questionId: groupAnchorQuestionId,
+          studentAnswer: ['A', 'B']
+        }
+      ];
+
+      await request(app)
+        .post(`/api/exams/sessions/${sessionId}/submit`)
+        .set('Authorization', `Bearer ${studentToken}`)
+        .send({ answers })
+        .expect(200);
+
+      const graded = await query(
+        'SELECT question_id, student_answer, is_correct, points_earned FROM exam_session_answers WHERE session_id = $1 AND question_id IN ($2, $3) ORDER BY question_id',
+        [sessionId, groupAnchorQuestionId, groupMemberQuestionId]
+      );
+
+      expect(graded.rowCount).toBe(2);
+      graded.rows.forEach((row: any) => {
+        const parsed = JSON.parse(row.student_answer || 'null');
+        expect(parsed).toEqual(['A', 'B']);
+        expect(row.is_correct).toBe(true);
+        expect(Number(row.points_earned)).toBeCloseTo(1.0);
+      });
+
+      const sessionRow = await query('SELECT total_score FROM exam_sessions WHERE id = $1', [sessionId]);
+      expect(Number(sessionRow.rows[0].total_score)).toBeCloseTo(2.0);
+
+      await testPool!.query('DELETE FROM exam_session_answers WHERE session_id = $1', [sessionId]);
+      await testPool!.query('DELETE FROM exam_sessions WHERE id = $1', [sessionId]);
     });
 
     it('should fail to submit for non-existent session', async () => {

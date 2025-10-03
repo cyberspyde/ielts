@@ -13,6 +13,19 @@ interface TimerProps {
   darkMode: boolean;
 }
 
+type SubmitDialogState =
+  | {
+      kind: 'stage';
+      stageType: 'listening' | 'reading';
+      currentName: string;
+      nextSectionIndex: number;
+      nextSectionName: string;
+    }
+  | {
+      kind: 'final';
+      currentName: string;
+    };
+
 const Timer: React.FC<TimerProps> = ({ duration, onTimeUp, isPaused, darkMode }) => {
   const [timeLeft, setTimeLeft] = useState(duration * 60);
 
@@ -65,6 +78,35 @@ const resolveSectionDuration = (section: any, exam: any): number => {
   return d ? d : 60;
 };
 
+const normalizeSectionPassageTexts = (section: any): Record<string, string> => {
+  if (!section) return {};
+  let raw = section.passageTexts;
+  if (typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch { raw = undefined; }
+  }
+  const out: Record<string, string> = {};
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+      if (typeof value === 'string') {
+        out[String(key)] = value;
+      }
+    });
+  }
+  if (typeof section.passageText === 'string' && section.passageText.length && !out['1']) {
+    out['1'] = section.passageText;
+  }
+  return out;
+};
+
+const resolvePassageTextForPart = (section: any, part?: number): string => {
+  if (!section) return '';
+  const map = normalizeSectionPassageTexts(section);
+  if (!part || part <= 0) part = 1;
+  const key = String(part);
+  if (map[key] !== undefined) return map[key];
+  return map['1'] ?? (typeof section.passageText === 'string' ? section.passageText : '');
+};
+
 const ExamTaking: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
   const [searchParams] = useSearchParams();
@@ -74,13 +116,15 @@ const ExamTaking: React.FC = () => {
   const [answers, setAnswers] = useState<Record<string, { questionId: string; answer: string | string[] }>>({});
   const [fillBlankDrafts, setFillBlankDrafts] = useState<Record<string, string[]>>({});
   const [isPaused, setIsPaused] = useState(false);
-  const [showConfirmSubmit, setShowConfirmSubmit] = useState(false);
+  const [submitDialog, setSubmitDialog] = useState<SubmitDialogState | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sectionTimerDuration, setSectionTimerDuration] = useState<number>(0);
   const [timerKey, setTimerKey] = useState(0);
   const previousSectionIndexRef = useRef<number | null>(null);
   const transitionReasonRef = useRef<'manual' | 'timeUp' | null>(null);
   const [sectionTransition, setSectionTransition] = useState<{ fromName: string; toName: string; reason: 'manual' | 'timeUp'; } | null>(null);
+  const suppressNextTransitionOverlayRef = useRef<boolean>(false);
+  const [lockedSectionCutoff, setLockedSectionCutoff] = useState<number>(0);
   // UI preferences
   const [showSettings, setShowSettings] = useState(false);
   const [prefFontSize, setPrefFontSize] = useState<number>(() => {
@@ -121,6 +165,7 @@ const ExamTaking: React.FC = () => {
   // Navigation state
   const [currentSectionIndex, setCurrentSectionIndex] = useState(0);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [currentReadingPart, setCurrentReadingPart] = useState<number>(1);
   // Instruction debug toggle
   const [instructionDebug, setInstructionDebug] = useState<boolean>(() => {
     try { return /debugInstr=1/i.test(window.location.search) || localStorage.getItem('debugInstructions') === '1'; } catch { return false; }
@@ -192,6 +237,27 @@ const ExamTaking: React.FC = () => {
     }
   }, [answers]);
 
+  const inferReadingPart = React.useCallback((q: any, fallbackNumber?: number): number => {
+    const deriveByNumber = (num?: number) => {
+      if (typeof num !== 'number' || Number.isNaN(num)) return 1;
+      if (num <= 13) return 1;
+      if (num <= 26) return 2;
+      return 3;
+    };
+    if (!q) return deriveByNumber(fallbackNumber);
+    let meta: any = q.metadata;
+    if (meta && typeof meta === 'string') {
+      try { meta = JSON.parse(meta); } catch { meta = {}; }
+    }
+    const direct = meta?.readingPart ?? meta?.reading_part;
+    const numeric = Number(direct);
+    if (!Number.isNaN(numeric) && numeric > 0) return numeric;
+    const candidateNumber = typeof fallbackNumber === 'number'
+      ? fallbackNumber
+      : (typeof q.questionNumber === 'number' ? q.questionNumber : undefined);
+    return deriveByNumber(candidateNumber);
+  }, []);
+
   // Fetch exam (with questions) - include sid so server can authorize question access for ticket-based (unauth) sessions
   const activeSid = sidFromUrl || sessionId || undefined;
   const { data: exam, isLoading: examLoading } = useQuery({
@@ -218,10 +284,10 @@ const ExamTaking: React.FC = () => {
   useEffect(() => {
     let lastToggle = 0;
     const handler = (e: KeyboardEvent) => {
-      if (e.repeat) return; // ignore auto-repeat
+      if (e.repeat) return;
       if (e.key.toLowerCase() === 'd' && e.ctrlKey && e.shiftKey) {
         const now = Date.now();
-        if (now - lastToggle < 250) return; // debounce fast double press
+        if (now - lastToggle < 250) return;
         lastToggle = now;
         setDebugTables(prev => {
           const next = !prev; try { localStorage.setItem('debugTables', next ? '1':'0'); } catch {}
@@ -318,7 +384,7 @@ const ExamTaking: React.FC = () => {
     },
   onSuccess: () => {
       hasSubmitRetriedRef.current = false;
-      setShowConfirmSubmit(false);
+      setSubmitDialog(null);
       // Policy: Do not show results to students after submit
       toast.success('Your exam was submitted successfully. Results will be reviewed by admins.');
       navigate('/dashboard');
@@ -349,6 +415,33 @@ const ExamTaking: React.FC = () => {
   const hasSubmitRetriedRef = useRef(false);
 
   const currentSection = exam?.sections?.[currentSectionIndex];
+  const examSections = React.useMemo(() => exam?.sections || [], [exam?.sections]);
+  const sectionTypes = React.useMemo(
+    () => examSections.map((s: any) => String(s.sectionType || '').toLowerCase()),
+    [examSections]
+  );
+  const firstListeningIndex = React.useMemo(
+    () => sectionTypes.findIndex((t: string) => t === 'listening'),
+    [sectionTypes]
+  );
+  const firstReadingIndex = React.useMemo(
+    () => sectionTypes.findIndex((t: string, idx: number) => idx > (firstListeningIndex === -1 ? -1 : firstListeningIndex) && t === 'reading'),
+    [sectionTypes, firstListeningIndex]
+  );
+  const firstWritingIndex = React.useMemo(
+    () => sectionTypes.findIndex((t: string, idx: number) => idx > (firstReadingIndex === -1 ? -1 : firstReadingIndex) && t === 'writing'),
+    [sectionTypes, firstReadingIndex]
+  );
+  const hasMockFlow = firstListeningIndex !== -1 && firstReadingIndex !== -1 && firstWritingIndex !== -1;
+  const findNextSectionIndex = React.useCallback(
+    (type: string, afterIndex: number) => {
+      for (let i = afterIndex + 1; i < sectionTypes.length; i += 1) {
+        if (sectionTypes[i] === type) return i;
+      }
+      return -1;
+    },
+    [sectionTypes]
+  );
   useEffect(() => {
     if (debugTables && currentSection?.questions) {
       // eslint-disable-next-line no-console
@@ -379,7 +472,15 @@ const ExamTaking: React.FC = () => {
     const toType = (toSection?.sectionType || '').toLowerCase();
     const movingForward = currentSectionIndex > prevIndex;
 
-    if (movingForward && fromType && toType && fromType !== toType) {
+    if (hasMockFlow && movingForward && fromType && toType && fromType !== toType) {
+      setLockedSectionCutoff((prev) => Math.max(prev, currentSectionIndex));
+    }
+
+    if (suppressNextTransitionOverlayRef.current) {
+      suppressNextTransitionOverlayRef.current = false;
+      setSectionTransition(null);
+      setIsPaused(false);
+    } else if (movingForward && fromType && toType && fromType !== toType) {
       setSectionTransition({
         fromName: formatSectionName(fromSection),
         toName: formatSectionName(toSection),
@@ -393,7 +494,7 @@ const ExamTaking: React.FC = () => {
 
     previousSectionIndexRef.current = currentSectionIndex;
     transitionReasonRef.current = null;
-  }, [exam, currentSectionIndex, formatSectionName]);
+  }, [exam, currentSectionIndex, formatSectionName, hasMockFlow, setLockedSectionCutoff]);
 
   useEffect(() => {
     if (!exam) return;
@@ -408,9 +509,8 @@ const ExamTaking: React.FC = () => {
         })),
       }));
       (window as any).__dropdownDump = dump;
-      console.log('[DropdownDump]', dump);
-    } catch (e) {
-      console.warn('[DropdownDump] failed', e);
+    } catch (_e) {
+      /* ignore dump failure */
     }
   }, [exam]);
 
@@ -440,6 +540,7 @@ const ExamTaking: React.FC = () => {
 
   const isListeningSection = (currentSection?.sectionType || '').toLowerCase() === 'listening';
   const isWritingSection = (currentSection?.sectionType || '').toLowerCase() === 'writing';
+  const isReadingSection = (currentSection?.sectionType || '').toLowerCase() === 'reading';
   // Writing parts (Task 1 / Task 2). Default mapping: writing_task1 -> Part 1, essay -> Part 2, overrideable via metadata.writingPart
   const writingQuestions = React.useMemo(() => (currentSection?.questions || []).filter((q: any) => ['writing_task1','essay'].includes(q.questionType)), [currentSection]);
   const getWritingPart = React.useCallback((q: any): number => (q?.metadata?.writingPart) || (q.questionType === 'writing_task1' ? 1 : (q.questionType === 'essay' ? 2 : 1)), []);
@@ -458,6 +559,18 @@ const ExamTaking: React.FC = () => {
   const activeWritingQuestion = React.useMemo(() => {
     return writingQuestions.find((q:any) => getWritingPart(q) === currentWritingPart) || writingQuestions[0];
   }, [writingQuestions, getWritingPart, currentWritingPart]);
+  const readingParts: number[] = React.useMemo(() => {
+    if (!isReadingSection) return [] as number[];
+    const parts = new Set<number>();
+    (currentSection?.questions || []).forEach((q: any) => {
+      parts.add(inferReadingPart(q));
+    });
+    const arr = Array.from(parts).sort((a, b) => a - b);
+    for (let i = 1; i <= 3; i += 1) {
+      if (!arr.includes(i)) arr.push(i);
+    }
+    return arr.sort((a, b) => a - b).slice(0, 3);
+  }, [isReadingSection, currentSection, inferReadingPart]);
   // Listening part helpers.
   // Supports two modes:
   //  1) Single-section mode (original): one listening section with questionNumbers 1..40 (auto parts every 10).
@@ -554,7 +667,7 @@ const ExamTaking: React.FC = () => {
     return null;
   }, [currentSection]);
   // Visible questions (exclude group members, matching (special UI), and table container which we render once above list)
-  const visibleQuestions = React.useMemo(() => {
+  const allVisibleQuestions = React.useMemo(() => {
     // Normalize metadata (server may return JSON string) & include table containers
     const raw = currentSection?.questions || [];
     const all = raw.map((q: any) => {
@@ -571,6 +684,41 @@ const ExamTaking: React.FC = () => {
       return true;
     }).sort((a:any,b:any)=> (a.questionNumber||0)-(b.questionNumber||0));
   }, [currentSection, tableContainer]);
+
+  const visibleQuestions = React.useMemo(() => {
+    if (!isReadingSection) return allVisibleQuestions;
+    return allVisibleQuestions.filter((q: any) => inferReadingPart(q) === currentReadingPart);
+  }, [allVisibleQuestions, isReadingSection, currentReadingPart, inferReadingPart]);
+
+  useEffect(() => {
+    if (!isReadingSection) return;
+    const firstPart = readingParts[0] || 1;
+    setCurrentReadingPart(firstPart);
+    setCurrentQuestionIndex(0);
+    skipNextScrollRef.current = true;
+    const firstQuestion = allVisibleQuestions.find((q: any) => inferReadingPart(q) === firstPart);
+    if (firstQuestion?.questionNumber !== undefined) {
+      sectionCurrentNumRef.current = firstQuestion.questionNumber;
+    }
+  }, [isReadingSection, currentSection?.id, readingParts, allVisibleQuestions, inferReadingPart]);
+
+  useEffect(() => {
+    if (!isReadingSection) return;
+    setCurrentQuestionIndex(0);
+    skipNextScrollRef.current = true;
+    const firstQuestion = visibleQuestions[0];
+    if (firstQuestion?.questionNumber !== undefined) {
+      sectionCurrentNumRef.current = firstQuestion.questionNumber;
+    }
+  }, [isReadingSection, currentReadingPart, visibleQuestions]);
+
+  const resolvedPassageText = React.useMemo(() => {
+    if (!currentSection) return '';
+    if (!isReadingSection) {
+      return typeof currentSection.passageText === 'string' ? currentSection.passageText : '';
+    }
+    return resolvePassageTextForPart(currentSection, currentReadingPart);
+  }, [currentSection, currentReadingPart, isReadingSection]);
   // blankNumberMap: questionId -> assigned sequential numbers for blanks.
   // Modes:
   //   Default (no metadata.singleNumber): multi-blank fill_blank consumes one number per blank (displayed as a range Questions X–Y).
@@ -580,24 +728,120 @@ const ExamTaking: React.FC = () => {
     const list = [...visibleQuestions];
     if (!list.length) return map;
     // We now trust backend assigned questionNumber; do not resequence. Only map blanks for quick placeholder display.
-  for (const q of list) {
+    for (const q of list) {
       if (q.questionType === 'fill_blank') {
-    const text = normalizeNewlines(q.questionText || '');
+        const text = normalizeNewlines(q.questionText || '');
         const curly = (text.match(/\{answer\d+\}/gi) || []).length;
         const underscores = (text.match(/_{3,}/g) || []).length;
         const blanks = curly || underscores || 1;
-        // Use existing questionNumber as anchor; if multi-blank allocate synthetic subsequent numbers just for display (not persisted)
         const base = q.questionNumber || 0;
-        if (blanks <=1 || q.metadata?.singleNumber) map[q.id] = [base];
-  const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks); // backward compatible
-  if (blanks <=1 || combine) map[q.id] = [base];
-        else {
-          const nums: number[] = []; for (let i=0;i<blanks;i++) nums.push(base + i); map[q.id] = nums;
+        const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks); // backward compatible
+        if (blanks <= 1 || combine) {
+          map[q.id] = [base];
+        } else {
+          const nums: number[] = [];
+          for (let i = 0; i < blanks; i += 1) nums.push(base + i);
+          map[q.id] = nums;
         }
       }
     }
     return map;
   }, [visibleQuestions]);
+
+  const resolveMultiSelectLimit = React.useCallback((question: any, fallback: number = 2): number => {
+    if (!question) return fallback;
+    let meta = question.metadata;
+    if (meta && typeof meta === 'string') {
+      try { meta = JSON.parse(meta); } catch { meta = {}; }
+    }
+    if (!meta || typeof meta !== 'object') meta = {};
+    const numericFrom = (value: any): number | null => {
+      const num = Number(value);
+      return Number.isFinite(num) && num > 0 ? num : null;
+    };
+    const candidateKeys = ['selectCount', 'select_count', 'requiredCount', 'required_count', 'maxSelections', 'max_selections', 'answersRequired', 'answers_required', 'answerCount', 'answer_count'];
+    for (const key of candidateKeys) {
+      if (Object.prototype.hasOwnProperty.call(meta, key)) {
+        const resolved = numericFrom((meta as any)[key]);
+        if (resolved !== null) return resolved;
+      }
+    }
+    if (Array.isArray((meta as any).expectedAnswers)) {
+      const len = (meta as any).expectedAnswers
+        .map((val: any) => (typeof val === 'string' ? val.trim() : String(val ?? '').trim()))
+        .filter((val: string) => val.length > 0).length;
+      if (len > 0) return len;
+    }
+    const correct = (question as any).correctAnswer;
+    const derivedFromCorrect = (() => {
+      if (Array.isArray(correct)) {
+        return correct.filter((val: any) => {
+          if (val === null || val === undefined) return false;
+          return String(val).trim().length > 0;
+        }).length;
+      }
+      if (typeof correct === 'string') {
+        const trimmed = correct.trim();
+        if (!trimmed) return 0;
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            return parsed.filter((val: any) => {
+              if (val === null || val === undefined) return false;
+              return String(val).trim().length > 0;
+            }).length;
+          }
+        } catch {}
+        if (trimmed.includes('|')) {
+          return trimmed.split('|').map((piece) => piece.trim()).filter(Boolean).length;
+        }
+      }
+      return 0;
+    })();
+    if (derivedFromCorrect > 0) return derivedFromCorrect;
+    return fallback;
+  }, []);
+
+  const isMultiSelectQuestion = React.useCallback((question: any): boolean => {
+    if (!question) return false;
+    let meta = question.metadata;
+    if (meta && typeof meta === 'string') {
+      try { meta = JSON.parse(meta); } catch { meta = {}; }
+    }
+    if (!meta || typeof meta !== 'object') meta = {};
+    const truthyKeys = [
+      'allowMultiSelect',
+      'allow_multi_select',
+      'multiSelect',
+      'multi_select',
+      'isMulti',
+      'is_multi',
+      'multipleAnswers',
+      'multiple_answers',
+    ];
+    if (truthyKeys.some((key) => Boolean((meta as any)[key]))) return true;
+    const selectionMode = (meta as any).selectionMode ?? (meta as any).selection_mode ?? (meta as any).selectMode ?? (meta as any).select_mode ?? (meta as any).mode;
+    if (typeof selectionMode === 'string' && selectionMode.toLowerCase().includes('multi')) return true;
+    const numericKeys = [
+      'maxSelections',
+      'max_selections',
+      'selectCount',
+      'select_count',
+      'requiredCount',
+      'required_count',
+      'answersRequired',
+      'answers_required',
+      'answerCount',
+      'answer_count',
+    ];
+    if (numericKeys.some((key) => {
+      const val = Number((meta as any)[key]);
+      return Number.isFinite(val) && val > 1;
+    })) {
+      return true;
+    }
+    return resolveMultiSelectLimit(question, 1) > 1;
+  }, [resolveMultiSelectLimit]);
   // For listening sections: build a map of first questionNumber -> instruction for each distinct groupInstruction block.
   const listeningInstructionMap = React.useMemo(() => {
     const map: Record<number, string> = {};
@@ -655,21 +899,90 @@ const ExamTaking: React.FC = () => {
     if (instructionDebug) console.info('[InstrDebug] Active. API: window.examInstructionDebugAPI');
   }, [exam, currentSectionIndex, listeningInstructionMap, instructionDebug]);
   // currentQuestion removed (unused after refactor)
-  const isMatchingSection = (currentSection?.questions || []).some((q: any) => (q.questionType === 'matching'));
-  const headingOptions: any[] = isMatchingSection
-    ? ((currentSection as any)?.headingBank?.options ||
-       ((currentSection?.questions || []).find((q: any) => q.questionType === 'matching')?.options || []))
-    : [];
+  const isMatchingSection = React.useMemo(
+    () => (currentSection?.questions || []).some((q: any) => q.questionType === 'matching'),
+    [currentSection]
+  );
+  const headingOptions: any[] = React.useMemo(() => {
+    if (!isMatchingSection) return [];
+    const bankOptions = (currentSection as any)?.headingBank?.options;
+    if (Array.isArray(bankOptions) && bankOptions.length) return bankOptions;
+    const fallback = (currentSection?.questions || []).find((q: any) => q.questionType === 'matching')?.options;
+    return Array.isArray(fallback) ? fallback : [];
+  }, [isMatchingSection, currentSection]);
 
-  // Precompute matching questions
-  const matchingQuestions = (currentSection?.questions || []).filter((q: any) => q.questionType === 'matching');
-  const matchingQuestionsSorted = [...matchingQuestions].sort((a: any, b: any) => (a.questionNumber || 0) - (b.questionNumber || 0));
+  const matchingQuestions = React.useMemo(() => {
+    const raw = (currentSection?.questions || []).filter((q: any) => q.questionType === 'matching');
+    return raw.map((q: any) => {
+      if (q && q.metadata && typeof q.metadata === 'string') {
+        try {
+          return { ...q, metadata: JSON.parse(q.metadata) };
+        } catch {
+          return { ...q, metadata: {} };
+        }
+      }
+      return q;
+    });
+  }, [currentSection]);
+  const matchingQuestionIdSet = React.useMemo(() => {
+    return new Set<string>(matchingQuestions.map((q: any) => q?.id).filter(Boolean));
+  }, [matchingQuestions]);
+
+  const matchingQuestionsSorted = React.useMemo(
+    () => [...matchingQuestions].sort((a: any, b: any) => (a.questionNumber || 0) - (b.questionNumber || 0)),
+    [matchingQuestions]
+  );
+  const matchingQuestionsForCurrentPart = React.useMemo(() => {
+    if (!isReadingSection) return [] as any[];
+    return matchingQuestionsSorted.filter((q: any) => inferReadingPart(q, q.questionNumber) === currentReadingPart);
+  }, [isReadingSection, matchingQuestionsSorted, inferReadingPart, currentReadingPart]);
+  const shouldShowMatchingForPart = matchingQuestionsForCurrentPart.length > 0;
+
+  const firstMatchingQuestionNumber = React.useMemo(() => {
+    if (!shouldShowMatchingForPart) return null;
+    const first = matchingQuestionsForCurrentPart[0];
+    return typeof first?.questionNumber === 'number' ? first.questionNumber : null;
+  }, [shouldShowMatchingForPart, matchingQuestionsForCurrentPart]);
+
+
+  const headingAssignments = React.useMemo(() => {
+    if (!shouldShowMatchingForPart) return {} as Record<string, { numbers: number[]; count: number }>;
+    const map: Record<string, { numbers: number[]; count: number }> = {};
+    for (const mq of matchingQuestionsForCurrentPart) {
+      const letter = (answers[mq.id]?.answer as string) || '';
+      if (!letter) continue;
+      if (!map[letter]) map[letter] = { numbers: [], count: 0 };
+      map[letter].count += 1;
+      if (typeof mq.questionNumber === 'number') {
+        map[letter].numbers.push(mq.questionNumber);
+      }
+    }
+    Object.values(map).forEach(entry => entry.numbers.sort((a, b) => a - b));
+    return map;
+  }, [shouldShowMatchingForPart, matchingQuestionsForCurrentPart, answers]);
+
+  const matchingHeadingQuestionText = React.useMemo(() => {
+    if (!shouldShowMatchingForPart) return '';
+    const first = matchingQuestionsForCurrentPart[0];
+    return typeof first?.questionText === 'string' ? first.questionText : '';
+  }, [shouldShowMatchingForPart, matchingQuestionsForCurrentPart]);
+
+  const matchingHeadingRangeLabel = React.useMemo(() => {
+    if (!shouldShowMatchingForPart) return '';
+    const nums = matchingQuestionsForCurrentPart
+      .map((mq: any) => mq?.questionNumber)
+      .filter((num: any) => typeof num === 'number')
+      .sort((a: number, b: number) => a - b);
+    if (!nums.length) return '';
+    if (nums.length === 1) return 'Question ' + nums[0];
+    return 'Questions ' + nums[0] + '-' + nums[nums.length - 1];
+  }, [shouldShowMatchingForPart, matchingQuestionsForCurrentPart]);
 
   // Auto-detect paragraphs with letter markers (either a line containing only 'A' or a line starting 'A ' inline). Ensure unique sequential letters.
   interface PassageParagraph { letter?: string; text: string; }
   const passageParagraphs: (PassageParagraph & { index?: number })[] = React.useMemo(() => {
-    if (!currentSection?.passageText) return [];
-    const raw = currentSection.passageText.replace(/\r\n/g, '\n');
+    if (!resolvedPassageText) return [];
+    const raw = resolvedPassageText.replace(/\r\n/g, '\n');
     // First detect explicit markers like [[paragraph1]] [[p2]] etc.
     const markerRegex = /\[\[(?:p|paragraph)\s*(\d+)\]\]/gi;
     const markers: { num: number; start: number; end: number }[] = [];
@@ -714,16 +1027,17 @@ const ExamTaking: React.FC = () => {
       else if (firstLetterIndex !== -1 && idx > firstLetterIndex) { let code = 65; while (used.has(String.fromCharCode(code))) code++; p.letter = String.fromCharCode(code); used.add(p.letter); }
     });
     return paras;
-  }, [currentSection?.passageText]);
+  }, [resolvedPassageText]);
 
   // Helper: assign heading to question ensuring uniqueness (one heading used only once)
   const assignHeadingToQuestion = (letter: string, questionId: string) => {
     setAnswers(prev => {
       const next = { ...prev } as typeof prev;
-      // Remove letter from any other question to enforce uniqueness
-      Object.values(next).forEach(v => {
-        if (v.questionId !== questionId && v.answer === letter) {
-          v.answer = '';
+      Object.values(next).forEach(entry => {
+        if (!entry || entry.questionId === questionId) return;
+        if (!matchingQuestionIdSet.has(entry.questionId)) return;
+        if (entry.answer === letter) {
+          next[entry.questionId] = { questionId: entry.questionId, answer: '' };
         }
       });
       next[questionId] = { questionId, answer: letter };
@@ -748,18 +1062,29 @@ const ExamTaking: React.FC = () => {
   };
 
   const changeSection = React.useCallback((targetIndex: number, reason: 'manual' | 'timeUp' = 'manual', targetQuestionIndex?: number) => {
-    const sections = exam?.sections || [];
+    const sections = examSections;
     if (!sections[targetIndex]) return;
+    if (reason === 'manual' && targetIndex < lockedSectionCutoff) {
+      toast.info('You cannot return to previous sections once the next part has begun.');
+      return;
+    }
     transitionReasonRef.current = reason;
+    autoScrollIntentRef.current = typeof targetQuestionIndex === 'number' && targetQuestionIndex > 0;
     setCurrentSectionIndex(targetIndex);
     if (typeof targetQuestionIndex === 'number' && !Number.isNaN(targetQuestionIndex)) {
       setCurrentQuestionIndex(targetQuestionIndex);
     } else {
+      autoScrollIntentRef.current = false;
       setCurrentQuestionIndex(0);
     }
-  }, [exam?.sections]);
+  }, [examSections, lockedSectionCutoff]);
 
   const goToQuestion = (sectionIndex: number, questionIndex: number) => {
+    if (sectionIndex < lockedSectionCutoff) {
+      toast.info('You cannot return to previous sections once the next part has begun.');
+      return;
+    }
+    autoScrollIntentRef.current = questionIndex > 0;
     if (sectionIndex === currentSectionIndex) {
       setCurrentQuestionIndex(questionIndex);
     } else {
@@ -769,19 +1094,28 @@ const ExamTaking: React.FC = () => {
 
   const goToNextQuestion = () => {
     if (currentQuestionIndex < visibleQuestions.length - 1) {
+      autoScrollIntentRef.current = true;
       setCurrentQuestionIndex(prev => prev + 1);
     } else if (currentSectionIndex < (exam?.sections?.length || 0) - 1) {
+      autoScrollIntentRef.current = false;
       changeSection(currentSectionIndex + 1, 'manual', 0);
     }
   };
 
   const goToPreviousQuestion = () => {
     if (currentQuestionIndex > 0) {
+      autoScrollIntentRef.current = true;
       setCurrentQuestionIndex(prev => prev - 1);
     } else if (currentSectionIndex > 0) {
-      const prevSection = exam?.sections?.[currentSectionIndex - 1];
+      const targetIndex = currentSectionIndex - 1;
+      if (targetIndex < lockedSectionCutoff) {
+        toast.info('You cannot return to previous sections once the next part has begun.');
+        return;
+      }
+      const prevSection = examSections?.[targetIndex];
       const prevVisible = (prevSection?.questions || []).filter((q: any) => !q.metadata?.groupMemberOf && q.questionType !== 'matching');
-      changeSection(currentSectionIndex - 1, 'manual', prevVisible.length ? prevVisible.length - 1 : 0);
+      autoScrollIntentRef.current = prevVisible.length > 1;
+      changeSection(targetIndex, 'manual', prevVisible.length ? prevVisible.length - 1 : 0);
     }
   };
 
@@ -873,9 +1207,134 @@ const ExamTaking: React.FC = () => {
     if (isLastSection) {
       if (sessionId) submit.mutate(sessionId);
     } else {
-      changeSection(currentSectionIndex + 1, 'timeUp', 0);
+      const targetIndex = currentSectionIndex + 1;
+      if (hasMockFlow) {
+        const fromType = sectionTypes[currentSectionIndex];
+        const toType = sectionTypes[targetIndex];
+        if (fromType && toType && fromType !== toType) {
+          setLockedSectionCutoff((prev) => Math.max(prev, targetIndex));
+        }
+      }
+      changeSection(targetIndex, 'timeUp', 0);
     }
-  }, [exam?.sections, currentSectionIndex, sessionId, submit, changeSection]);
+  }, [changeSection, currentSectionIndex, hasMockFlow, sectionTypes, sessionId, submit]);
+
+  const handleSubmitIntent = React.useCallback(() => {
+    if (!currentSection) return;
+    const sectionType = String(currentSection.sectionType || '').toLowerCase();
+    if (hasMockFlow && (sectionType === 'listening' || sectionType === 'reading')) {
+      const targetType = sectionType === 'listening' ? 'reading' : 'writing';
+      const nextIndex = findNextSectionIndex(targetType, currentSectionIndex);
+      if (nextIndex !== -1) {
+        setSubmitDialog({
+          kind: 'stage',
+          stageType: sectionType === 'listening' ? 'listening' : 'reading',
+          currentName: formatSectionName(currentSection),
+          nextSectionIndex: nextIndex,
+          nextSectionName: formatSectionName(examSections[nextIndex]),
+        });
+        return;
+      }
+    }
+    setSubmitDialog({
+      kind: 'final',
+      currentName: formatSectionName(currentSection),
+    });
+  }, [currentSection, currentSectionIndex, examSections, findNextSectionIndex, hasMockFlow]);
+
+  const handleSubmitDialogCancel = React.useCallback(() => {
+    setSubmitDialog(null);
+  }, []);
+
+  const handleSubmitDialogConfirm = React.useCallback(() => {
+    const dialog = submitDialog;
+    if (!dialog) return;
+    if (dialog.kind === 'stage') {
+      suppressNextTransitionOverlayRef.current = true;
+      setSubmitDialog(null);
+      setLockedSectionCutoff((prev) => Math.max(prev, dialog.nextSectionIndex));
+      changeSection(dialog.nextSectionIndex, 'manual', 0);
+      return;
+    }
+    if (!sessionId) {
+      toast.error('Unable to submit your exam session. Please refresh and try again.');
+      return;
+    }
+    setSubmitDialog(null);
+    submit.mutate(sessionId);
+  }, [changeSection, sessionId, submit, submitDialog]);
+
+  const submitDialogNode = submitDialog ? (() => {
+    const containerClass = (darkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900') + ' w-full max-w-md rounded-lg shadow-xl p-6';
+    if (submitDialog.kind === 'stage') {
+      const nextDuration = resolveSectionDuration(examSections[submitDialog.nextSectionIndex], exam);
+      const heading = submitDialog.stageType === 'listening' ? 'Listening section complete' : 'Reading section complete';
+      const body = submitDialog.stageType === 'listening'
+        ? 'Your Listening answers are locked. The Reading section will begin next. Once you proceed, you will not be able to revisit Listening questions.'
+        : 'Your Reading answers are locked. The Writing section will begin next. Once you proceed, you will not be able to revisit Reading questions.';
+      return (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
+          <div className={containerClass}>
+            <div className="flex items-center gap-3 mb-3">
+              <AlertTriangle className="h-6 w-6 text-amber-500" />
+              <div>
+                <h3 className="text-lg font-semibold leading-snug">{heading}</h3>
+                <p className="text-sm opacity-75">Next: {submitDialog.nextSectionName}{Number.isFinite(nextDuration) ? ` · ${nextDuration} minutes` : ''}</p>
+              </div>
+            </div>
+            <p className="text-sm mb-5 opacity-90">{body}</p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={handleSubmitDialogCancel}
+                className={(darkMode ? 'bg-gray-800 text-gray-200 border border-gray-700 hover:bg-gray-700' : 'bg-gray-100 text-gray-700 border border-gray-300 hover:bg-gray-200') + ' flex-1 px-4 py-2 rounded'}
+              >
+                Review again
+              </button>
+              <button
+                type="button"
+                onClick={handleSubmitDialogConfirm}
+                className="flex-1 px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
+              >
+                Start {submitDialog.nextSectionName}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
+        <div className={containerClass}>
+          <div className="flex items-center gap-3 mb-3">
+            <AlertTriangle className="h-6 w-6 text-red-500" />
+            <div>
+              <h3 className="text-lg font-semibold leading-snug">Submit exam</h3>
+              <p className="text-sm opacity-75">You are finishing {submitDialog.currentName}</p>
+            </div>
+          </div>
+          <p className="text-sm mb-5 opacity-90">Submitting will finalize all answers for this mock test. Please confirm you are ready to finish.</p>
+          <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={handleSubmitDialogCancel}
+              className={(darkMode ? 'bg-gray-800 text-gray-200 border border-gray-700 hover:bg-gray-700' : 'bg-gray-100 text-gray-700 border border-gray-300 hover:bg-gray-200') + ' flex-1 px-4 py-2 rounded'}
+            >
+              Review again
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmitDialogConfirm}
+              className="flex-1 px-4 py-2 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
+              disabled={submit.isPending}
+            >
+              {submit.isPending ? 'Submitting…' : 'Submit exam'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  })() : null;
 
   const { user } = useAuth();
 
@@ -956,6 +1415,19 @@ const ExamTaking: React.FC = () => {
   // Track active number in non-listening sections
   const sectionCurrentNumRef = useRef<number | null>(null);
   const questionRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const skipNextScrollRef = useRef(false);
+  const autoScrollIntentRef = useRef(false);
+
+  // Ensure matching headings panel opens with headings visible when reading parts switch
+  useEffect(() => {
+    if (!isReadingSection) return;
+    if (!shouldShowMatchingForPart) return;
+    const container = rightScrollRef.current;
+    if (!container) return;
+    container.scrollTo({ top: 0, behavior: 'auto' });
+  }, [isReadingSection, currentReadingPart, shouldShowMatchingForPart]);
+
+
   // Generic helper: scroll and focus by question number within a container
   const scrollAndFocusByQnum = (num: number, container: HTMLElement | null) => {
     if (!container) return;
@@ -983,17 +1455,25 @@ const ExamTaking: React.FC = () => {
   }, []);
 
   useEffect(() => {
-  const section = currentSection;
-  if (!section) return;
-  const targetQuestion = visibleQuestions[currentQuestionIndex];
+    const section = currentSection;
+    if (!section) return;
+    const targetQuestion = visibleQuestions[currentQuestionIndex];
     if (!targetQuestion) return;
     const container = rightScrollRef.current;
     if (!container) return;
-    // For matching questions (handled on left), scroll to top of headings list.
-    if (targetQuestion.questionType === 'matching') {
-      container.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (skipNextScrollRef.current) {
+      skipNextScrollRef.current = false;
+      autoScrollIntentRef.current = false;
       return;
     }
+
+    if (!autoScrollIntentRef.current) {
+      return;
+    }
+
+    autoScrollIntentRef.current = false;
+
     const el = questionRefs.current[targetQuestion.id];
     if (el) {
       const offsetTop = el.offsetTop - 8; // small padding adjustment
@@ -1177,7 +1657,7 @@ const ExamTaking: React.FC = () => {
             <button onClick={() => setShowSettings(s => !s)} className={(showSettings ? 'ring-2 ring-blue-500 ' : '') + "px-3 py-2 rounded text-sm border transition-colors " + (darkMode ? 'border-gray-600 bg-gray-700 hover:bg-gray-600 text-gray-100' : 'border-gray-300 bg-white hover:bg-gray-100 text-gray-700')}>Settings</button>
             {/* Per-section timer (Listening) */}
             <Timer key={`timer-${timerKey}`} darkMode={darkMode} duration={sectionTimerDuration || 30} onTimeUp={handleTimeUp} isPaused={isPaused} />
-            <button onClick={() => setShowConfirmSubmit(true)} className="px-3 py-2 text-xs bg-red-600 text-white rounded hover:bg-red-700">Submit</button>
+            <button onClick={handleSubmitIntent} className="px-3 py-2 text-xs bg-red-600 text-white rounded hover:bg-red-700">Submit</button>
           </div>
         </div>
         {showSettings && (
@@ -1587,8 +2067,8 @@ const ExamTaking: React.FC = () => {
                   {(() => {
                 // Multiple Choice (single or multi-select) rendering
                 if (type === 'multiple_choice') {
-                  const allowMulti = !!q.metadata?.allowMultiSelect;
-                  const selectCount = Number(q.metadata?.selectCount) || 2;
+                  const allowMulti = isMultiSelectQuestion(q);
+                  const selectCount = resolveMultiSelectLimit(q, 2);
                   const current = answers[q.id]?.answer as any;
                   const selectedLetters: string[] = allowMulti ? (Array.isArray(current) ? current : (typeof current === 'string' && current ? current.split('|') : [])) : ([]);
                   // Detect dropdown mode from various metadata aliases
@@ -1670,14 +2150,15 @@ const ExamTaking: React.FC = () => {
                             );
                           })
                         )}
-                        {allowMulti && <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Select {selectCount} answers.</div>}
+                        {allowMulti && <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Select {selectCount} answer{selectCount === 1 ? '' : 's'}.</div>}
                       </div>
                     </div>
                   );
                 }
-                // Multi-select (choose TWO) distinct type
+                // Multi-select (choose N) distinct type
                 if (type === 'multi_select') {
                   const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as string[]) : [];
+                  const maxSelect = resolveMultiSelectLimit(q, 2);
                   return (
                     <div key={q.id} className="text-sm flex flex-col gap-2">
                       <div className="flex items-start gap-2 flex-wrap">
@@ -1695,7 +2176,13 @@ const ExamTaking: React.FC = () => {
                               className={`flex items-start gap-2 text-sm px-3 py-2 border rounded cursor-pointer select-none ${checked ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50')}`}
                               onClick={() => {
                                 let next = [...current];
-                                if (checked) next = next.filter(l => l !== letter); else if (next.length < 2) next.push(letter); else next = [next[0], letter];
+                                if (checked) {
+                                  next = next.filter(l => l !== letter);
+                                } else if (next.length < maxSelect) {
+                                  next.push(letter);
+                                } else {
+                                  return;
+                                }
                                 handleAnswerChange(q.id, next);
                               }}
                             >
@@ -1704,7 +2191,7 @@ const ExamTaking: React.FC = () => {
                             </label>
                           );
                         })}
-                        <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Choose TWO answers.</div>
+                        <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Choose {maxSelect} answer{maxSelect === 1 ? '' : 's'}.</div>
                       </div>
                     </div>
                   );
@@ -2177,18 +2664,7 @@ const ExamTaking: React.FC = () => {
             })()}
           </div>
         </div>
-        {showConfirmSubmit && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className={(darkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900') + ' rounded-lg p-6 w-full max-w-sm'}>
-              <h3 className="text-base font-semibold mb-2 flex items-center gap-2"><AlertTriangle className="h-5 w-5 text-red-500" /> Submit Listening Section</h3>
-              <p className={"text-sm mb-4 " + secondaryTextClass}>Are you sure you want to submit? This will finalize your answers.</p>
-              <div className="flex gap-2">
-                <button onClick={()=> setShowConfirmSubmit(false)} className={(darkMode ? 'bg-gray-800 hover:bg-gray-700 border-gray-600 text-gray-200' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300') + ' flex-1 px-3 py-2 rounded border text-sm'}>Cancel</button>
-                <button disabled={!sessionId || submit.isPending} onClick={()=> sessionId && submit.mutate(sessionId)} className={'flex-1 px-3 py-2 rounded text-sm font-medium ' + (submit.isPending ? 'bg-blue-400 text-white' : 'bg-red-600 hover:bg-red-700 text-white')}>{submit.isPending ? 'Submitting…' : 'Submit'}</button>
-              </div>
-            </div>
-          </div>
-        )}
+        {submitDialogNode}
         {transitionOverlay}
       </div>
     );
@@ -2233,7 +2709,7 @@ const ExamTaking: React.FC = () => {
           <button onClick={() => setShowSettings(s => !s)} className={(showSettings ? 'ring-2 ring-blue-500 ' : '') + "px-3 py-2 rounded text-sm border transition-colors " + (darkMode ? 'border-gray-600 bg-gray-700 hover:bg-gray-600 text-gray-100' : 'border-gray-300 bg-white hover:bg-gray-100 text-gray-700')}>Settings</button>
           {/* Per-section timer (Reading/Writing/etc.) */}
           <Timer key={`timer-${timerKey}`} darkMode={darkMode} duration={sectionTimerDuration || 60} onTimeUp={handleTimeUp} isPaused={isPaused} />
-          {exam && <button onClick={() => setShowConfirmSubmit(true)} className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700">Submit</button>}
+          {exam && <button onClick={handleSubmitIntent} className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700">Submit</button>}
         </div>
       </div>
       {showSettings && (
@@ -2286,7 +2762,7 @@ const ExamTaking: React.FC = () => {
                     <h3 className="font-semibold text-gray-900 mb-3">Reading Passage</h3>
                     {/* Matching drag & drop paragraphs */}
                     {/* Always show passage text (if any) */}
-                    {isMatchingSection && passageParagraphs.length > 0 && matchingQuestionsSorted.length > 0 ? (
+                    {shouldShowMatchingForPart && passageParagraphs.length > 0 ? (
                       <div className="mb-6">
                         {(() => {
                           const hasExplicitMarkers = passageParagraphs.some(p => p.index !== undefined);
@@ -2294,7 +2770,7 @@ const ExamTaking: React.FC = () => {
                             // Map by explicit paragraph index to matching question with same metadata.paragraphIndex
                             return passageParagraphs.map((paraObj, idxAll) => {
                               const para = paraObj.text;
-                              const mq = matchingQuestionsSorted.find(q => q.metadata?.paragraphIndex === paraObj.index);
+                              const mq = matchingQuestionsForCurrentPart.find(q => q.metadata?.paragraphIndex === paraObj.index);
                               const sharedStyle: React.CSSProperties = {
                                 fontSize: prefFontSize,
                                 lineHeight: 1.55,
@@ -2318,6 +2794,8 @@ const ExamTaking: React.FC = () => {
                                 <div key={mq.id} className="mb-6 pb-4 border-b last:border-0 last:pb-0">
                                   <div
                                     className={`mb-2 px-3 py-2 border rounded flex items-center gap-3 min-h-[44px] ${darkMode ? 'bg-gray-800' : 'bg-white'} transition-colors text-sm ${draggingHeading ? 'border-blue-500 ring-1 ring-blue-300' : (darkMode ? 'border-gray-600' : 'border-gray-300')}`}
+                                    data-qnum={mq.questionNumber ?? undefined}
+                                    tabIndex={0}
                                     onDragOver={(e) => { e.preventDefault(); }}
                                     onDrop={(e) => { e.preventDefault(); const letter = e.dataTransfer.getData('text/plain'); if (letter) assignHeadingToQuestion(letter, mq.id); setDraggingHeading(null); }}
                                   >
@@ -2359,13 +2837,15 @@ const ExamTaking: React.FC = () => {
                               );
                             }
                             const idx = lettered.indexOf(paraObj);
-                            const mq = matchingQuestionsSorted[idx];
+                            const mq = matchingQuestionsForCurrentPart[idx];
                             if (!mq) return null;
                             const qAnswer = (answers[mq.id]?.answer as string) || '';
                             return (
                               <div key={mq.id} className="mb-6 pb-4 border-b last:border-0 last:pb-0">
                                 <div
                                   className={`mb-2 px-3 py-2 border rounded flex items-center gap-3 min-h-[44px] ${darkMode ? 'bg-gray-800' : 'bg-white'} transition-colors text-sm ${draggingHeading ? 'border-blue-500 ring-1 ring-blue-300' : (darkMode ? 'border-gray-600' : 'border-gray-300')}`}
+                                  data-qnum={mq.questionNumber ?? undefined}
+                                  tabIndex={0}
                                   onDragOver={(e) => { e.preventDefault(); }}
                                   onDrop={(e) => { e.preventDefault(); const letter = e.dataTransfer.getData('text/plain'); if (letter) assignHeadingToQuestion(letter, mq.id); setDraggingHeading(null); }}
                                 >
@@ -2388,7 +2868,7 @@ const ExamTaking: React.FC = () => {
                       </div>
                     ) : null}
                     {/* Fallback passage for matching sections when detection failed */}
-                    {isMatchingSection && (!passageParagraphs.length || !matchingQuestionsSorted.length) && currentSection?.passageText && (
+                    {shouldShowMatchingForPart && (!passageParagraphs.length || !matchingQuestionsForCurrentPart.length) && resolvedPassageText && (
                       <div
                         className={(darkMode ? 'text-gray-200' : 'text-gray-800') + ' prose max-w-none whitespace-pre-wrap mb-6'}
                         style={{
@@ -2396,7 +2876,7 @@ const ExamTaking: React.FC = () => {
                           lineHeight: 1.55,
                           fontFamily: prefFontFamily === 'serif' ? 'Georgia, Cambria, Times New Roman, Times, serif' : prefFontFamily === 'mono' ? 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace' : 'system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif'
                         }}
-                      >{currentSection.passageText.replace(/\[\[(?:p|paragraph)\s*\d+\]\]/gi,'').trim()}</div>
+                      >{resolvedPassageText.replace(/\[\[(?:p|paragraph)\s*\d+\]\]/gi,'').trim()}</div>
                     )}
                     {/* Image labeling shared image (if any image_labeling questions exist in this section) */}
                     {(() => {
@@ -2500,7 +2980,7 @@ const ExamTaking: React.FC = () => {
                     })()}
 
                     {/* Non-matching reading section passage */}
-                    {!isMatchingSection && currentSection?.passageText && (
+                    {!shouldShowMatchingForPart && resolvedPassageText && (
                       <div
                         className={(darkMode ? 'text-gray-200' : 'text-gray-800') + ' prose max-w-none whitespace-pre-wrap mb-6'}
                         style={{
@@ -2508,7 +2988,7 @@ const ExamTaking: React.FC = () => {
                           lineHeight: 1.55,
                           fontFamily: prefFontFamily === 'serif' ? 'Georgia, Cambria, Times New Roman, Times, serif' : prefFontFamily === 'mono' ? 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace' : 'system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif'
                         }}
-                      >{currentSection.passageText}</div>
+                      >{resolvedPassageText}</div>
                     )}
                   </>
                 ) : (
@@ -2628,8 +3108,8 @@ const ExamTaking: React.FC = () => {
                               </div>
                             );
                           })()}
-                          {currentSection?.passageText ? (
-                            <div className="whitespace-pre-wrap">{currentSection.passageText}</div>
+                          {resolvedPassageText ? (
+                            <div className="whitespace-pre-wrap">{resolvedPassageText}</div>
                           ) : (
                             <div className="italic opacity-70">Adjust font size, family, or theme in Settings. Questions appear on the right.</div>
                           )}
@@ -2686,32 +3166,6 @@ const ExamTaking: React.FC = () => {
                       );
                     })}
                     <div className="pt-1 text-[9px] text-gray-600">Add ?debugTables=1 to URL or press Ctrl+Shift+D. Reload keeps state via localStorage.</div>
-                  </div>
-                )}
-                {isMatchingSection && headingOptions.length > 0 && (
-                  <div className="mb-4 space-y-2">
-                    {(() => { const gi = matchingQuestions[0]?.metadata?.groupInstruction; return gi ? <div className={"text-xs whitespace-pre-wrap border rounded p-2 " + (darkMode ? 'bg-gray-800 border-gray-700 text-gray-300' : 'bg-gray-50 text-gray-600 border-gray-200')}>{gi}</div> : null; })()}
-                    <div className={"text-sm font-medium " + (darkMode ? 'text-gray-200' : 'text-gray-700')}>List of Headings</div>
-                    <div className="flex flex-col gap-2">
-                      {headingOptions.map((opt: any, idx: number) => {
-                        const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + idx);
-                        const text = opt.text || opt.option_text || '';
-                        const used = matchingQuestions.some((mq: any) => (answers[mq.id]?.answer as string) === letter);
-                        return (
-                          <div
-                            key={letter}
-                            draggable
-                            onDragStart={(e) => { e.dataTransfer.setData('text/plain', letter); setDraggingHeading(letter); }}
-                            onDragEnd={() => setDraggingHeading(null)}
-                            className={`px-3 py-1.5 rounded border text-sm cursor-move select-none leading-snug transition-colors ${used ? (darkMode ? 'bg-gray-700 text-gray-500 line-through border-gray-600' : 'bg-gray-200 text-gray-500 line-through border-gray-300') : (darkMode ? 'bg-gray-800 border-gray-600 text-gray-200 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50')}`}
-                            title={text + (used ? ' (already used)' : '')}
-                          >
-                            {text}
-                          </div>
-                        );
-                      })}
-                    </div>
-                    <div className={"text-[10px] mt-1 " + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Drag a heading text onto a paragraph drop zone on the left. Each heading can be used once.</div>
                   </div>
                 )}
                 {/* Table container rendered (if any) before question list */}
@@ -2992,7 +3446,111 @@ const ExamTaking: React.FC = () => {
                     }
                     return out;
                   })();
-                  return renderQuestions.map((q: any, idx: number) => {
+
+                  const renderHeadingPalette = (key: string) => {
+                    const firstMatching = matchingQuestionsForCurrentPart[0];
+                    const groupInstruction = firstMatching?.metadata?.groupInstruction;
+                    const promptText = matchingHeadingQuestionText;
+                    const rangeLabel = matchingHeadingRangeLabel;
+                    return (
+                      <div key={key} className="mb-4 space-y-2">
+                        {rangeLabel ? (
+                          <div className={"text-[11px] uppercase tracking-wide font-semibold " + (darkMode ? 'text-gray-400' : 'text-gray-500')}>
+                            {rangeLabel}
+                          </div>
+                        ) : null}
+                        {promptText ? (
+                          <div className={"text-sm font-semibold whitespace-pre-wrap leading-snug " + (darkMode ? 'text-gray-100' : 'text-gray-900')}>
+                            {normalizeNewlines(promptText)}
+                          </div>
+                        ) : null}
+                        {groupInstruction ? (
+                          <div className={"text-xs whitespace-pre-wrap border rounded p-2 " + (darkMode ? 'bg-gray-800 border-gray-700 text-gray-300' : 'bg-gray-50 text-gray-600 border-gray-200')}>
+                            {normalizeNewlines(groupInstruction)}
+                          </div>
+                        ) : null}
+                        <div className={"text-sm font-medium " + (darkMode ? 'text-gray-200' : 'text-gray-700')}>List of Headings</div>
+                        <div className="flex flex-col gap-2">
+                          {headingOptions.map((opt: any, idxOption: number) => {
+                            const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + idxOption);
+                            const text = opt.text || opt.option_text || '';
+                            const assignment = headingAssignments[letter];
+                            const assignedNumbers = assignment?.numbers || [];
+                            const assignedCount = assignment?.count || 0;
+                            const isUsed = assignedCount > 0;
+                            const paletteBase = 'px-3 py-1.5 rounded border text-sm cursor-move select-none leading-snug transition-colors flex items-center gap-2';
+                            const paletteTone = isUsed
+                              ? (darkMode ? 'bg-gray-800 border-gray-700 text-gray-200' : 'bg-gray-50 border-gray-200 text-gray-700')
+                              : (darkMode ? 'bg-gray-800 border-gray-600 text-gray-100 hover:bg-gray-700' : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-100');
+                            const assignmentLabel = isUsed
+                              ? (assignedNumbers.length
+                                ? 'Assigned to ' + assignedNumbers.map((n: number) => 'Q' + n).join(', ')
+                                : 'Assigned')
+                              : 'Unused';
+                            const assignmentTone = isUsed
+                              ? (darkMode ? 'text-blue-300' : 'text-blue-600')
+                              : (darkMode ? 'text-gray-500' : 'text-gray-400');
+                            const paletteClasses = paletteBase + ' ' + paletteTone;
+                            const titleText = letter + '. ' + text + (isUsed ? ' (' + assignmentLabel + ')' : '');
+                            const assignmentClasses = 'text-[11px] ml-2 ' + assignmentTone;
+                            return (
+                              <div
+                                key={letter || idxOption}
+                                role="button"
+                                tabIndex={0}
+                                draggable
+                                onDragStart={(e) => { e.dataTransfer.setData('text/plain', letter); setDraggingHeading(letter); }}
+                                onDragEnd={() => setDraggingHeading(null)}
+                                className={paletteClasses}
+                                title={titleText}
+                              >
+                                <span className="font-semibold">{letter}</span>
+                                <span className="flex-1">{text}</span>
+                                <span className={assignmentClasses}>
+                                  {assignmentLabel}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className={"text-[10px] mt-1 " + (darkMode ? 'text-gray-400' : 'text-gray-500')}>
+                          Drag a heading text onto a paragraph drop zone on the left. Each heading can be used once.
+                        </div>
+                      </div>
+                    );
+                  };
+
+                  const sequenceWithHeadings = (() => {
+                    if (!shouldShowMatchingForPart || headingOptions.length === 0) return renderQuestions;
+                    const headingKey = firstMatchingQuestionNumber !== null
+                      ? `matching-headings-after-${Math.max(0, firstMatchingQuestionNumber - 1)}`
+                      : 'matching-headings-bank';
+                    const headingEntry: any = { __headingPalette: true, __key: headingKey };
+                    if (!renderQuestions.length) {
+                      return [headingEntry];
+                    }
+                    let insertAfterIdx = -1;
+                    renderQuestions.forEach((entry: any, idxRender: number) => {
+                      if (!entry || entry.__instruction || entry.__headingPalette) return;
+                      const num = typeof entry.questionNumber === 'number'
+                        ? entry.questionNumber
+                        : (blankNumberMap[entry.id]?.[0] ?? null);
+                      if (firstMatchingQuestionNumber !== null && num !== null && num < firstMatchingQuestionNumber) {
+                        insertAfterIdx = idxRender;
+                      }
+                    });
+                    if (insertAfterIdx === -1) {
+                      return [headingEntry, ...renderQuestions];
+                    }
+                    const arr = [...renderQuestions];
+                    arr.splice(insertAfterIdx + 1, 0, headingEntry);
+                    return arr;
+                  })();
+
+                  return sequenceWithHeadings.map((q: any, idx: number) => {
+                    if (q?.__headingPalette) {
+                      return renderHeadingPalette(q.__key || 'matching-headings-bank');
+                    }
                   if (q.__instruction) {
                     return (
                       <div key={q.__key} className={"mb-3 text-sm font-semibold rounded p-3 whitespace-pre-wrap leading-snug tracking-normal "+warningPanel}>{q.__instruction}</div>
@@ -3026,9 +3584,6 @@ const ExamTaking: React.FC = () => {
                       dropdownMode,
                       metadata: metaAny,
                     };
-                    if (dropdownMode) {
-                      console.log('[DropdownRender]', q.id, q.questionNumber, dropdownRaw, metaAny);
-                    }
                   }
                   const displayNumber = (blankNumberMap[q.id]?.[0]) || q.questionNumber || (idx + 1);
                   // Interactive fill_blank: support placeholders {answer1} OR runs of underscores ___ inline.
@@ -3409,40 +3964,46 @@ const ExamTaking: React.FC = () => {
 
                     {(q.questionType === 'multiple_choice' || q.type === 'multiple_choice' || q.questionType === 'drag_drop') && (
                       <div className="mb-2">
-                        {q.questionType === 'multiple_choice' && q.metadata?.allowMultiSelect ? (
+                        {q.questionType === 'multiple_choice' && isMultiSelectQuestion(q) ? (
                           <div className="space-y-1">
-                            {(q.options || []).map((opt: any, oIdx: number) => {
-                              const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + oIdx);
-                              const label = opt.text || opt.option_text || '';
+                            {(() => {
                               const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as string[]) : [];
-                              const checked = current.includes(letter);
-                              const maxSel = Number(q.metadata.selectCount) || 2;
+                              const maxSel = resolveMultiSelectLimit(q, 2);
                               return (
-                                <div
-                                  key={letter}
-                                  className={`flex items-start gap-2 text-sm px-3 py-2 border rounded cursor-pointer select-none transition-colors ${checked ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50 active:bg-gray-100')}`}
-                                  onClick={() => {
-                                    let next = [...current];
-                                    if (checked) {
-                                      next = next.filter(l => l !== letter);
-                                    } else if (next.length < maxSel) {
-                                      next.push(letter);
-                                    } else {
-                                      next[next.length - 1] = letter;
-                                    }
-                                    handleAnswerChange(q.id, next);
-                                  }}
-                                  role="checkbox"
-                                  aria-checked={checked}
-                                  tabIndex={0}
-                                  onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); (e.currentTarget as HTMLElement).click(); } }}
-                                >
-                                  <span className={`mt-0.5 inline-flex w-4 h-4 border rounded-sm items-center justify-center text-[10px] font-semibold ${checked ? 'bg-blue-500 border-blue-500 text-white' : (darkMode ? 'border-gray-500 text-transparent' : 'border-gray-400 text-transparent')}`}>✓</span>
-                                  <span className="flex-1">{label}</span>
-                                </div>
+                                <>
+                                  {(q.options || []).map((opt: any, oIdx: number) => {
+                                    const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + oIdx);
+                                    const label = opt.text || opt.option_text || '';
+                                    const checked = current.includes(letter);
+                                    return (
+                                      <div
+                                        key={letter}
+                                        className={`flex items-start gap-2 text-sm px-3 py-2 border rounded cursor-pointer select-none transition-colors ${checked ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50 active:bg-gray-100')}`}
+                                        onClick={() => {
+                                          let next = [...current];
+                                          if (checked) {
+                                            next = next.filter(l => l !== letter);
+                                          } else if (next.length < maxSel) {
+                                            next.push(letter);
+                                          } else {
+                                            next[next.length - 1] = letter;
+                                          }
+                                          handleAnswerChange(q.id, next);
+                                        }}
+                                        role="checkbox"
+                                        aria-checked={checked}
+                                        tabIndex={0}
+                                        onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); (e.currentTarget as HTMLElement).click(); } }}
+                                      >
+                                        <span className={`mt-0.5 inline-flex w-4 h-4 border rounded-sm items-center justify-center text-[10px] font-semibold ${checked ? 'bg-blue-500 border-blue-500 text-white' : (darkMode ? 'border-gray-500 text-transparent' : 'border-gray-400 text-transparent')}`}>✓</span>
+                                        <span className="flex-1">{label}</span>
+                                      </div>
+                                    );
+                                  })}
+                                  <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Select {maxSel} answer{maxSel === 1 ? '' : 's'}.</div>
+                                </>
                               );
-                            })}
-                            <div className={'text-[10px] mt-1 ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Select {q.metadata.selectCount || 2} answers.</div>
+                            })()}
                           </div>
                         ) : (
                           <div className="space-y-1">
@@ -3497,34 +4058,40 @@ const ExamTaking: React.FC = () => {
                       </div>
                     )}
 
-                    {q.questionType === 'multi_select' && (
-                      <div className="mb-2 space-y-1">
-                        {(q.options || []).map((opt: any, idx: number) => {
-                          const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + idx);
-                          const label = opt.option_text || opt.text || '';
-                          const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as string[]) : [];
-                          const checked = current.includes(letter);
-                          return (
-                            <label
-                              key={letter}
-                              className={`flex items-start gap-2 text-sm px-3 py-2 border rounded cursor-pointer select-none ${checked ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50')}`}
-                              onClick={() => {
-                                let next = [...current];
-                                if (checked) next = next.filter(l => l !== letter); else if (next.length < 2) next.push(letter); else {
-                                  // Replace the second selection keeping the first
-                                  next = [next[0], letter];
-                                }
-                                handleAnswerChange(q.id, next);
-                              }}
-                            >
-                              <input type="checkbox" className={'mt-1 ' + (darkMode ? 'accent-blue-500' : '')} checked={checked} readOnly />
-                              <span className="flex-1">{label}</span>
-                            </label>
-                          );
-                        })}
-                        <div className={'text-[10px] ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Choose TWO answers.</div>
-                      </div>
-                    )}
+                    {q.questionType === 'multi_select' && (() => {
+                      const maxSelect = resolveMultiSelectLimit(q, 2);
+                      return (
+                        <div className="mb-2 space-y-1">
+                          {(q.options || []).map((opt: any, idx: number) => {
+                            const letter = opt.letter || opt.option_letter || String.fromCharCode(65 + idx);
+                            const label = opt.option_text || opt.text || '';
+                            const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as string[]) : [];
+                            const checked = current.includes(letter);
+                            return (
+                              <label
+                                key={letter}
+                                className={`flex items-start gap-2 text-sm px-3 py-2 border rounded cursor-pointer select-none ${checked ? (darkMode ? 'bg-blue-700 border-blue-600 text-white' : 'bg-blue-100 border-blue-300') : (darkMode ? 'bg-gray-800 border-gray-600 hover:bg-gray-700' : 'bg-white border-gray-300 hover:bg-gray-50')}`}
+                                onClick={() => {
+                                  let next = [...current];
+                                  if (checked) {
+                                    next = next.filter(l => l !== letter);
+                                  } else if (next.length < maxSelect) {
+                                    next.push(letter);
+                                  } else {
+                                    return;
+                                  }
+                                  handleAnswerChange(q.id, next);
+                                }}
+                              >
+                                <input type="checkbox" className={'mt-1 ' + (darkMode ? 'accent-blue-500' : '')} checked={checked} readOnly />
+                                <span className="flex-1">{label}</span>
+                              </label>
+                            );
+                          })}
+                          <div className={'text-[10px] ' + (darkMode ? 'text-gray-400' : 'text-gray-500')}>Choose {maxSelect} answer{maxSelect === 1 ? '' : 's'}.</div>
+                        </div>
+                      );
+                    })()}
 
                     {/* Matching dropdown removed in favor of drag & drop UI on left */}
 
@@ -3832,7 +4399,10 @@ const ExamTaking: React.FC = () => {
                       );
                     })()}
                   </div>
-                );});})()}
+                );
+                  });
+                })()}
+
               </div>
               <div className="p-4 border-t flex items-center gap-2">
                 <button
@@ -3848,7 +4418,7 @@ const ExamTaking: React.FC = () => {
                 >
                   Reset Answers
                 </button>
-                <button onClick={() => setShowConfirmSubmit(true)} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">Submit Answers</button>
+                <button onClick={handleSubmitIntent} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">Submit Answers</button>
               </div>
             </div>
           </div>
@@ -3875,11 +4445,18 @@ const ExamTaking: React.FC = () => {
           if (q && q.metadata && typeof q.metadata === 'string') { try { return { ...q, metadata: JSON.parse(q.metadata) }; } catch {} }
           return q;
         });
+        const belongsToActiveReadingPart = (question: any, fallbackNum?: number) => {
+          if (!isReadingSection) return true;
+          return inferReadingPart(question, fallbackNum ?? question?.questionNumber) === currentReadingPart;
+        };
         secQs.forEach((q:any) => {
           if (q.questionType === 'simple_table') {
-            extractSimpleTableNumbersFromQuestion(q).forEach(({num, answered}) => mark(num, answered));
+            extractSimpleTableNumbersFromQuestion(q).forEach(({num, answered}) => {
+              if (belongsToActiveReadingPart(q, num)) mark(num, answered);
+            });
             return;
           }
+          if (!belongsToActiveReadingPart(q)) return;
           if (q.questionType === 'fill_blank') {
             const text = normalizeNewlines(q.questionText || '');
             const curly = (text.match(/\{answer\d+\}/gi) || []).length;
@@ -3892,6 +4469,7 @@ const ExamTaking: React.FC = () => {
               const value = combine
                 ? (answerValues[0] ?? '')
                 : (answerValues[i] ?? '');
+              if (!belongsToActiveReadingPart(q, num)) continue;
               mark(num, !!value);
             }
           } else if (typeof q.questionNumber === 'number') {
@@ -3965,70 +4543,94 @@ const ExamTaking: React.FC = () => {
             className={"px-3 py-2 text-sm rounded border " + (darkMode ? 'bg-gray-700 border-gray-600 text-gray-200 hover:bg-gray-600' : 'bg-white border-gray-300 hover:bg-gray-50 text-gray-700')}
             disabled={currentSectionIndex === 0 && currentQuestionIndex === 0}
           >Prev</button>
-          <div className="flex-1 flex flex-wrap gap-1 overflow-y-auto max-h-20">
-            {(() => {
-              // Build unified number map for current section including simple_table cells
-              const numsMap: Record<number, boolean> = {};
-              const mark = (n:number, ans:boolean) => { if (!(n in numsMap)) numsMap[n] = false; if (ans) numsMap[n] = true; };
-              const secQs = (currentSection?.questions || []).map((q:any) => {
-                if (q && q.metadata && typeof q.metadata === 'string') { try { return { ...q, metadata: JSON.parse(q.metadata) }; } catch { } }
-                return q;
-              });
-              secQs.forEach((q:any) => {
-                if (q.questionType === 'simple_table') {
-                  extractSimpleTableNumbersFromQuestion(q).forEach(({num, answered}) => mark(num, answered));
-                  return;
-                }
-                if (q.questionType === 'fill_blank') {
-                  const text = normalizeNewlines(q.questionText || '');
-                  const curly = (text.match(/\{answer\d+\}/gi) || []).length;
-                  const underscores = (text.match(/_{3,}/g) || []).length;
-                  const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks);
-                  const blanks = combine ? 1 : (curly || underscores || 1);
-                  const answerValues = getBlankValues(q.id);
-                  for (let i = 0; i < blanks; i++) {
-                    const num = (q.questionNumber || 0) + (blanks > 1 ? i : 0);
-                    const value = combine
-                      ? (answerValues[0] ?? '')
-                      : (answerValues[i] ?? '');
-                    mark(num, !!value);
+          <div className="flex-1 overflow-y-auto max-h-24">
+            {isReadingSection ? (
+              <div className="flex flex-wrap gap-2">
+                {readingParts.map((part) => (
+                  <button
+                    key={`reading-part-btn-${part}`}
+                    type="button"
+                    onClick={() => {
+                      const firstInPart = allVisibleQuestions.find((q: any) => inferReadingPart(q) === part);
+                      setCurrentReadingPart(part);
+                      setCurrentQuestionIndex(0);
+                      skipNextScrollRef.current = true;
+                      if (firstInPart?.questionNumber !== undefined) {
+                        sectionCurrentNumRef.current = firstInPart.questionNumber;
+                      }
+                    }}
+                    className={'px-3 py-1.5 rounded border font-medium text-sm transition-colors ' + (part === currentReadingPart
+                      ? 'bg-blue-600 border-blue-600 text-white'
+                      : (darkMode ? 'bg-gray-900 border-gray-600 text-gray-300 hover:bg-gray-700' : 'bg-gray-50 border-gray-300 text-gray-600 hover:bg-gray-100'))}
+                  >Part {part}</button>
+                ))}
+              </div>
+            ) : (
+              (() => {
+                // Build unified number map for current section including simple_table cells
+                const numsMap: Record<number, boolean> = {};
+                const mark = (n:number, ans:boolean) => { if (!(n in numsMap)) numsMap[n] = false; if (ans) numsMap[n] = true; };
+                const secQs = (currentSection?.questions || []).map((q:any) => {
+                  if (q && q.metadata && typeof q.metadata === 'string') { try { return { ...q, metadata: JSON.parse(q.metadata) }; } catch { } }
+                  return q;
+                });
+                secQs.forEach((q:any) => {
+                  if (q.questionType === 'simple_table') {
+                    extractSimpleTableNumbersFromQuestion(q).forEach(({num, answered}) => mark(num, answered));
+                    return;
                   }
-                } else if ((q.questionType === 'multiple_choice' && q.metadata?.allowMultiSelect) || q.questionType === 'multi_select') {
-                  const required = Number(q.metadata?.selectCount) || 2;
-                  const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as any[]) : [];
-                  const full = current.length >= required;
-                  for (let i = 0; i < required; i++) {
-                    const num = (q.questionNumber || 0) + i;
-                    mark(num, full);
-                  }
-                } else if (typeof q.questionNumber === 'number') {
-                  mark(q.questionNumber, !!(answers[q.id]?.answer));
-                }
-              });
-              const sorted = Object.keys(numsMap).map(n=> Number(n)).sort((a,b)=> a-b);
-              return sorted.map((num:number) => (
-                <button
-                  key={`sec-${num}`}
-                  title={`Question ${num}`}
-                  onClick={() => {
-                    // First try to find exact question index with this number
-                    const idxByNum = visibleQuestions.findIndex((vq:any) => vq.questionNumber === num);
-                    if (idxByNum !== -1) {
-                      goToQuestion(currentSectionIndex, idxByNum);
-                      // focus will be handled by useEffect after index change
-                      // Also attempt direct focus by data-qnum in case UI does not re-render quickly
-                      scrollAndFocusByQnum(num, rightScrollRef.current);
-                      sectionCurrentNumRef.current = num;
-                      return;
+                  if (q.questionType === 'fill_blank') {
+                    const text = normalizeNewlines(q.questionText || '');
+                    const curly = (text.match(/\{answer\d+\}/gi) || []).length;
+                    const underscores = (text.match(/_{3,}/g) || []).length;
+                    const combine = !!(q.metadata?.singleNumber || q.metadata?.combineBlanks);
+                    const blanks = combine ? 1 : (curly || underscores || 1);
+                    const answerValues = getBlankValues(q.id);
+                    for (let i = 0; i < blanks; i++) {
+                      const num = (q.questionNumber || 0) + (blanks > 1 ? i : 0);
+                      const value = combine
+                        ? (answerValues[0] ?? '')
+                        : (answerValues[i] ?? '');
+                      mark(num, !!value);
                     }
-                    // If number belongs to table cell, just scroll/focus by data attribute
-                    scrollAndFocusByQnum(num, rightScrollRef.current as any);
-                    sectionCurrentNumRef.current = num;
-                  }}
-                  className={`w-8 h-8 text-[11px] rounded border flex items-center justify-center ${chipClass(false, !!numsMap[num])}`}
-                >{num}</button>
-              ));
-            })()}
+                  } else if ((q.questionType === 'multiple_choice' && isMultiSelectQuestion(q)) || q.questionType === 'multi_select') {
+                    const required = resolveMultiSelectLimit(q, 2);
+                    const current = Array.isArray(answers[q.id]?.answer) ? (answers[q.id]?.answer as any[]) : [];
+                    const full = current.length >= required;
+                    for (let i = 0; i < required; i++) {
+                      const num = (q.questionNumber || 0) + i;
+                      mark(num, full);
+                    }
+                  } else if (typeof q.questionNumber === 'number') {
+                    mark(q.questionNumber, !!(answers[q.id]?.answer));
+                  }
+                });
+                const sorted = Object.keys(numsMap).map(n=> Number(n)).sort((a,b)=> a-b);
+                const currentNum = sectionCurrentNumRef.current ?? visibleQuestions[currentQuestionIndex]?.questionNumber ?? null;
+                return (
+                  <div className="flex flex-wrap gap-1">
+                    {sorted.map((num:number) => (
+                      <button
+                        key={`sec-${num}`}
+                        title={`Question ${num}`}
+                        onClick={() => {
+                          const idxByNum = visibleQuestions.findIndex((vq:any) => vq.questionNumber === num);
+                          if (idxByNum !== -1) {
+                            goToQuestion(currentSectionIndex, idxByNum);
+                            scrollAndFocusByQnum(num, rightScrollRef.current);
+                            sectionCurrentNumRef.current = num;
+                            return;
+                          }
+                          scrollAndFocusByQnum(num, rightScrollRef.current as any);
+                          sectionCurrentNumRef.current = num;
+                        }}
+                        className={`w-8 h-8 text-[11px] rounded border flex items-center justify-center ${chipClass(currentNum === num, !!numsMap[num])}`}
+                      >{num}</button>
+                    ))}
+                  </div>
+                );
+              })()
+            )}
           </div>
           <button
             onClick={goToNextQuestion}
@@ -4037,24 +4639,8 @@ const ExamTaking: React.FC = () => {
           >Next</button>
         </div>
       </div>
-
-      {showConfirmSubmit && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
-            <div className="flex items-center mb-4">
-              <AlertTriangle className="h-6 w-6 text-red-600 mr-2" />
-              <h3 className="text-lg font-semibold">Submit Exam</h3>
-            </div>
-            <p className="text-gray-600 mb-6">Are you sure you want to submit your exam? This action cannot be undone.</p>
-            <div className="flex space-x-3">
-              <button onClick={() => setShowConfirmSubmit(false)} className="flex-1 px-4 py-2 text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">Cancel</button>
-              <button onClick={() => sessionId && submit.mutate(sessionId)} disabled={submit.isPending} className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50">
-                {submit.isPending ? 'Submitting...' : 'Submit Exam'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {submitDialogNode}
+      {transitionOverlay}
     </div>
   );
 };

@@ -39,6 +39,11 @@ export interface ExamSection {
   questions: Question[];
   order: number;
   // legacy per-section audio removed; use Exam.audioUrl instead
+  instructions?: string;
+  audioUrl?: string;
+  passageText?: string;
+  passageTexts?: Record<string, string> | null;
+  headingBank?: any;
 }
 
 // Question Types

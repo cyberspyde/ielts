@@ -672,6 +672,7 @@ router.put('/exams/:examId/sections/:sectionId',
   body('instructions').optional().isString(),
   body('audioUrl').optional().isString(),
   body('passageText').optional().isString(),
+  body('passageTexts').optional().isObject(),
   body('headingBank').optional(),
   asyncHandler(async (req: Request, res: Response) => {
     checkValidationErrors(req);
@@ -683,11 +684,46 @@ router.put('/exams/:examId/sections/:sectionId',
     const map: Record<string, string> = {
       title: 'title', description: 'description',
       maxScore: 'max_score', sectionOrder: 'section_order', instructions: 'instructions',
-      audioUrl: 'audio_url', passageText: 'passage_text', headingBank: 'heading_bank'
+      audioUrl: 'audio_url', passageText: 'passage_text', passageTexts: 'passage_texts', headingBank: 'heading_bank'
     };
+    let derivedPassageText: string | null | undefined;
     for (const key of Object.keys(map)) {
       const val = (req.body as any)[key];
-      if (val !== undefined) { fields.push(`${map[key]} = $${p++}`); values.push(key === 'headingBank' ? JSON.stringify(val) : val); }
+      if (val === undefined) continue;
+      if (key === 'headingBank') {
+        fields.push(`${map[key]} = $${p++}`);
+        values.push(JSON.stringify(val));
+        continue;
+      }
+      if (key === 'passageTexts') {
+        let normalized = val;
+        if (typeof normalized === 'string') {
+          try { normalized = JSON.parse(normalized); }
+          catch { normalized = {}; }
+        }
+        if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) {
+          normalized = {};
+        }
+        fields.push(`${map[key]} = $${p++}`);
+        values.push(JSON.stringify(normalized));
+        const entries = Object.entries(normalized as Record<string, any>)
+          .filter(([_, text]) => typeof text === 'string' && text.trim().length > 0)
+          .sort(([aKey], [bKey]) => Number(aKey) - Number(bKey));
+        if (entries.length > 0) {
+          derivedPassageText = entries[0][1].trim();
+        } else if (Object.keys(normalized).length > 0) {
+          derivedPassageText = '';
+        } else {
+          derivedPassageText = null; // explicit clear when payload is empty object
+        }
+        continue;
+      }
+      fields.push(`${map[key]} = $${p++}`);
+      values.push(val);
+    }
+    if (derivedPassageText !== undefined && !('passageText' in (req.body as any))) {
+      fields.push(`passage_text = $${p++}`);
+      values.push(derivedPassageText);
     }
     if (fields.length === 0) { res.json({ success: true, message: 'No changes' }); return; }
     values.push(sectionId, examId);

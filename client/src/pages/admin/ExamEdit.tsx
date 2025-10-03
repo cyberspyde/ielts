@@ -14,6 +14,54 @@ const buildLettersFromQuestions = (questions: any[]): string[] => {
   return letters;
 };
 
+const normalizeSectionPassages = (section: any): Record<string, string> => {
+  if (!section) return {};
+  let raw = section.passageTexts;
+  if (typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch { raw = undefined; }
+  }
+  const result: Record<string, string> = {};
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+      if (typeof value === 'string') {
+        result[String(key)] = value;
+      }
+    });
+  }
+  if (typeof section.passageText === 'string' && section.passageText.length && !result['1']) {
+    result['1'] = section.passageText;
+  }
+  return result;
+};
+
+const getPassageForPart = (section: any, part?: number): string => {
+  const key = part ? String(part) : '1';
+  const map = normalizeSectionPassages(section);
+  if (map[key] !== undefined) return map[key];
+  if (!part || part === 1) {
+    return typeof section?.passageText === 'string' ? section.passageText : '';
+  }
+  return '';
+};
+
+const buildPassageUpdatePayload = (section: any, part: number | undefined, value: string) => {
+  const key = part ? String(part) : '1';
+  const map = normalizeSectionPassages(section);
+  const next: Record<string, string> = { ...map };
+  if (value && value.length) {
+    next[key] = value;
+  } else {
+    delete next[key];
+  }
+  const payload: any = { passageTexts: next };
+  if (!part || part === 1) {
+    payload.passageText = value;
+  } else if (!next['1'] && typeof section?.passageText !== 'string') {
+    payload.passageText = '';
+  }
+  return payload;
+};
+
 // --- Simple Table Editor extracted to prevent hook order violations ---
 const SimpleTableEditor: React.FC<{ question: any; updateQuestion: any; deleteQuestion: any; }> = ({ question: tq, updateQuestion, deleteQuestion }) => {
   const [localRows, setLocalRows] = React.useState<any[][]>(() => (tq.metadata?.simpleTable?.rows || [[]]).map((r:any)=> r.map((c:any)=> ({ ...c }))));
@@ -885,6 +933,18 @@ const AdminExamEdit: React.FC = () => {
     }
   };
 
+  const toggleSharedOptionsAnchor = async (section: any, question: any, enable: boolean) => {
+    const meta = { ...(question.metadata || {}) };
+    if (enable) {
+      meta.sharedOptionsAnchor = true;
+    } else {
+      delete meta.sharedOptionsAnchor;
+      delete (meta as any).shared_options_anchor;
+    }
+    question.metadata = meta;
+    await updateQuestion.mutateAsync({ questionId: question.id, data: { metadata: meta } });
+  };
+
   const addSharedOption = async (section: any, block: SharedMcqBlock) => {
     const sharedMcqs = block.questions;
     if (!sharedMcqs.length) {
@@ -1148,8 +1208,31 @@ const AdminExamEdit: React.FC = () => {
               {/* Per-section listening audio UI removed; centralized at exam level */}
               {section.sectionType === 'reading' && (
                 <div className="md:col-span-5">
-                  <label className="block text-sm text-gray-600 mb-1">Passage Text</label>
-                  <textarea defaultValue={section.passageText || ''} onBlur={(e) => updateSection.mutate({ sectionId: section.id, data: { passageText: e.target.value } })} className="w-full rounded-md border-gray-300" rows={4} />
+                  <label className="block text-sm text-gray-600 mb-1">
+                    Passage Text{FULL_MOCK ? ` (Passage ${activePart || 1})` : ''}
+                  </label>
+                  {(() => {
+                    const part = FULL_MOCK ? (activePart || 1) : 1;
+                    const current = getPassageForPart(section, part);
+                    return (
+                      <textarea
+                        key={`${section.id}-passage-${part}`}
+                        defaultValue={current}
+                        onBlur={(e) => {
+                          const nextValue = e.target.value;
+                          if (nextValue === current) return;
+                          if (FULL_MOCK) {
+                            const payload = buildPassageUpdatePayload(section, part, nextValue);
+                            updateSection.mutate({ sectionId: section.id, data: payload });
+                          } else {
+                            updateSection.mutate({ sectionId: section.id, data: { passageText: nextValue, passageTexts: { '1': nextValue } } });
+                          }
+                        }}
+                        className="w-full rounded-md border-gray-300"
+                        rows={4}
+                      />
+                    );
+                  })()}
                 </div>
               )}
             </div>
@@ -1290,7 +1373,7 @@ const AdminExamEdit: React.FC = () => {
 
             {/* Quick bulk question creator for this section (hidden for Writing sections) */}
             {section.sectionType !== 'writing' && (
-            <div className="mb-6 border rounded bg-gray-50 p-4">
+              <div className="mb-6 border rounded bg-gray-50 p-4">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-sm font-medium text-gray-700">Add Question Range</span>
               </div>
@@ -1345,10 +1428,11 @@ const AdminExamEdit: React.FC = () => {
                 ); })()}
               </div>
               <div className="text-[11px] text-gray-500 mt-2">For drag & drop, Q start becomes group anchor; subsequent numbers become group items.</div>
-            </div>
+              </div>
             )}
 
             {/* Image Labeling (map/plan/diagram) */}
+            {section.sectionType !== 'writing' && (
             <div className="mb-6 border rounded bg-gray-50 p-4">
               <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
                 <span className="text-sm font-medium text-gray-700">Image Labeling (per-question anchors)</span>
@@ -1470,6 +1554,7 @@ const AdminExamEdit: React.FC = () => {
               })()}
               <div className="mt-2 text-[11px] text-gray-500">Tip: Click any dot, then click on the image to position the anchor precisely. X/Y are relative (0–1).</div>
             </div>
+            )}
 
             {/* Import Headings for matching */}
             {/* Headings import hidden to reduce complexity; manage in create flow */}
@@ -1489,6 +1574,12 @@ const AdminExamEdit: React.FC = () => {
                     <div key={`block-${tm.type}`} className="mb-4 border rounded">
                       <div className="px-3 py-2 border-b bg-gray-50 text-sm font-medium text-gray-700">Headings & Matching</div>
                       <div className="p-3">
+                        <div className="mb-3 text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded p-2">
+                          <div className="font-semibold text-[11px] uppercase tracking-wide text-blue-600">Passage Markers</div>
+                          <div className="mt-1 leading-snug text-blue-700">
+                            To anchor headings directly in the passage, insert markers like <code>[[paragraph1]]</code>, <code>[[paragraph2]]</code>, or the shorthand <code>[[p3]]</code> before each paragraph. When you click <em>Generate from Passage</em>, these markers map to the corresponding heading questions automatically.
+                          </div>
+                        </div>
                         <div className="mb-3">
                           <textarea
                             placeholder="Group instruction (shown once to students)"
@@ -1521,7 +1612,7 @@ const AdminExamEdit: React.FC = () => {
                           }}>Add Heading</button>
                           <button className="px-3 py-2 text-sm border rounded bg-blue-50 border-blue-300 text-blue-700" onClick={() => createQuestion.mutate({ sectionId: section.id, questionType: 'matching', metadata: withPartMeta(section) })}>+ Add Paragraph</button>
                           <button className="px-3 py-2 text-sm border rounded bg-green-50 border-green-300 text-green-700" onClick={async () => {
-                            const passage = section.passageText || '';
+                            const passage = getPassageForPart(section, filterByPart ? activePart : undefined) || '';
                             // Detect explicit markers first: [[P1]] [[paragraph2]] etc.
                             const markerRegex = /\[\[(?:p|paragraph)\s*(\d+)\]\]/gi;
                             const markers: { index: number; start: number; end: number; token: string }[] = [];
@@ -1839,6 +1930,13 @@ const AdminExamEdit: React.FC = () => {
                                     || q.metadata?.display_mode === 'dropdown'
                                     || q.metadata?.renderMode === 'dropdown'
                                     || q.metadata?.dropdown === true;
+                                  const blockForQuestion = questionBlockMap.get(q.id);
+                                  const blockQuestions = blockForQuestion?.questions || [];
+                                  const isSharedAnchor = Boolean(q.metadata?.sharedOptionsAnchor || q.metadata?.shared_options_anchor);
+                                  const isFirstInBlock = blockQuestions[0]?.id === q.id;
+                                  const blockIndex = sharedBlocks.findIndex((b) => b.questions.some((qq: any) => qq.id === q.id));
+                                  const hasPreviousSharedBlock = blockIndex > 0;
+                                  const canSplitHere = !isSharedAnchor && blockQuestions.length > 0 && !isFirstInBlock;
                                   return (
                                     <div key={`mc-row-${q.id}`} className="flex items-center gap-2">
                                       <div className="w-10 text-xs text-gray-500">Q{q.questionNumber || q.order || i + 1}</div>
@@ -1851,7 +1949,7 @@ const AdminExamEdit: React.FC = () => {
                                       {!q.metadata?.groupMemberOf && (
                                         <div className="flex items-center gap-1">
                                           {(() => {
-                                            const block = questionBlockMap.get(q.id);
+                                            const block = blockForQuestion;
                                             const sharedLetters = block ? (sharedLettersByBlock.get(makeBlockKey(section.id, block)) || resolveSharedLetters(section, block)) : [];
                                             const letters = q.metadata?.customOptionsGroup
                                               ? (q.options || []).map((o: any) => o.option_letter || o.letter).filter(Boolean)
@@ -2103,6 +2201,23 @@ const AdminExamEdit: React.FC = () => {
                                                 className="text-[10px] px-2 py-0.5 border rounded border-gray-300 text-gray-600 hover:bg-gray-50"
                                                 onClick={() => toggleCustomOptionsForGroup(section, q, true)}
                                               >Customize opts</button>
+                                            )}
+                                            {canSplitHere && (
+                                              <button
+                                                type="button"
+                                                className="text-[10px] px-2 py-0.5 border rounded border-blue-300 text-blue-700 hover:bg-blue-50"
+                                                onClick={() => toggleSharedOptionsAnchor(section, q, true)}
+                                              >Split shared block</button>
+                                            )}
+                                            {isSharedAnchor && (
+                                              <>
+                                                <span className="text-[10px] px-2 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-700" title="This question starts a new shared options block">Shared block start</span>
+                                                <button
+                                                  type="button"
+                                                  className="text-[10px] px-2 py-0.5 border rounded border-blue-300 text-blue-700 hover:bg-blue-50"
+                                                  onClick={() => toggleSharedOptionsAnchor(section, q, false)}
+                                                >{hasPreviousSharedBlock ? 'Merge with previous block' : 'Remove split flag'}</button>
+                                              </>
                                             )}
                                             {q.metadata?.customOptionsGroup && openLocalOptions[q.id] && (
                                               <div className="w-full mt-2 bg-white border rounded p-2 text-[11px] space-y-1">

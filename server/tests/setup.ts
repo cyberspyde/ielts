@@ -183,10 +183,15 @@ export {
 };
 
 // Override the main db import for tests
-jest.mock('../src/config/database-no-redis', () => ({
-  ...jest.requireActual('../src/config/database-no-redis'),
-  db: testPool,
-}));
+jest.mock('../src/config/database-no-redis', () => {
+  const actual = jest.requireActual('../src/config/database-no-redis');
+  return {
+    ...actual,
+    get db() {
+      return testPool ?? actual.db;
+    },
+  };
+});
 
 // Utility function to seed test data
 export async function seedTestData() {

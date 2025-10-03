@@ -13,6 +13,15 @@ interface AdminSessionResultsData {
   answers: Array<any>;
 }
 
+type SectionKey = 'listening' | 'reading' | 'writing';
+
+interface SectionTabInfo {
+  id: SectionKey;
+  label: string;
+  count: number;
+  helper: string;
+}
+
 const AdminSessionResults: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
   // const navigate = useNavigate();
@@ -186,15 +195,9 @@ const AdminSessionResults: React.FC = () => {
     };
   }, [data]);
 
-  if (isLoading) {
-    return <div className="flex items-center justify-center h-[60vh] text-gray-600"><Loader2 className="h-8 w-8 animate-spin mr-2" />Loading results…</div>;
-  }
-  if (error) {
-    return <div className="p-8 text-center text-red-600">Failed to load session results.</div>;
-  }
-  if (!data) return null;
-
-  const { session, exam, answers } = data;
+  const session = data?.session ?? null;
+  const exam = data?.exam ?? null;
+  const answers: any[] = Array.isArray(data?.answers) ? (data?.answers as any[]) : [];
   const pctRaw = session?.percentageScore;
   const pctNum = typeof pctRaw === 'number' ? pctRaw : Number(pctRaw);
   const pctDisplay = isFinite(pctNum) ? pctNum.toFixed(1) : '0.0';
@@ -265,6 +268,126 @@ const AdminSessionResults: React.FC = () => {
   const listeningBand = listeningTotal ? listeningBandFromCorrect(listeningCorrect) : null;
   const readingBand = readingTotal ? readingBandFromCorrect(readingCorrect, exam?.type) : null;
 
+  const answersBySection = React.useMemo<Record<'all' | SectionKey, any[]>>(() => {
+    const buckets: Record<'all' | SectionKey, any[]> = {
+      all: [],
+      listening: [],
+      reading: [],
+      writing: [],
+    };
+    const detectSection = (value: unknown): SectionKey | null => {
+      if (!value) return null;
+      const raw = String(value).toLowerCase();
+      if (raw.includes('listen')) return 'listening';
+      if (raw.includes('read')) return 'reading';
+      if (raw.includes('writ')) return 'writing';
+      return null;
+    };
+    (summary.answers || []).forEach((answer: any) => {
+      buckets.all.push(answer);
+      const metadata = answer?.questionMetadata || {};
+      const section = (
+        detectSection(answer?.sectionType)
+        || detectSection(answer?.section)
+        || detectSection(answer?.sectionLabel)
+        || detectSection(answer?.sectionTitle)
+        || detectSection(answer?.sectionName)
+        || detectSection(answer?.section?.type)
+        || detectSection(metadata?.sectionType)
+        || detectSection(metadata?.section)
+        || detectSection(metadata?.sectionLabel)
+        || detectSection(metadata?.sectionTitle)
+      );
+      let key: SectionKey | null = section;
+      if (!key) {
+        const qType = String(answer?.questionType || '').toLowerCase();
+        if (['essay', 'writing_task1', 'writing_task2', 'writing'].some((token) => qType.includes(token))) {
+          key = 'writing';
+        }
+      }
+      if (key) {
+        buckets[key].push(answer);
+      }
+    });
+    return buckets;
+  }, [summary.answers]);
+
+  const sectionTabs = React.useMemo<SectionTabInfo[]>(() => [
+    {
+      id: 'listening',
+      label: 'Listening',
+      count: answersBySection.listening.length,
+      helper: listeningTotal ? `${listeningCorrect}/${listeningTotal} correct` : 'No responses',
+    },
+    {
+      id: 'reading',
+      label: 'Reading',
+      count: answersBySection.reading.length,
+      helper: readingTotal ? `${readingCorrect}/${readingTotal} correct` : 'No responses',
+    },
+    {
+      id: 'writing',
+      label: 'Writing',
+      count: answersBySection.writing.length,
+      helper: answersBySection.writing.length
+        ? `${answersBySection.writing.length} task${answersBySection.writing.length === 1 ? '' : 's'}`
+        : 'Awaiting grading',
+    },
+  ], [answersBySection, listeningCorrect, listeningTotal, readingCorrect, readingTotal]);
+
+  const [activeSection, setActiveSection] = React.useState<SectionKey>('listening');
+
+  React.useEffect(() => {
+    const firstWithAnswers = sectionTabs.find((tab) => tab.count > 0);
+    const activeHasAnswers = sectionTabs.some((tab) => tab.id === activeSection && tab.count > 0);
+    if (!activeHasAnswers && firstWithAnswers) {
+      setActiveSection(firstWithAnswers.id);
+    }
+  }, [sectionTabs, activeSection]);
+
+  const answersForActiveSection = React.useMemo<any[]>(() => answersBySection[activeSection] || [], [answersBySection, activeSection]);
+
+  const activeSectionLabel = React.useMemo(() => (
+    sectionTabs.find((tab) => tab.id === activeSection)?.label || 'Selected section'
+  ), [sectionTabs, activeSection]);
+
+  const detailItems = React.useMemo(() => {
+    const items: { key: string; heading: string; a: any }[] = [];
+    let nextNumber = 1;
+    answersForActiveSection.forEach((a: any) => {
+      const sa = a.studentAnswer;
+      if (sa && typeof sa === 'object' && sa.type === 'simple_table' && Array.isArray(sa.graded) && sa.graded.length) {
+        const count = sa.graded.length;
+        const start = nextNumber;
+        const end = nextNumber + count - 1;
+        const rangeLabel = start === end ? String(start) : `${start}-${end}`;
+        items.push({ key: a.questionId, heading: `Q${rangeLabel}. ${a.questionText}`, a });
+        nextNumber = end + 1;
+      } else {
+        const explicit = a.questionMetadata?.questionNumber || a.questionNumber;
+        let displayNum: number;
+        if (typeof explicit === 'number' && explicit >= nextNumber) {
+          displayNum = explicit;
+          nextNumber = explicit + 1;
+        } else {
+          displayNum = nextNumber;
+          nextNumber += 1;
+        }
+        items.push({ key: a.questionId, heading: `Q${displayNum}. ${a.questionText}`, a });
+      }
+    });
+    return items;
+  }, [answersForActiveSection]);
+
+  if (isLoading) {
+    return <div className="flex items-center justify-center h-[60vh] text-gray-600"><Loader2 className="h-8 w-8 animate-spin mr-2" />Loading results…</div>;
+  }
+  if (error) {
+    return <div className="p-8 text-center text-red-600">Failed to load session results.</div>;
+  }
+  if (!session || !exam) {
+    return <div className="p-8 text-center text-gray-500">Session results are not available.</div>;
+  }
 
   const renderStudentAnswer = (ans: any) => {
     if (ans == null) return '—';
@@ -301,6 +424,10 @@ const AdminSessionResults: React.FC = () => {
       default: return t || '—';
     }
   };
+
+  if (!session || !exam) {
+    return <div className="p-8 text-center text-gray-500">Session results are not available.</div>;
+  }
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-8">
@@ -383,10 +510,33 @@ const AdminSessionResults: React.FC = () => {
         </div>
       )}
 
+      <div className="flex flex-wrap items-center gap-2 mb-6">
+        <span className="text-xs uppercase tracking-wide text-gray-500 mr-2">Section</span>
+        {sectionTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => setActiveSection(tab.id)}
+            disabled={!tab.count}
+            className={`px-3 py-1.5 text-sm rounded border transition ${
+              activeSection === tab.id
+                ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+            } ${tab.count ? '' : 'opacity-50 cursor-not-allowed'}`}
+          >
+            <span className="font-medium">{tab.label}</span>
+            <span className="block text-[11px] leading-4 opacity-80">
+              {tab.helper}
+            </span>
+          </button>
+        ))}
+      </div>
+
       {/* Exam-style summary and optional details */}
       <div className="bg-white rounded-lg border p-6">
         <h2 className="text-lg font-semibold text-gray-900">Exam Results</h2>
         <p className="text-gray-600">{summary.examTitle}</p>
+        <div className="mt-2 text-sm text-gray-600">Viewing {activeSectionLabel} section results</div>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-4">
           <div className="flex items-center text-sm text-gray-600">
             <Calendar className="h-4 w-4 mr-2" />
@@ -413,26 +563,12 @@ const AdminSessionResults: React.FC = () => {
 
         {showDetails && (
           <div className="mt-6 space-y-3">
-            {(() => {
-              const items: { key: string; heading: string; a: any }[] = [];
-              let nextNumber = 1;
-              summary.answers.forEach((a: any) => {
-                const sa = a.studentAnswer;
-                if (sa && typeof sa === 'object' && sa.type === 'simple_table' && Array.isArray(sa.graded) && sa.graded.length) {
-                  const count = sa.graded.length;
-                  const start = nextNumber; const end = nextNumber + count - 1;
-                  const rangeLabel = start === end ? String(start) : `${start}-${end}`;
-                  items.push({ key: a.questionId, heading: `Q${rangeLabel}. ${a.questionText}`, a });
-                  nextNumber = end + 1;
-                } else {
-                  const explicit = a.questionMetadata?.questionNumber || a.questionNumber;
-                  let displayNum: number;
-                  if (typeof explicit === 'number' && explicit >= nextNumber) { displayNum = explicit; nextNumber = explicit + 1; }
-                  else { displayNum = nextNumber; nextNumber += 1; }
-                  items.push({ key: a.questionId, heading: `Q${displayNum}. ${a.questionText}`, a });
-                }
-              });
-              return items.map(({ key, heading, a }) => {
+            {detailItems.length === 0 ? (
+              <div className="p-4 border border-dashed border-gray-300 rounded text-sm text-gray-500">
+                No answers captured for the {activeSectionLabel} section.
+              </div>
+            ) : (
+              detailItems.map(({ key, heading, a }) => {
                 const isSimpleTable = a.questionType === 'simple_table';
                 return (
                   <div key={key} className="p-4 border border-gray-200 rounded">
@@ -477,7 +613,6 @@ const AdminSessionResults: React.FC = () => {
                             </div>
                           );
                         }
-                        // Per-blank breakdown for multi-blank fill-in
                         if (a.questionType === 'fill_blank' && Array.isArray(a.studentAnswer)) {
                           const normalize = (s:any) => String(s ?? '').toLowerCase().replace(/\s+/g,' ').trim();
                           const buildGroups = (): string[][] => {
@@ -570,8 +705,8 @@ const AdminSessionResults: React.FC = () => {
                     )}
                   </div>
                 );
-              });
-            })()}
+              })
+            )}
           </div>
         )}
       </div>

@@ -25,7 +25,10 @@ export const computeSharedMcqBlocks = (section: any): SharedMcqBlock[] => {
       continue;
     }
     const qNum = questionNumberOf(question);
-    if (!current) {
+    const isAnchorBreak = Boolean(
+      question.metadata?.sharedOptionsAnchor || question.metadata?.shared_options_anchor
+    );
+    if (!current || isAnchorBreak) {
       current = { anchorId: question.id, questions: [question], start: qNum, end: qNum };
       blocks.push(current);
       continue;

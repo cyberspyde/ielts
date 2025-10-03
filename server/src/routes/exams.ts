@@ -319,7 +319,7 @@ router.get('/:id',
     // Get sections
     let sectionsSql = `
       SELECT id, section_type, title, description,
-        max_score, section_order, instructions, audio_url, passage_text, heading_bank
+        max_score, section_order, instructions, audio_url, passage_text, passage_texts, heading_bank
       FROM exam_sections 
       WHERE exam_id = $1`;
     const params: any[] = [id];
@@ -366,12 +366,13 @@ router.get('/:id',
         instructions: section.instructions,
         audioUrl: section.audio_url,
         passageText: section.passage_text,
+        passageTexts: section.passage_texts,
         headingBank: section.heading_bank,
         questions: []
       };
 
       // Include questions if requested and user is authenticated
-  if (includeQuestions && allowQuestions) {
+      if (includeQuestions && allowQuestions) {
         const questionsResult = await query(`
           SELECT id, question_type, question_text, question_number, points,
                  time_limit_seconds, explanation, audio_url, image_url, metadata, correct_answer
@@ -887,35 +888,127 @@ router.post('/sessions/:sessionId/submit',
       const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
       const questionRows = (await query(`
         SELECT eq.id, eq.points, eq.correct_answer, eq.question_type, eq.metadata, eq.question_number,
-               es.heading_bank
+               es.heading_bank, eq.section_id
         FROM exam_questions eq
         JOIN exam_sections es ON eq.section_id = es.id
         WHERE eq.id IN (${placeholders}) AND es.exam_id = $${ids.length + 1}
       `, [...ids, session.exam_id])).rows;
-  const byId: Record<string, any> = {}; questionRows.forEach((q: any) => { byId[q.id] = q; });
+      const parseMetadata = (raw: any): any => {
+        if (!raw) return null;
+        if (typeof raw === 'object') return raw;
+        if (typeof raw === 'string') {
+          try { return JSON.parse(raw); } catch { return null; }
+        }
+        return null;
+      };
+      const byId: Record<string, any> = {};
+      questionRows.forEach((q: any) => { byId[q.id] = q; });
       // Build grouping anchors (metadata.groupRangeEnd or groupMemberOf)
-      const anchors: Record<string, { anchor: any; members: any[] }> = {};
+      const anchors: Record<string, { anchor: any | null; members: any[] }> = {};
+      const sectionBuckets: Record<string, any[]> = {};
+      const groupRanges: Array<{ sectionId: string | null; anchorId: string; start: number; end: number }> = [];
       for (const q of questionRows) {
-        let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
+        const sectionKey = q.section_id ? String(q.section_id) : 'unknown';
+        if (!sectionBuckets[sectionKey]) sectionBuckets[sectionKey] = [];
+        sectionBuckets[sectionKey].push(q);
+        const meta = parseMetadata(q.metadata);
         if (meta?.groupMemberOf) {
-          anchors[meta.groupMemberOf] = anchors[meta.groupMemberOf] || { anchor: null, members: [] };
-          anchors[meta.groupMemberOf].members.push(q);
-        } else if (meta?.groupRangeEnd) {
-          anchors[q.id] = anchors[q.id] || { anchor: q, members: [] };
+          const anchorId = meta.groupMemberOf;
+          anchors[anchorId] = anchors[anchorId] || { anchor: null, members: [] };
+          if (!anchors[anchorId].members.some((m: any) => m.id === q.id)) {
+            anchors[anchorId].members.push(q);
+          }
+        }
+        if (meta?.groupRangeEnd) {
+          const startNum = typeof q.question_number === 'number' ? q.question_number : Number(q.question_number);
+          const endNum = Number(meta.groupRangeEnd);
+          if (Number.isFinite(startNum) && Number.isFinite(endNum) && endNum > startNum) {
+            groupRanges.push({
+              sectionId: q.section_id ? String(q.section_id) : null,
+              anchorId: q.id,
+              start: startNum,
+              end: endNum,
+            });
+          }
+        }
+      }
+      if (groupRanges.length) {
+        const rangesBySection: Record<string, Array<{ anchorId: string; start: number; end: number }>> = {};
+        for (const range of groupRanges) {
+          if (!range.sectionId) continue;
+          if (!rangesBySection[range.sectionId]) rangesBySection[range.sectionId] = [];
+          rangesBySection[range.sectionId].push({ anchorId: range.anchorId, start: range.start, end: range.end });
+        }
+        const sectionIds = Object.keys(rangesBySection);
+        if (sectionIds.length) {
+          const sectionPlaceholders = sectionIds.map((_, idx) => `$${idx + 1}`).join(',');
+          const extraRows = (await query(`
+            SELECT eq.id, eq.points, eq.correct_answer, eq.question_type, eq.metadata, eq.question_number, eq.section_id
+            FROM exam_questions eq
+            JOIN exam_sections es ON eq.section_id = es.id
+            WHERE es.exam_id = $${sectionIds.length + 1} AND eq.section_id IN (${sectionPlaceholders})
+          `, [...sectionIds, session.exam_id])).rows;
+          for (const extra of extraRows) {
+            if (byId[extra.id]) continue;
+            const sectionId = extra.section_id ? String(extra.section_id) : null;
+            if (!sectionId) continue;
+            const ranges = rangesBySection[sectionId] || [];
+            if (!ranges.length) continue;
+            const qNum = typeof extra.question_number === 'number' ? extra.question_number : Number(extra.question_number);
+            if (!Number.isFinite(qNum)) continue;
+            const meta = parseMetadata(extra.metadata);
+            const anchorFromMeta = typeof meta?.groupMemberOf === 'string' ? meta.groupMemberOf : null;
+            const matchingRange = ranges.find((range) => {
+              if (anchorFromMeta && anchorFromMeta === range.anchorId) return true;
+              return qNum > range.start && qNum <= range.end;
+            });
+            if (!matchingRange) continue;
+            const bucketKey = sectionId;
+            if (!sectionBuckets[bucketKey]) sectionBuckets[bucketKey] = [];
+            if (!sectionBuckets[bucketKey].some((existing: any) => existing.id === extra.id)) {
+              sectionBuckets[bucketKey].push(extra);
+            }
+          }
         }
       }
       for (const q of questionRows) {
-        let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
+        const meta = parseMetadata(q.metadata);
+        const existing = anchors[q.id];
+        if (existing && !existing.anchor) existing.anchor = q;
+        if (!meta?.groupRangeEnd) continue;
+        const entry = anchors[q.id] || { anchor: q, members: [] };
+        if (!entry.anchor) entry.anchor = q;
+        const startNumRaw = typeof q.question_number === 'number' ? q.question_number : Number(q.question_number);
+        const endNumRaw = Number(meta.groupRangeEnd);
+        if (Number.isFinite(startNumRaw) && Number.isFinite(endNumRaw) && endNumRaw > startNumRaw) {
+          const bucketKey = q.section_id ? String(q.section_id) : 'unknown';
+          const candidates = sectionBuckets[bucketKey] || [];
+          for (const cand of candidates) {
+            if (cand.id === q.id) continue;
+            const candNum = typeof cand.question_number === 'number' ? cand.question_number : Number(cand.question_number);
+            if (!Number.isFinite(candNum) || candNum <= startNumRaw || candNum > endNumRaw) continue;
+            const candMeta = parseMetadata(cand.metadata);
+            if (candMeta?.groupMemberOf && candMeta.groupMemberOf !== q.id) continue;
+            if (candMeta?.groupRangeEnd) continue; // skip nested anchors
+            if (!entry.members.some((m: any) => m.id === cand.id)) {
+              entry.members.push(cand);
+            }
+          }
+        }
+        anchors[q.id] = entry;
+      }
+      for (const q of questionRows) {
+        const meta = parseMetadata(q.metadata);
         if (meta?.groupMemberOf) continue; // skip member grading
         // Skip legacy container table question types (no direct grading; their referenced cell sub-questions are separate)
         if (q.question_type === 'table_fill_blank' || q.question_type === 'table_drag_drop') continue;
         // Handle new simple_table aggregated question: grade each embedded cell
         if (q.question_type === 'simple_table') {
           // Flatten each table cell (and each blank within multi-blank cells) into graded entries
-          let meta: any = null; try { meta = q.metadata ? JSON.parse(q.metadata) : null; } catch {}
+          const tableMeta = meta;
           const rawStudent = answerMap[q.id];
           let studentObj: any = null; try { studentObj = typeof rawStudent === 'string' ? JSON.parse(rawStudent) : rawStudent; } catch {}
-          const rows = meta?.simpleTable?.rows || [];
+          const rows = tableMeta?.simpleTable?.rows || [];
           const gradedEntries: any[] = [];
           let tableScore = 0;
           let tableMax = 0;
@@ -1119,15 +1212,21 @@ router.post('/sessions/:sessionId/submit',
         const group = anchors[anchorId]; if (!group.anchor || !group.members.length) continue;
         const r = await query('SELECT is_correct, points_earned FROM exam_session_answers WHERE session_id = $1 AND question_id = $2', [sessionId, anchorId]);
         if (r.rowCount === 0) continue; const { is_correct } = r.rows[0];
+        const serializeAnswer = (value: any): string => {
+          if (value === undefined || value === null) return 'null';
+          try { return JSON.stringify(value); } catch { return 'null'; }
+        };
+        const anchorAnswerRaw = answerMap[anchorId];
+        const anchorAnswerSerialized = serializeAnswer(anchorAnswerRaw);
         for (const m of group.members) {
+          if (!answerMap[m.id]) answerMap[m.id] = anchorAnswerRaw;
+          const memberAnswerRaw = answerMap[m.id];
+          const memberSerialized = serializeAnswer(memberAnswerRaw ?? anchorAnswerRaw);
           // ensure answer row exists (even if user didn't send it) using student's anchor answer value
-          if (!answerMap[m.id]) {
-            await query(`INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at, is_correct, points_earned)
-              VALUES ($1,$2,$3,CURRENT_TIMESTAMP,$4,$5)
-              ON CONFLICT (session_id, question_id) DO UPDATE SET is_correct = EXCLUDED.is_correct, points_earned = EXCLUDED.points_earned, answered_at = CURRENT_TIMESTAMP`, [sessionId, m.id, 'null', is_correct, is_correct ? m.points : 0]);
-          } else {
-            await query(`UPDATE exam_session_answers SET is_correct = $1, points_earned = $2 WHERE session_id = $3 AND question_id = $4`, [is_correct, is_correct ? m.points : 0, sessionId, m.id]);
-          }
+          await query(`INSERT INTO exam_session_answers (session_id, question_id, student_answer, answered_at, is_correct, points_earned)
+            VALUES ($1,$2,$3,CURRENT_TIMESTAMP,$4,$5)
+            ON CONFLICT (session_id, question_id)
+            DO UPDATE SET student_answer = EXCLUDED.student_answer, is_correct = EXCLUDED.is_correct, points_earned = EXCLUDED.points_earned, answered_at = CURRENT_TIMESTAMP`, [sessionId, m.id, memberSerialized, is_correct, is_correct ? m.points : 0]);
           if (is_correct) totalScore += parseFloat(m.points);
           maxPossibleScore += parseFloat(m.points); // include member points in possible score
         }
